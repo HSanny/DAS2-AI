@@ -1,0 +1,316 @@
+# equipment_rules.yaml
+# ===========================================================================
+# Ordered rules mapping a sensor Description to an equipment class.
+#
+# Why this file exists
+# --------------------
+# The v1 classifier was a six-keyword if/elif chain, which left 3,847 of 5,204
+# analog sensors (74%) in an 'Others' bucket that the detector then dropped
+# before analysis. The bottleneck on coverage was never the detectors -- it was
+# this mapping. Making it data rather than code also means the client can tune
+# it without a release.
+#
+# How matching works
+# ------------------
+# Rules are evaluated IN ORDER and the FIRST match wins, so ordering carries
+# meaning. Three orderings in particular are load-bearing:
+#
+#   1. Setpoint/alarm BEFORE every measurement class.
+#      "LowerSeletarPS-Raw-Water-Pump3-Current-low-alarm-setpoint" is a
+#      configured threshold, not a current reading. Classifying it as Current
+#      would anomaly-detect a value that changes only when an engineer edits
+#      it -- i.e. page someone for a deliberate action.
+#
+#   2. Energy (kWh) BEFORE Voltage.
+#      "PunggolSerangoon-6.6KV INCOMER 2 F14 KWH" contains "KV", so a Voltage
+#      rule placed first would swallow every energy meter on an HV incomer.
+#
+#   3. Current BEFORE Power.
+#      "Kranji2PS-HT-IN-POWER-Current L3" measures current on the power
+#      incomer; the trailing noun is the measured quantity.
+#
+# `kind` drives how a class is treated downstream:
+#   measurement - a physical process value; the normal detector stack
+#   counter     - monotonically increasing (kWh, run hours). A flat counter
+#                 means the pump is OFF, which is normal, and a drop means a
+#                 reset, not a fault. Needs different detectors entirely.
+#   config      - setpoints and thresholds. Never alerted.
+#   status      - digital state.
+#
+# `alertable: false` means "analyse and show on the dashboard, but do not page
+# anyone". Newly added classes start here and are promoted per class once their
+# false-positive rate has been seen. Full coverage roughly quadruples the
+# sensors under detection, so this is what stops that becoming an alert flood.
+# ===========================================================================
+
+version: 1
+
+defaults:
+  analog_fallback: UNCLASSIFIED
+  digital_fallback: DigitalStatus
+
+rules:
+
+  # --- configuration and test points: must precede all measurements --------
+  - equipment: Setpoint
+    patterns:
+      - "set[\\s_-]?point"
+      - "deadband"
+      - "dead[\\s_-]?band"
+      - "\\b(hi|hihi|lo|lolo|high|low)\\b.*\\bsetpoint\\b"
+      - "alarm[\\s_-]?(setpoint|limit|threshold)"
+      - "(high|low|hi|lo)[\\s_-]?(high|low)?[\\s_-]?alarm[\\s_-]?setpoint"
+      - "\\bthreshold\\b"
+
+  - equipment: Simulation
+    patterns:
+      - "simulation"
+      - "simulate"
+      - "\\bsimu\\b"
+
+  # --- counters: monotonic, so the usual detectors are actively wrong ------
+  - equipment: Energy
+    patterns:
+      - "\\bkwh\\b"
+      - "\\bkvarh\\b"
+      - "\\bmwh\\b"
+      - "\\benergy\\b"
+
+  - equipment: Runtime
+    patterns:
+      - "run[\\s_-]?time"
+      - "\\bhr[\\s_-]?runtime\\b"
+      - "(operating|running)[\\s_-]?hours"
+      - "\\bhours[\\s_-]?run\\b"
+      - "\\btotaliser\\b"
+      - "\\btotalizer\\b"
+
+  # --- electrical ----------------------------------------------------------
+  - equipment: PowerFactor
+    patterns:
+      - "power[\\s_-]?factor"
+      - "\\bp\\.?f\\.?\\b"
+
+  - equipment: Current
+    patterns:
+      - "\\bcurrent\\b"
+      - "\\bamp(s|ere|erage)?\\b"
+
+  - equipment: Power
+    patterns:
+      - "\\bpower\\b"
+      - "\\bkw\\b"
+      - "\\bmw\\b"
+      - "\\bkva\\b"
+      - "\\bkvar\\b"
+
+  - equipment: Voltage
+    patterns:
+      - "voltage"
+      - "\\bvolt"
+      - "\\bkv\\b"
+      - "\\bvdc\\b"
+
+  - equipment: Battery
+    patterns:
+      - "batter"
+      - "\\bbatt\\b"
+
+  - equipment: Frequency
+    patterns:
+      - "frequency"
+      - "\\bhz\\b"
+
+  # --- rotating plant ------------------------------------------------------
+  # Vibration is the classic pump-failure precursor and the highest-value
+  # predictive-maintenance signal in the estate. 98 of these are currently
+  # discarded unanalysed.
+  - equipment: Vibration
+    patterns:
+      - "vibrat"
+
+  - equipment: Speed
+    patterns:
+      - "\\bspeed\\b"
+      - "\\brpm\\b"
+
+  # --- weather -------------------------------------------------------------
+  # Rain gauges are what make WEATHER_DRIVEN triage possible with no external
+  # API: flow spiked and it was raining nearby means do not dispatch.
+  - equipment: Rainfall
+    patterns:
+      - "rainfall"
+      - "rain[\\s_-]?(gauge|fall)"
+      - "\\brain\\b"
+
+  - equipment: Wind
+    patterns:
+      - "wind[\\s_-]?(speed|direction|dir)"
+      - "\\bwind\\b"
+
+  - equipment: SolarRadiation
+    patterns:
+      - "radiation"
+      - "\\bsolar\\b"
+      - "terr[\\s_-]?rad\\b"
+      - "\\brad\\b"
+
+  # --- hydraulic -----------------------------------------------------------
+  - equipment: Flowrate
+    patterns:
+      - "flow[\\s_-]?rate"
+      - "\\bflow\\b"
+      - "\\bdischarge\\b"
+
+  - equipment: Pressure
+    patterns:
+      - "pressure"
+      - "\\bpress\\b"
+    # "\\bbar\\b" was tried and removed: all 9 matches in the real inventory
+    # are electrical busbars (JurongTG-BUS-BAR, StamfordDT-ESB Bus bar
+    # Condition), every one of them digital. The unit never appears in a
+    # description here.
+
+  - equipment: Level
+    patterns:
+      - "water[\\s_-]?level"
+      - "\\bwl\\b"
+      - "reservoir[\\s_-]?.*level"
+      - "\\blevel\\b"
+      - "elevation"
+      - "\\btide\\b"
+      - "wet[\\s_-]?well"
+      - "\\bstock\\b"
+      - "\\bullage\\b"
+
+  - equipment: Position
+    patterns:
+      - "position"
+      - "penstock"
+      - "\\bopening\\b"
+      - "\\bgate\\b"
+
+  - equipment: Load
+    patterns:
+      - "load[\\s_-]?cell"
+      - "\\btorque\\b"
+
+  # --- water quality -------------------------------------------------------
+  - equipment: Dissolved Oxygen
+    # Constrained to analog, because "DO" is overloaded in SCADA naming: on
+    # analog points it is Dissolved Oxygen (Marina Bay-DO, MacRitchie-DO --
+    # 56 real reservoir water-quality sensors), but on digital points it is
+    # Digital Output (Kranji2PS-DO-CMD-P5_6, JurongPS-DO-C9-P13_14 -- 36 of
+    # them). Matching both would file three dozen output commands as a water
+    # quality measurement.
+    signal_types: [Analog]
+    patterns:
+      - "dissolved[\\s_-]?oxygen"
+      - "\\bdo\\b"
+
+  - equipment: Conductivity
+    signal_types: [Analog]
+    patterns:
+      - "conductivit"
+      - "\\bcond\\b"
+
+  - equipment: Turbidity
+    signal_types: [Analog]
+    patterns:
+      - "turbidit"
+      - "\\bntu\\b"
+
+  - equipment: pH
+    signal_types: [Analog]
+    patterns:
+      - "\\bph\\b"
+
+  - equipment: Chlorine
+    signal_types: [Analog]
+    patterns:
+      - "chlorine"
+      - "\\bcl2\\b"
+      - "residual"
+
+  - equipment: Temperature
+    patterns:
+      - "temperature"
+      - "\\btemp\\b"
+
+  # --- digital plant state -------------------------------------------------
+  - equipment: Pump
+    patterns:
+      - "\\bpump\\b"
+      - "\\bp[0-9]+[\\s_-]?(run|status|start|stop)\\b"
+
+  - equipment: Valve
+    patterns:
+      - "\\bvalve\\b"
+      - "\\bmov\\b"
+
+  - equipment: Communications
+    patterns:
+      - "\\bcomm(s|unication)?\\b"
+      - "\\bheartbeat\\b"
+      - "\\bwatchdog\\b"
+
+# ---------------------------------------------------------------------------
+# Per-class metadata.
+#
+# `range` feeds RANGE_VIOLATION. These are fleet-wide and crude -- applying
+# "Pressure 0..20" to every pressure sensor in Singapore is close to useless
+# when real sensors have medians of 0.0034 and 3.90. They are a placeholder for
+# the per-point HH/H/L/LL limits already commissioned in the SCADA, and a
+# violation is only raised once it clears the sensor's own measured noise.
+# A null range means "do not range-check this class".
+# ---------------------------------------------------------------------------
+classes:
+
+  Pressure:          {kind: measurement, unit: bar,    alertable: true,  range: [0, 20]}
+  Flowrate:          {kind: measurement, unit: "L/s",  alertable: true,  range: [-2000, 2000]}
+  Level:             {kind: measurement, unit: "%",    alertable: true,  range: null}
+  Temperature:       {kind: measurement, unit: C,      alertable: true,  range: [0, 60]}
+  Conductivity:      {kind: measurement, unit: "uS/cm", alertable: true, range: [0, 50000]}
+  Dissolved Oxygen:  {kind: measurement, unit: "mg/L", alertable: true,  range: [0, 20]}
+  Voltage:           {kind: measurement, unit: V,      alertable: true,  range: [0, 500]}
+
+  # Added by this rewrite. They start non-alerting: analysed and visible on the
+  # dashboard, but unable to page anyone until their false-positive rate has
+  # been observed. Promote per class, on evidence.
+  Vibration:         {kind: measurement, unit: "mm/s", alertable: false, range: [0, 50]}
+  Current:           {kind: measurement, unit: A,      alertable: false, range: [0, 5000]}
+  Power:             {kind: measurement, unit: kW,     alertable: false, range: null}
+  PowerFactor:       {kind: measurement, unit: "",     alertable: false, range: [-1, 1]}
+  Frequency:         {kind: measurement, unit: Hz,     alertable: false, range: [0, 100]}
+  Battery:           {kind: measurement, unit: V,      alertable: false, range: [0, 60]}
+  Speed:             {kind: measurement, unit: rpm,    alertable: false, range: [0, 5000]}
+  Position:          {kind: measurement, unit: "%",    alertable: false, range: null}
+  Load:              {kind: measurement, unit: "",     alertable: false, range: null}
+  Rainfall:          {kind: measurement, unit: mm,     alertable: false, range: [0, 500]}
+  Wind:              {kind: measurement, unit: "m/s",  alertable: false, range: [0, 100]}
+  SolarRadiation:    {kind: measurement, unit: "W/m2", alertable: false, range: [0, 2000]}
+  Turbidity:         {kind: measurement, unit: NTU,    alertable: false, range: [0, 1000]}
+  pH:                {kind: measurement, unit: "",     alertable: false, range: [0, 14]}
+  Chlorine:          {kind: measurement, unit: "mg/L", alertable: false, range: [0, 10]}
+
+  # Counters only ever climb. A flat counter means the plant is idle, which is
+  # normal; a drop is a rollover or reset, not a fault. Running flatline or
+  # spike detection over them produces nothing but noise.
+  Energy:            {kind: counter, unit: kWh,   alertable: false, range: null}
+  Runtime:           {kind: counter, unit: hours, alertable: false, range: null}
+
+  # Configuration. Changes when an engineer edits it, so it is never a fault.
+  Setpoint:          {kind: config, unit: "", alertable: false, range: null}
+  Simulation:        {kind: config, unit: "", alertable: false, range: null}
+
+  # Digital state.
+  Pump:              {kind: status, unit: "", alertable: false, range: null}
+  Valve:             {kind: status, unit: "", alertable: false, range: null}
+  Communications:    {kind: status, unit: "", alertable: false, range: null}
+  DigitalStatus:     {kind: status, unit: "", alertable: false, range: null}
+
+  # Genuinely unclassifiable from the name: generic analog-input channels such
+  # as "SgSembKechil-AIN-C2-P7" or "Pandan1Ext-ACCIN-C6-P14" carry no semantic
+  # hint at all. Counted and reported every run rather than silently dropped,
+  # so coverage is a tracked number instead of an invisible default.
+  UNCLASSIFIED:      {kind: unknown, unit: "", alertable: false, range: null}
