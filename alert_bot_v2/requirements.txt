@@ -1,0 +1,8 @@
+# requirements.txt for alert_bot
+# Pinned versions match analysis_bot/requirements.txt where shared, so
+# both containers run the same SQLAlchemy/dotenv/pyodbc versions.
+
+requests==2.32.3
+SQLAlchemy==2.0.43
+python-dotenv==1.1.0
+pyodbc==5.2.0
