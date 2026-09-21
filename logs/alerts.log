@@ -1,7 +1,0 @@
-2026-09-21 06:39:37,238 [INFO] BOT_TOKEN = TEST-TOKEN and CHAT_ID = -100123
-2026-09-21 06:39:49,428 [INFO] BOT_TOKEN = TEST-TOKEN and CHAT_ID = -100123
-2026-09-21 06:39:56,856 [INFO] BOT_TOKEN = TEST-TOKEN and CHAT_ID = -100123
-2026-09-21 06:39:56,868 [INFO] 📝 Feedback Id=12345: real (by siti)
-2026-09-21 06:39:56,888 [INFO] 👂 Feedback poller started (offset=0, timeout=25s)
-2026-09-21 06:39:56,890 [INFO] 📝 Feedback Id=777: noise (by siti)
-2026-09-21 06:39:56,893 [INFO] 📝 Feedback Id=888: unsure (by siti)

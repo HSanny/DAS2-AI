@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Runtime output -- regenerated every run, never source of truth
+logs/
+raw/
+output_csv/
+output_plots/
+output_html/
+cache/
+
+# Local environment / secrets
+.env
+*.local.yaml
+
+# Test scratch
+tests/.tmp_*
+
+# Fujitsu inputs mounted at runtime, not committed
+HISTORY/
+HISTALMEVT/
+HISTCURR/
