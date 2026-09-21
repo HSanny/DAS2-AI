@@ -307,7 +307,7 @@ try:
         # Optional: dedupe helper
         hash_cols = [c for c in [
             "Equipment","Description","First_Anomaly_Time","Last_Anomaly_Time",
-            "Anomaly_Points","Num_Events","Peak_RZ","Max_DTW_Dist","Plot_Path"
+            "Anomaly_Points","Num_Events","Peak_RZ","Max_ROC_Rate","Plot_Path"
         ] if c in df_summary.columns]
         if hash_cols:
             df_summary["RecordHash"] = (

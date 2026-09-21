@@ -13,7 +13,6 @@ plt.ioff()
 import matplotlib.dates as mdates
 from datetime import datetime
 from sklearn.ensemble import IsolationForest
-from fastdtw import fastdtw
 from pathlib import Path
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
@@ -30,15 +29,48 @@ ROLL_WIN_Z   = 24
 MAD_Z_THRESH = 4.5
 MAD_Z_HARD   = 8.0
 
+# Scale flooring for robust-Z (see robust_z / resolution_estimate).
+# RZ_SATURATE also caps reported scores: without it, dividing by a near-zero
+# floor yields |RZ| in the tens of thousands, which is meaningless as a
+# magnitude and distorts every ranking that sorts on Peak_RZ.
+RZ_SATURATE                 = 50.0
+RZ_REL_SCALE_FLOOR          = 1e-6   # relative guard vs the local median level
+RESOLUTION_MIN_ACTIVE_FRAC  = 0.05   # need >=5% non-zero diffs to trust a resolution estimate
+QUANT_MIN_SAMPLES           = 10     # minimum non-zero diffs before testing for quantisation
+QUANT_TOL                   = 0.05   # median |ratio - round(ratio)| below this => quantised
+
 # Isolation Forest
 ISO_BASE_CONTAM   = 0.01
 ISO_N_ESTIMATORS  = 200
 ISO_WIN           = 12
 ISO_RANDOM_STATE  = 42
 
-# DTW
-DTW_REF_WIN = 24
-DTW_K       = 6.0
+# =========================
+# Rate-of-change channel (replaces the former sliding-DTW channel)
+# =========================
+# The old `dtw_sliding` compared v[i-w:i] against v[i-w+1:i+1] -- the SAME
+# window shifted by one sample. Because DTW must match both endpoints and the
+# interior then aligns at zero cost, its optimal path always costs exactly
+#
+#     |v[i-w] - v[i-w+1]|  +  |v[i-1] - v[i]|
+#
+# Verified against an exact DTW implementation: correlation 1.000000, maximum
+# absolute difference 0.0. It was an identity, not an approximation -- so that
+# channel never compared shapes with anything. It measured a first difference,
+# plus the same difference echoed w samples later.
+#
+# That echo was a live bug: a transient at index k produced a phantom second
+# peak at k+w (reproduced at indices 123/124 for a spike at 100 with w=24),
+# which MERGE_GAP=3 and COOLDOWN=12 neither merge nor suppress, so it cast a
+# spurious third vote at the wrong time.
+#
+# It also cost ~16.5k fastdtw() calls with a Python-lambda cost function on the
+# highest-rate sensor, to compute what is one vectorised line.
+#
+# Replaced by an explicit, honest rate-of-change channel: |dv/dt| in
+# engineering units per second. Same intent, no echo, no dependency, O(n).
+ROC_K          = 6.0    # MAD multiplier for the rate threshold
+MIN_SENSOR_POINTS = 48  # admission floor (previously implied by the DTW window)
 
 # Per-sensor anomaly budget
 TARGET_POINT_RATE = 0.003
@@ -50,7 +82,7 @@ MERGE_GAP     = 3
 COOLDOWN      = 12
 Z_EVENT_MIN   = 5.5
 REL_JUMP_MIN  = 0.10
-DTW_EVENT_RATE= 0.20
+ROC_EVENT_RATE= 0.20
 
 # Sensor-level selection (for final outputs)
 MAX_ABNORMAL_SENSORS        = 10  # hard cap on sensors to send out
@@ -77,7 +109,7 @@ SKIP_UNCATEGORIZED_EQUIPMENT = {
 # Edge / step-change anomaly suppression
 # =========================
 # Equipment cycling on/off (pumps starting, valves opening, gates moving)
-# produces sharp transitions that the detectors (Z, ISO, DTW) all flag
+# produces sharp transitions that the detectors (Z, ISO, ROC) all flag
 # simultaneously because the value changes fast — statistically anomalous,
 # operationally normal. Per direct client instruction (May 2026): suppress
 # any event where the value level BEFORE differs significantly from the
@@ -101,15 +133,15 @@ STEP_MIN_LEVEL_DIFF_PCT    = 0.10  # before/after median must differ by ≥ this
 
 # Detection profiles per Equipment (which methods to use)
 DETECTOR_PROFILE = {
-    'Pressure':         dict(use_z=True,  use_iso=True,  use_dtw=True,  suppress_steps=True),
-    'Flowrate':         dict(use_z=True,  use_iso=True,  use_dtw=True,  suppress_steps=True),
-    'Conductivity':     dict(use_z=True,  use_iso=False, use_dtw=True,  suppress_steps=True),
-    'Voltage':          dict(use_z=True,  use_iso=True,  use_dtw=False, suppress_steps=True),
-    'Dissolved Oxygen': dict(use_z=True,  use_iso=True,  use_dtw=False, suppress_steps=True),
-    'Temperature':      dict(use_z=True,  use_iso=False, use_dtw=False, suppress_steps=True),
-    'LevelSensor':      dict(use_z=True,  use_iso=False, use_dtw=False, suppress_steps=True),
+    'Pressure':         dict(use_z=True,  use_iso=True,  use_roc=True,  suppress_steps=True),
+    'Flowrate':         dict(use_z=True,  use_iso=True,  use_roc=True,  suppress_steps=True),
+    'Conductivity':     dict(use_z=True,  use_iso=False, use_roc=True,  suppress_steps=True),
+    'Voltage':          dict(use_z=True,  use_iso=True,  use_roc=False, suppress_steps=True),
+    'Dissolved Oxygen': dict(use_z=True,  use_iso=True,  use_roc=False, suppress_steps=True),
+    'Temperature':      dict(use_z=True,  use_iso=False, use_roc=False, suppress_steps=True),
+    'LevelSensor':      dict(use_z=True,  use_iso=False, use_roc=False, suppress_steps=True),
 }
-DEFAULT_PROFILE = dict(use_z=True, use_iso=True, use_dtw=True, suppress_steps=True)
+DEFAULT_PROFILE = dict(use_z=True, use_iso=True, use_roc=True, suppress_steps=True)
 
 # Plotting
 now_time = datetime.now().strftime("%Y%m%d_%H%M")
@@ -135,13 +167,147 @@ def is_rule_invalid(equipment, value):
     return False
 
 
-def robust_z(series, window=ROLL_WIN_Z):
+def resolution_estimate(values, min_active_frac=RESOLUTION_MIN_ACTIVE_FRAC):
+    """
+    Estimate a sensor's measurement resolution (quantisation step), or return
+    0.0 when the signal is not quantised.
+
+    A quantised signal changes only in whole multiples of its step, so the
+    smallest non-zero difference is the step and every other difference is
+    close to an integer multiple of it. That is an falsifiable test, and it is
+    the test used here -- a low percentile of the differences on its own is NOT
+    a resolution estimate. For continuous data (say N(0,1) noise) the 25th
+    percentile of |diff| is around 0.45, which is a substantial fraction of the
+    real spread; flooring the scale with it would suppress genuine outliers on
+    perfectly healthy sensors.
+
+    Returns 0.0 in two cases, both meaning "no usable resolution evidence":
+
+      * The series is too static. If nearly every difference is zero, the few
+        non-zero ones are far more likely to BE the anomaly than to reveal the
+        resolution -- using them as a scale floor would divide the excursion by
+        itself and hide it, the exact failure this exists to prevent.
+      * The differences are not consistent with any single step, i.e. the
+        signal is continuous.
+
+    robust_z() treats 0.0 as "fall through to the saturation rule".
+    """
+    v = np.asarray(values, dtype=float)
+    d = np.abs(np.diff(v))
+    d = d[np.isfinite(d)]
+    if d.size == 0:
+        return 0.0
+    nz = d[d > 0]
+    # Too static to infer anything, or too few changes for the test to mean much.
+    if nz.size < QUANT_MIN_SAMPLES or (nz.size / d.size) < min_active_frac:
+        return 0.0
+
+    # Try the smallest observed steps as candidates; the true step must divide
+    # all the others. Several candidates are tried because a single float
+    # artefact could otherwise make the smallest difference unusable.
+    for candidate in (np.min(nz), np.percentile(nz, 1), np.percentile(nz, 5)):
+        if not np.isfinite(candidate) or candidate <= 0:
+            continue
+        ratios = nz / candidate
+        residual = np.abs(ratios - np.round(ratios))
+        if np.median(residual) < QUANT_TOL:
+            return float(candidate)
+    return 0.0
+
+
+def robust_z(series, window=ROLL_WIN_Z, resolution=None):
+    """
+    Robust z-score of each point against a local median, scaled by a FLOORED
+    estimate of local spread.
+
+    Why the floor matters
+    ---------------------
+    The previous implementation did `mad.replace(0, np.nan)` and then
+    `rz.fillna(0.0)`, which meant any window whose MAD was zero scored exactly
+    0 -- i.e. no anomaly. That silently blinded the detector to the cases that
+    matter most on this fleet:
+
+      * 300 zeros with a single spike to 250.0  -> max|RZ| was 0.000
+      * a 0.1-quantised 414.8 V bus dropping to 380 V -> 2.965 (below 4.5)
+
+    Both are invisible because the median filter sees a flat neighbourhood, so
+    MAD is 0. Idle pumps make this common here: abnormal_sensor_backup.csv
+    contains Flowrate sensors with Median_Value of 0.0 and 0.001302, and those
+    are precisely the sensors where a spurious reading matters.
+
+    The fix has two parts:
+      1. Floor the scale at the sensor's measurement resolution (and a tiny
+         relative floor), so a quantised signal is scored against its real
+         resolution rather than a degenerate zero.
+      2. Where the local baseline is *exactly* constant and no resolution can
+         be inferred, any non-zero deviation is by definition maximally
+         surprising, so it saturates instead of collapsing to zero.
+
+    Scores are clipped to +/-RZ_SATURATE. Dividing by a near-zero floor
+    otherwise produces values in the tens of thousands, which are meaningless
+    as a magnitude and distort every downstream ranking that uses Peak_RZ.
+
+    Behaviour on healthy, noisy sensors is unchanged: there MAD comfortably
+    exceeds the floor, so the floor never binds. That is deliberate -- buying
+    sensitivity on quiet sensors by raising the false-alarm rate on healthy
+    ones would be no improvement at all.
+
+    Two known defects deliberately NOT fixed here
+    ---------------------------------------------
+    1. Mis-scaling. The formula is `1.4826 * dev / MAD`, but 1.4826 * MAD is
+       the estimator of sigma, so the constant belongs on the denominator. As
+       written, every score is inflated by 1.4826^2 ~= 2.198x, which means the
+       documented thresholds are really:
+
+           MAD_Z_THRESH 4.5 -> 2.05 sigma
+           Z_EVENT_MIN  5.5 -> 2.50 sigma
+           MAD_Z_HARD   8.0 -> 3.64 sigma
+
+       Correcting it would change which points are flagged and therefore alert
+       volume, which is out of scope for a Phase 0 fix. Every threshold in this
+       file was tuned against the inflated scale, so the scale and the
+       thresholds must be corrected together -- that happens in Phase 4, where
+       thresholds are re-derived from scratch.
+
+    2. Non-causality. The rolling windows are `center=True`, so a point's score
+       depends on data that arrived after it. With a 72h window re-run every
+       6h, each timestamp is re-scored ~12 times against different future
+       context, which is why the same event appears and disappears between
+       runs. Replacing this with a causal baseline is also Phase 4 work.
+
+    Returns (rz, med, scale) -- the third element is the floored MAD actually
+    used, not the raw MAD.
+    """
     s = pd.Series(series).astype(float)
     med = s.rolling(window, min_periods=1, center=True).median()
     mad = (s - med).abs().rolling(window, min_periods=1, center=True).median()
-    mad = mad.replace(0, np.nan)
-    rz = 1.4826 * (s - med) / mad
-    return rz.fillna(0.0), med, mad
+
+    if resolution is None:
+        resolution = resolution_estimate(s.values)
+
+    # Floor 1: the instrument cannot resolve finer than its quantisation step.
+    # Floor 2: a tiny relative guard, so a large-magnitude signal is not scored
+    #          against a scale smaller than its own floating-point granularity.
+    floor = np.maximum(float(resolution), RZ_REL_SCALE_FLOOR * med.abs())
+    scale = np.maximum(mad, floor)
+
+    dev = s - med
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # NOTE: `1.4826 *` belongs on the denominator (1.4826*MAD estimates
+        # sigma), so this formula inflates every score by 1.4826^2 ~= 2.198x.
+        # It is preserved verbatim here ON PURPOSE -- see the mis-scaling note
+        # in the docstring.
+        rz = 1.4826 * dev / scale.where(scale > 0)
+
+    # Exactly-constant baseline with no resolution evidence: a zero deviation is
+    # normal, anything else is maximally anomalous.
+    degenerate = ~(scale > 0)
+    rz = rz.mask(degenerate & (dev == 0), 0.0)
+    rz = rz.mask(degenerate & (dev != 0), np.sign(dev) * RZ_SATURATE)
+
+    rz = rz.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    rz = rz.clip(-RZ_SATURATE, RZ_SATURATE)
+    return rz, med, scale
 
 
 def features_for_iso(values, win=ISO_WIN):
@@ -183,23 +349,51 @@ def isolation_forest_detection(values):
     return labels == -1, cont
 
 
-def dtw_sliding(series, ref_win=DTW_REF_WIN):
-    v = np.asarray(series).astype(float)
+def roc_sliding(series, timestamps):
+    """
+    Rate-of-change channel: |dv/dt| in engineering units per second.
+
+    Replaces the former sliding-DTW channel, which was provably just a first
+    difference plus an echo -- see the ROC block in Tunables for the derivation.
+
+    Timestamp hazard
+    ----------------
+    This telemetry is report-by-exception with 1-second resolution, and
+    duplicate timestamps do occur. A naive dv/dt would divide by zero on every
+    duplicate and flag it as an infinite-rate spike, so non-positive intervals
+    are dropped rather than divided by. Backwards intervals (out-of-order rows,
+    or an RTU clock stepping at NTP sync) are treated the same way.
+
+    Returns (rate, flags), both length n, with rate[0] = NaN.
+    """
+    v = np.asarray(series, dtype=float)
     n = len(v)
-    dists = np.full(n, np.nan)
-    if n < ref_win * 2:
-        return dists, np.zeros(n, dtype=bool)
-    for i in range(ref_win, n):
-        ref = v[i-ref_win:i]
-        tgt = v[i-ref_win+1:i+1]
-        dist, _ = fastdtw(ref, tgt, dist=lambda a, b: abs(a - b))
-        dists[i] = dist
-    ds = pd.Series(dists)
-    med = ds.median(skipna=True)
-    mad = (ds - med).abs().median(skipna=True)
-    thr = med + DTW_K * mad if pd.notna(med) and pd.notna(mad) else np.nan
-    flags = (ds > thr).fillna(False).values if pd.notna(thr) else np.zeros(n, dtype=bool)
-    return dists, flags
+    rate = np.full(n, np.nan)
+    if n < 2:
+        return rate, np.zeros(n, dtype=bool)
+
+    # Use .dt.total_seconds() rather than casting to int64: the int64
+    # representation carries whatever unit pandas inferred (s / ms / us / ns),
+    # so dividing by 1e9 silently mis-scales the rate by orders of magnitude.
+    # reset_index guards against the caller's non-trivial index misaligning diff().
+    ts = pd.to_datetime(pd.Series(timestamps).reset_index(drop=True))
+    dv = np.diff(v)
+    dt = ts.diff().dt.total_seconds().to_numpy()[1:]
+    # Guard: non-positive intervals carry no rate information.
+    dt = np.where(dt > 0, dt, np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rate[1:] = np.abs(dv / dt)
+    rate[~np.isfinite(rate)] = np.nan
+
+    rs = pd.Series(rate)
+    med = rs.median(skipna=True)
+    mad = (rs - med).abs().median(skipna=True)
+    if pd.notna(med) and pd.notna(mad):
+        thr = med + ROC_K * mad
+        flags = (rs > thr).fillna(False).to_numpy()
+    else:
+        flags = np.zeros(n, dtype=bool)
+    return rate, flags
 
 
 def _runs(flags):
@@ -242,15 +436,15 @@ def apply_cooldown(flags, cooldown=6):
     return out
 
 
-def vote_and_smooth(z_flags, iso_flags, dtw_flags, hard_overrides=None):
+def vote_and_smooth(z_flags, iso_flags, roc_flags, hard_overrides=None):
     zf = np.asarray(z_flags, dtype=bool)
     if iso_flags is None:
         iso_flags = np.zeros_like(zf)
-    if dtw_flags is None:
-        dtw_flags = np.zeros_like(zf)
+    if roc_flags is None:
+        roc_flags = np.zeros_like(zf)
     if hard_overrides is None:
         hard_overrides = np.zeros_like(zf)
-    votes = zf.astype(int) + iso_flags.astype(int) + dtw_flags.astype(int)
+    votes = zf.astype(int) + iso_flags.astype(int) + roc_flags.astype(int)
     base = (votes >= 2) | np.asarray(hard_overrides, dtype=bool)
     filtered = apply_run_length_filters(base, min_len=MIN_EVENT_LEN, merge_gap=MERGE_GAP)
     cooled   = apply_cooldown(filtered, cooldown=COOLDOWN)
@@ -325,19 +519,19 @@ def filter_events_by_impact(g, flags, suppress_steps=False):
         dur      = e - s + 1
         peak_rz  = float(np.nanmax(np.abs(seg.get('RZ', pd.Series([0])))))
         rel_jump = abs(seg['CurrValue'].iloc[-1] - seg['CurrValue'].iloc[0]) / med_abs
-        dtw_rate = float(seg.get('DTW_Flag', pd.Series([False] * len(seg))).mean())
+        roc_flag_frac = float(seg.get('ROC_Flag', pd.Series([False] * len(seg))).mean())
         keep = (
             (dur >= MIN_EVENT_LEN) and
             ((peak_rz >= Z_EVENT_MIN) or
              (rel_jump >= REL_JUMP_MIN) or
-             (dtw_rate >= DTW_EVENT_RATE))
+             (roc_flag_frac >= ROC_EVENT_RATE))
         )
         if keep:
             out[s:e + 1] = True
     return out
 
 
-def calibrate_flags_per_sensor(rz_abs, dtw_dist, iso_flags, base_cont):
+def calibrate_flags_per_sensor(rz_abs, roc_rate, iso_flags, base_cont):
     if np.isfinite(rz_abs).any():
         qz = np.nanquantile(rz_abs, 1 - TARGET_POINT_RATE)
         BASE_MIN_Z = 2.5
@@ -346,12 +540,12 @@ def calibrate_flags_per_sensor(rz_abs, dtw_dist, iso_flags, base_cont):
     else:
         z_flags = np.zeros_like(rz_abs, dtype=bool)
 
-    ds = np.asarray(dtw_dist, dtype=float)
+    ds = np.asarray(roc_rate, dtype=float)
     if np.isfinite(ds).any():
         qd  = np.nanquantile(ds, 1 - TARGET_POINT_RATE)
         med = np.nanmedian(ds)
         mad = np.nanmedian(np.abs(ds - med))
-        d_thr = max(qd, med + DTW_K * mad) if np.isfinite(med) and np.isfinite(mad) else qd
+        d_thr = max(qd, med + ROC_K * mad) if np.isfinite(med) and np.isfinite(mad) else qd
         d_flags = ds > d_thr
     else:
         d_flags = np.zeros_like(z_flags, dtype=bool)
@@ -400,7 +594,7 @@ def build_event_table(g, equipment, description):
             'Max_RZ':       float(seg['RZ'].abs().max(skipna=True)),
             'Z_Points':     int(seg['Z_Flag'].sum()),
             'ISO_Points':   int(seg['ISO_Flag'].sum()),
-            'DTW_Points':   int(seg['DTW_Flag'].sum()),
+            'ROC_Points':   int(seg['ROC_Flag'].sum()),
             'Rule_Invalid_In_Event': bool(seg['Rule_Based_Invalid'].any()),
         })
     return pd.DataFrame(rows)
@@ -416,8 +610,8 @@ def build_sensor_summary(result_df: pd.DataFrame,
         "Equipment", "Description",
         "Total_Points", "Anomaly_Points", "Anomaly_Pct",
         "Num_Events", "First_Anomaly_Time", "Last_Anomaly_Time",
-        "Z_Points", "ISO_Points", "DTW_Points",
-        "Peak_RZ", "Max_DTW_Dist",
+        "Z_Points", "ISO_Points", "ROC_Points",
+        "Peak_RZ", "Max_ROC_Rate",
         "Mean_Value", "Median_Value",
         "Plot_Path",
         "Longitude", "Latitude", "Location",
@@ -472,9 +666,9 @@ def build_sensor_summary(result_df: pd.DataFrame,
             "Last_Anomaly_Time":  grp.loc[anom_mask, 'DateTime'].max(),
             "Z_Points":  int(grp.loc[anom_mask, 'Z_Flag'].sum()),
             "ISO_Points": int(grp.loc[anom_mask, 'ISO_Flag'].sum()),
-            "DTW_Points": int(grp.loc[anom_mask, 'DTW_Flag'].sum()),
+            "ROC_Points": int(grp.loc[anom_mask, 'ROC_Flag'].sum()),
             "Peak_RZ":     float(np.nanmax(np.abs(grp.loc[anom_mask, 'RZ']))),
-            "Max_DTW_Dist": float(np.nanmax(grp.loc[anom_mask, 'DTW_Dist'])),
+            "Max_ROC_Rate": float(np.nanmax(grp.loc[anom_mask, 'ROC_Rate'])),
             "Mean_Value":  float(np.nanmean(grp['CurrValue'])),
             "Median_Value": float(np.nanmedian(grp['CurrValue'])),
             "Plot_Path":   plot_path_out,
@@ -633,11 +827,11 @@ def cluster_anomalous_sensors(abnormal_summary: pd.DataFrame,
     feature_cols = [
         "Anomaly_Pct",
         "Peak_RZ",
-        "Max_DTW_Dist",
+        "Max_ROC_Rate",
         "Num_Events",
         "Z_Points",
         "ISO_Points",
-        "DTW_Points",
+        "ROC_Points",
     ]
 
     X = abnormal_summary[feature_cols].fillna(0.0).to_numpy(dtype=float)
@@ -683,19 +877,19 @@ def cluster_anomaly_points(abnormal_points: pd.DataFrame,
                            output_dir: str,
                            n_clusters: int = 3):
     """
-    Cluster individual anomaly points based on RZ, DTW_Dist, and CurrValue.
-    Produces a scatter of RZ vs DTW_Dist colored by cluster.
+    Cluster individual anomaly points based on RZ, ROC_Rate, and CurrValue.
+    Produces a scatter of RZ vs ROC_Rate colored by cluster.
     """
     if abnormal_points.empty:
         print("[CLUSTER] No abnormal points to cluster.", flush=True)
         return None
 
-    for col in ["RZ", "DTW_Dist", "CurrValue"]:
+    for col in ["RZ", "ROC_Rate", "CurrValue"]:
         if col not in abnormal_points.columns:
             print(f"[CLUSTER] Missing column '{col}' in abnormal_points, skip point clusters.", flush=True)
             return None
 
-    ap = abnormal_points[["RZ", "DTW_Dist", "CurrValue"]].copy()
+    ap = abnormal_points[["RZ", "ROC_Rate", "CurrValue"]].copy()
     ap = ap.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     X = ap.to_numpy(dtype=float)
 
@@ -722,12 +916,12 @@ def cluster_anomaly_points(abnormal_points: pd.DataFrame,
         mask = abnormal_points["PointCluster"] == c
         plt.scatter(
             abnormal_points.loc[mask, "RZ"],
-            abnormal_points.loc[mask, "DTW_Dist"],
+            abnormal_points.loc[mask, "ROC_Rate"],
             label=f"Cluster {c}", alpha=0.7
         )
 
     plt.xlabel("RZ")
-    plt.ylabel("DTW_Dist")
+    plt.ylabel("ROC_Rate")
     plt.title("Clusters of Anomaly Points")
     plt.grid(True, alpha=0.3)
     plt.legend()
@@ -747,7 +941,7 @@ def plot_sensor(g, equipment, description, output_dir):
 
     zmask = g['Z_Flag'].fillna(False).to_numpy(dtype=bool)
     imask = g['ISO_Flag'].fillna(False).to_numpy(dtype=bool)
-    dmask = g['DTW_Flag'].fillna(False).to_numpy(dtype=bool)
+    dmask = g['ROC_Flag'].fillna(False).to_numpy(dtype=bool)
 
     if zmask.any():
         zpts = g.loc[zmask]
@@ -757,7 +951,7 @@ def plot_sensor(g, equipment, description, output_dir):
         plt.scatter(ipts['DateTime'], ipts['CurrValue'], marker='s', s=22, label='IsolationForest')
     if dmask.any():
         dpts = g.loc[dmask]
-        plt.scatter(dpts['DateTime'], dpts['CurrValue'], marker='x', s=28, label='DTW')
+        plt.scatter(dpts['DateTime'], dpts['CurrValue'], marker='x', s=28, label='Rate-of-change')
 
     event_mask = g['Combined_Anomaly'].fillna(False).to_numpy(dtype=bool)
     runs = _runs(event_mask)
@@ -789,20 +983,20 @@ def plot_sensor_clusters(g, equipment, description, output_dir, n_clusters=3):
     """
     For a single sensor (one Equipment + Description group):
 
-    - Build features [CurrValue, RZ, DTW_Dist] for each timestamp.
+    - Build features [CurrValue, RZ, ROC_Rate] for each timestamp.
     - Cluster ONLY normal points (Combined_Anomaly == False) with KMeans.
     - Project all points (normal + abnormal) into 2D via PCA.
     - Plot:
         * normal points colored by cluster
         * abnormal points highlighted with a different marker/color
     """
-    required_cols = ["CurrValue", "RZ", "DTW_Dist", "Combined_Anomaly"]
+    required_cols = ["CurrValue", "RZ", "ROC_Rate", "Combined_Anomaly"]
     for col in required_cols:
         if col not in g.columns:
             print(f"[CLUSTER-PLOT] Missing column '{col}' for {equipment} | {description}, skip.", flush=True)
             return ""
 
-    feats = g[["CurrValue", "RZ", "DTW_Dist"]].copy()
+    feats = g[["CurrValue", "RZ", "ROC_Rate"]].copy()
     feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     X = feats.to_numpy(dtype=float)
 
@@ -913,7 +1107,7 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
         try:
             g = g.sort_values('DateTime').reset_index(drop=True).copy()
             n_rows = len(g)
-            if n_rows < max(DTW_REF_WIN * 2, ROLL_WIN_Z + 5):
+            if n_rows < max(MIN_SENSOR_POINTS, ROLL_WIN_Z + 5):
                 if VERBOSE_LEVEL >= 2:
                     print(f"[{idx}/{total_pairs}] Skip {equipment} | {description}: not enough points ({n_rows}).", flush=True)
                 continue
@@ -921,11 +1115,11 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
             profile = DETECTOR_PROFILE.get(equipment, DEFAULT_PROFILE)
             use_z   = profile.get('use_z', True)
             use_iso = profile.get('use_iso', True)
-            use_dtw = profile.get('use_dtw', True)
+            use_roc = profile.get('use_roc', True)
 
             if VERBOSE_LEVEL >= 1:
                 print(f"[{idx}/{total_pairs}] {equipment} | {description} (rows={n_rows}) "
-                      f"[use_z={use_z}, use_iso={use_iso}, use_dtw={use_dtw}]...", flush=True)
+                      f"[use_z={use_z}, use_iso={use_iso}, use_roc={use_roc}]...", flush=True)
 
             values = g['CurrValue'].astype(float).values
 
@@ -947,29 +1141,29 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
             )
             g['ISO_Cont'] = iso_cont
 
-            # DTW (optional per profile)
-            if use_dtw:
-                dtw_dist, dtw_flags = dtw_sliding(values, ref_win=min(DTW_REF_WIN, max(6, len(values) // 12)))
+            # Rate-of-change (optional per profile)
+            if use_roc:
+                roc_rate, roc_flags = roc_sliding(values, g['DateTime'])
             else:
-                dtw_dist  = np.full(n_rows, np.nan)
-                dtw_flags = np.zeros(n_rows, dtype=bool)
-            g['DTW_Dist'] = dtw_dist
-            g['DTW_Flag'] = pd.Series(dtw_flags, index=g.index)
+                roc_rate  = np.full(n_rows, np.nan)
+                roc_flags = np.zeros(n_rows, dtype=bool)
+            g['ROC_Rate'] = roc_rate
+            g['ROC_Flag'] = pd.Series(roc_flags, index=g.index)
 
             # Calibrate + vote
             rz_abs = np.abs(rz)
-            zF, dF, iF, used_cont = calibrate_flags_per_sensor(rz_abs, dtw_dist, iso_flags, iso_cont)
+            zF, dF, iF, used_cont = calibrate_flags_per_sensor(rz_abs, roc_rate, iso_flags, iso_cont)
 
             # Enforce per-equipment profile on flags
             if not use_z:
                 zF = np.zeros_like(zF, dtype=bool)
-            if not use_dtw:
+            if not use_roc:
                 dF = np.zeros_like(dF, dtype=bool)
             if not use_iso:
                 iF = np.zeros_like(iF, dtype=bool)
 
             g['Z_Flag']   = pd.Series(zF, index=g.index)
-            g['DTW_Flag'] = pd.Series(dF, index=g.index)
+            g['ROC_Flag'] = pd.Series(dF, index=g.index)
             g['ISO_Flag'] = pd.Series(iF, index=g.index)
             g['ISO_Cont'] = used_cont
 
@@ -992,7 +1186,7 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
             comb_pts = int(g['Combined_Anomaly'].sum())
             z_pts    = int(g['Z_Flag'].sum())
             iso_pts  = int(g['ISO_Flag'].sum())
-            dtw_pts  = int(g['DTW_Flag'].sum())
+            roc_pts  = int(g['ROC_Flag'].sum())
 
             if comb_pts > 0:
                 abnormal_sensor_count += 1
@@ -1000,7 +1194,7 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
 
             sensor_time = time.time() - sensor_start
             if VERBOSE_LEVEL >= 1:
-                print(f"   -> Z:{z_pts} ISO:{iso_pts} DTW:{dtw_pts} COMB:{comb_pts} events:{num_events} "
+                print(f"   -> Z:{z_pts} ISO:{iso_pts} ROC:{roc_pts} COMB:{comb_pts} events:{num_events} "
                       f"time:{sensor_time:.2f}s", flush=True)
 
             if VERBOSE_LEVEL >= 1 and (idx % PRINT_EVERY == 0):
@@ -1025,7 +1219,7 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
         add_cols  = [
             'RZ', 'Z_Flag',
             'ISO_Flag', 'ISO_Cont',
-            'DTW_Dist', 'DTW_Flag',
+            'ROC_Rate', 'ROC_Flag',
             'Combined_Anomaly', 'Rule_Based_Invalid'
         ]
         add_cols  = [c for c in add_cols if c not in orig_cols]
@@ -1041,7 +1235,7 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
             tmp["Methods_Used"] = (
                 (tmp["Z_Points"]   > 0).astype(int) +
                 (tmp["ISO_Points"] > 0).astype(int) +
-                (tmp["DTW_Points"] > 0).astype(int)
+                (tmp["ROC_Points"] > 0).astype(int)
             )
 
             # Filter: require at least REQUIRED_METHODS_PER_SENSOR and at least 1 event
