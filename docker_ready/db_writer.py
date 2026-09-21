@@ -31,6 +31,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from dotenv import load_dotenv
 
+from event_dedup import assign_event_identity, new_event_id, prior_rows_query
+
 # ---------- Setup logging ----------
 LOG_FILE = "logs/db_writer.log"
 os.makedirs("logs", exist_ok=True)
@@ -314,6 +316,34 @@ try:
                 pd.util.hash_pandas_object(df_summary[hash_cols], index=False)
                 .astype("int64")
             )
+
+        # ---- Cross-run event identity -------------------------------------
+        # Consecutive runs overlap by 66 of 72 hours, so without this an
+        # ongoing fault is re-detected and re-alerted by every run that can
+        # still see it (up to 12 Telegram messages for one condition).
+        # Continuations inherit the first detection's EventKey and are marked
+        # AlertSuppressed so alert_bot stays quiet about them.
+        try:
+            with engine.begin() as conn:
+                prior_rows = pd.read_sql(text(prior_rows_query()), conn)
+            df_summary = assign_event_identity(df_summary, prior_rows)
+            n_dupes = int(df_summary["AlertSuppressed"].sum())
+            logger.info(
+                f"[abnormal_sensor_history] Event identity: "
+                f"{len(df_summary) - n_dupes} new, {n_dupes} continuation(s) suppressed."
+            )
+        except Exception as e:
+            # Never let dedup failure block the write. Alerting loudly beats
+            # losing the detection entirely, so fall back to "everything is new".
+            logger.error(
+                f"[abnormal_sensor_history] Event identity failed ({e}); "
+                f"writing rows without dedup. If this mentions an invalid column, "
+                f"run migrations/002_event_identity.sql."
+            )
+            if "EventKey" not in df_summary.columns:
+                df_summary["EventKey"] = [new_event_id() for _ in range(len(df_summary))]
+                df_summary["DedupOfEventKey"] = ""
+                df_summary["AlertSuppressed"] = False
 
         target_table = "abnormal_sensor_history"  # schema defaults to dbo unless specified
 

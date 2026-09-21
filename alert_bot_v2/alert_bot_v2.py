@@ -134,12 +134,22 @@ rate_limiter = RateLimiter(MIN_INTERVAL_SEC)
 # DB helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def fetch_unsent(limit=None):
-    """Fetch rows that need alerts. Returns list of dicts."""
+    """
+    Fetch rows that need alerts. Returns list of dicts.
+
+    AlertSuppressed marks a detection that continues an event already
+    alerted on in an earlier run. The detector runs over a 72h window on a
+    6h cadence, so consecutive runs overlap by 66 hours and one ongoing
+    fault is re-detected by ~12 runs; without this filter each of those
+    sent its own Telegram message. ISNULL keeps rows written before the
+    column existed alertable.
+    """
     base_sql = """
         SELECT Id, Equipment, [Description], Plot_Path, SnapshotRunId
           FROM dbo.abnormal_sensor_history
          WHERE AlertTriggered IS NULL
            AND Plot_Path IS NOT NULL
+           AND ISNULL(AlertSuppressed, 0) = 0
         ORDER BY Id ASC
     """
     sql = base_sql if not limit else f"{base_sql} OFFSET 0 ROWS FETCH NEXT {int(limit)} ROWS ONLY"

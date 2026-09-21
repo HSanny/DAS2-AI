@@ -610,7 +610,7 @@ def build_sensor_summary(result_df: pd.DataFrame,
         "Equipment", "Description",
         "Total_Points", "Anomaly_Points", "Anomaly_Pct",
         "Num_Events", "First_Anomaly_Time", "Last_Anomaly_Time",
-        "Z_Points", "ISO_Points", "ROC_Points",
+        "Z_Points", "ISO_Points", "ROC_Points", "Rule_Invalid_Points",
         "Peak_RZ", "Max_ROC_Rate",
         "Mean_Value", "Median_Value",
         "Plot_Path",
@@ -667,6 +667,10 @@ def build_sensor_summary(result_df: pd.DataFrame,
             "Z_Points":  int(grp.loc[anom_mask, 'Z_Flag'].sum()),
             "ISO_Points": int(grp.loc[anom_mask, 'ISO_Flag'].sum()),
             "ROC_Points": int(grp.loc[anom_mask, 'ROC_Flag'].sum()),
+            # Physical range violations, reported separately: these are certain
+            # faults, not statistical inferences, and an operator triaging the
+            # alert needs to see that distinction immediately.
+            "Rule_Invalid_Points": int(grp.loc[anom_mask, 'Rule_Based_Invalid'].sum()),
             "Peak_RZ":     float(np.nanmax(np.abs(grp.loc[anom_mask, 'RZ']))),
             "Max_ROC_Rate": float(np.nanmax(grp.loc[anom_mask, 'ROC_Rate'])),
             "Mean_Value":  float(np.nanmean(grp['CurrValue'])),
@@ -1168,10 +1172,26 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
             g['ISO_Cont'] = used_cont
 
             voted = vote_and_smooth(zF, iF, dF, hard_overrides=(rz_abs > MAD_Z_HARD))
-            combined = pd.Series(np.asarray(voted, dtype=bool), index=g.index) & (~g['Rule_Based_Invalid'])
+
+            # Physically impossible readings used to be SUBTRACTED here
+            # (`voted & ~Rule_Based_Invalid`), so a pressure sensor reporting
+            # -5 bar was silently dropped instead of alerted. That is backwards:
+            # a reading outside the instrument's physical range is the single
+            # most certain fault signal available -- it needs no statistical
+            # inference at all.
+            #
+            # They are still excluded from the statistical channels (so a
+            # garbage value cannot also inflate the vote), then OR-ed back in
+            # AFTER event gating. The gating exists to filter weak statistical
+            # evidence; a physical violation is not weak evidence, and a single
+            # out-of-range sample is a real fault even though it is shorter
+            # than MIN_EVENT_LEN.
+            invalid = g['Rule_Based_Invalid'].fillna(False).to_numpy(dtype=bool)
+            combined = np.asarray(voted, dtype=bool) & (~invalid)
             suppress_steps_flag = bool(profile.get('suppress_steps', False))
+            gated = filter_events_by_impact(g, combined, suppress_steps=suppress_steps_flag)
             g['Combined_Anomaly'] = pd.Series(
-                filter_events_by_impact(g, combined.to_numpy(), suppress_steps=suppress_steps_flag),
+                np.asarray(gated, dtype=bool) | invalid,
                 index=g.index,
             )
 
@@ -1187,6 +1207,7 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
             z_pts    = int(g['Z_Flag'].sum())
             iso_pts  = int(g['ISO_Flag'].sum())
             roc_pts  = int(g['ROC_Flag'].sum())
+            inv_pts  = int(g['Rule_Based_Invalid'].sum())
 
             if comb_pts > 0:
                 abnormal_sensor_count += 1
@@ -1194,7 +1215,8 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
 
             sensor_time = time.time() - sensor_start
             if VERBOSE_LEVEL >= 1:
-                print(f"   -> Z:{z_pts} ISO:{iso_pts} ROC:{roc_pts} COMB:{comb_pts} events:{num_events} "
+                print(f"   -> Z:{z_pts} ISO:{iso_pts} ROC:{roc_pts} INVALID:{inv_pts} "
+                      f"COMB:{comb_pts} events:{num_events} "
                       f"time:{sensor_time:.2f}s", flush=True)
 
             if VERBOSE_LEVEL >= 1 and (idx % PRINT_EVERY == 0):
