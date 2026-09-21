@@ -25,3 +25,8 @@ tests/.tmp_*
 HISTORY/
 HISTALMEVT/
 HISTCURR/
+
+# Client credentials must never be committed
+deploy/.env
+deploy/notes.txt
+**/notes.txt
