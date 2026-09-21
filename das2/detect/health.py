@@ -1,0 +1,370 @@
+"""
+das2.detect.health
+==================
+
+Sensor-health detectors: is the *instrument* broken?
+
+These run on the raw irregular stream, need no resampling, and — crucially —
+need no quantile calibration. That last point is what gives the system a null
+hypothesis for the first time. The detector being replaced had none: its
+thresholds never bound, because a quantile always won, so it emitted about ten
+sensors per run whether the network was healthy or on fire.
+
+A range violation is not "the top 0.3% of points". It is a reading outside what
+the instrument can physically produce. On a quiet night it fires zero times.
+
+Every detector here is comparative where it has to be
+-----------------------------------------------------
+The temptation is absolute rules — "unchanged for 30 minutes", "silent for an
+hour". Measured against the real feed, those are catastrophic:
+
+* **57% of actively-reporting sensors never change value** in two hours, so an
+  absolute flatline rule raises ~1,400 alerts per run.
+* Reporting cadence spans 120 s to 4,798 s between sensors, so a fixed silence
+  timeout pages for every slow-scanning sensor.
+* An idle flowmeter sitting at zero with symmetric noise reads negative about
+  half the time, so a raw `value < 0` range test flagged 1,079 points from one
+  healthy meter in a smoke run.
+
+So `FLATLINE` asks the sensor's own profile whether it is supposed to move,
+`STALE` compares against that sensor's own historical cadence, and
+`RANGE_VIOLATION` must clear the sensor's own measured noise.
+
+Where a profile is missing or too thin, the detector **abstains** rather than
+guessing. A detector that stays quiet when it cannot tell is worth far more than
+one that guesses and has to be switched off.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+
+from das2.detect.profile import SensorProfile
+from das2.timeutils import to_epoch_seconds
+from das2.models import AnomalyType, Signal
+
+DETECTOR = "health"
+
+
+# --------------------------------------------------------------------------- #
+# Tunables
+# --------------------------------------------------------------------------- #
+#: A flatline must exceed the sensor's own longest normal flat run by this
+#: multiple before it counts. Generous on purpose: the cost of a false "your
+#: sensor is frozen" is an engineer driving to a working instrument.
+FLATLINE_MULTIPLE = 3.0
+
+#: Silence is judged against the sensor's own p99 reporting interval, times this.
+#: A sensor that normally reports every 120 s with a p99 of 300 s is stale after
+#: ~25 minutes; one that normally reports hourly is not.
+STALE_MULTIPLE = 5.0
+STALE_FLOOR_S = 1800.0
+
+#: A range violation must clear this many robust sigma of the sensor's own noise.
+RANGE_TOLERANCE_SIGMA = 6.0
+
+#: Rate-of-change beyond this many robust sigma per second is a spike.
+SPIKE_SIGMA = 8.0
+
+#: Reverse flow must be sustained to distinguish a real backflow from noise
+#: around zero on an idle meter.
+REVERSE_FLOW_MIN_S = 300.0
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Contiguous True runs as (start, end) inclusive index pairs."""
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return []
+    splits = np.flatnonzero(np.diff(idx) > 1)
+    starts = np.r_[idx[0], idx[splits + 1]]
+    ends = np.r_[idx[splits], idx[-1]]
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def _scale(values: np.ndarray, profile: SensorProfile | None) -> float:
+    """
+    Robust spread, floored so a quiet sensor is not scored against zero.
+
+    Without the floor, any excursion on a constant sensor scores zero: a flat
+    neighbourhood has MAD 0, and dividing by it yields no signal at all. That
+    was a measured defect in the previous detector — 300 zeros plus a spike to
+    250.0 scored exactly 0.000.
+    """
+    if profile is not None and np.isfinite(profile.mad) and profile.mad > 0:
+        sigma = 1.4826 * profile.mad
+    else:
+        med = float(np.median(values))
+        sigma = 1.4826 * float(np.median(np.abs(values - med)))
+    resolution = profile.resolution if profile else 0.0
+    return max(sigma, float(resolution), 1e-12)
+
+
+# --------------------------------------------------------------------------- #
+# Detectors
+# --------------------------------------------------------------------------- #
+def detect_flatline(ts: pd.Series, values: np.ndarray,
+                    profile: SensorProfile | None) -> list[Signal]:
+    """
+    The sensor is still reporting, but the value has frozen.
+
+    Abstains unless the profile says this sensor normally moves. That guard is
+    the whole detector: without it this fires on 57% of the healthy fleet.
+    """
+    if profile is None or not profile.is_well_observed or profile.is_static:
+        return []
+    if len(values) < 3:
+        return []
+
+    seconds = to_epoch_seconds(ts)
+    threshold = profile.expected_flat_seconds * FLATLINE_MULTIPLE
+
+    signals: list[Signal] = []
+    start = 0
+    for i in range(1, len(values) + 1):
+        ended = i == len(values) or values[i] != values[start]
+        if not ended:
+            continue
+        duration = seconds[i - 1] - seconds[start]
+        # n_raw >= 2 by construction here: the sensor kept reporting through the
+        # flat stretch, which is what separates a frozen value from a dropout.
+        if duration >= threshold and (i - start) >= 2:
+            signals.append(Signal(
+                type=AnomalyType.FLATLINE,
+                start=pd.Timestamp(ts.iloc[start]).to_pydatetime(),
+                end=pd.Timestamp(ts.iloc[i - 1]).to_pydatetime(),
+                detector=DETECTOR,
+                magnitude=duration,
+                unit="s",
+                n_points=i - start,
+                detail={
+                    "value": float(values[start]),
+                    "normal_flat_s": round(profile.expected_flat_seconds, 1),
+                    "normal_change_rate_per_hour": profile.change_rate_per_hour,
+                },
+            ))
+        start = i
+    return signals
+
+
+def detect_stale(ts: pd.Series, profile: SensorProfile | None,
+                 window_end: datetime | None = None) -> list[Signal]:
+    """
+    The sensor has stopped reporting.
+
+    Distinct from FLATLINE: this is an absence of rows, not a frozen value.
+    Conflating the two loses the difference between "instrument stuck at a
+    plausible reading" and "RTU offline", which need different responses.
+
+    Judged against the sensor's own p99 interval, because cadence spans 120 s to
+    4,798 s across this fleet and a single global timeout cannot serve both.
+    """
+    if profile is None or not profile.is_well_observed:
+        return []
+    if not np.isfinite(profile.p99_interval_s) or profile.p99_interval_s <= 0:
+        return []
+    if len(ts) == 0:
+        return []
+
+    threshold = max(profile.p99_interval_s * STALE_MULTIPLE, STALE_FLOOR_S)
+    times = pd.to_datetime(pd.Series(ts)).sort_values().reset_index(drop=True)
+    seconds = to_epoch_seconds(times)
+
+    signals: list[Signal] = []
+    gaps = np.diff(seconds)
+    for i in np.flatnonzero(gaps >= threshold):
+        signals.append(Signal(
+            type=AnomalyType.STALE,
+            start=pd.Timestamp(times.iloc[i]).to_pydatetime(),
+            end=pd.Timestamp(times.iloc[i + 1]).to_pydatetime(),
+            detector=DETECTOR,
+            magnitude=float(gaps[i]),
+            unit="s",
+            n_points=0,
+            detail={"normal_p99_interval_s": round(profile.p99_interval_s, 1)},
+        ))
+
+    # Still silent at the end of the window: the most urgent case, and one a
+    # gap-based scan alone would miss because there is no closing row.
+    if window_end is not None:
+        trailing = (pd.Timestamp(window_end).timestamp() - seconds[-1])
+        if trailing >= threshold:
+            signals.append(Signal(
+                type=AnomalyType.STALE,
+                start=pd.Timestamp(times.iloc[-1]).to_pydatetime(),
+                end=pd.Timestamp(window_end).to_pydatetime(),
+                detector=DETECTOR,
+                magnitude=float(trailing),
+                unit="s",
+                n_points=0,
+                detail={"ongoing": True,
+                        "normal_p99_interval_s": round(profile.p99_interval_s, 1)},
+            ))
+    return signals
+
+
+def detect_range_violation(ts: pd.Series, values: np.ndarray,
+                           range_min: float | None, range_max: float | None,
+                           profile: SensorProfile | None,
+                           unit: str = "") -> list[Signal]:
+    """
+    A reading outside what the instrument can physically produce.
+
+    Needs no statistics at all, which is what makes it the backbone of the null
+    hypothesis — but it does need a deadband. The bounds are fleet-wide, and an
+    idle flowmeter at zero with symmetric noise reads negative about half the
+    time: testing raw `value < 0` produced 1,079 flagged points and 542 events
+    from one healthy meter.
+    """
+    if range_min is None and range_max is None:
+        return []
+    if len(values) == 0:
+        return []
+
+    tolerance = RANGE_TOLERANCE_SIGMA * _scale(values, profile)
+    below = values < (range_min - tolerance) if range_min is not None else np.zeros(len(values), bool)
+    above = values > (range_max + tolerance) if range_max is not None else np.zeros(len(values), bool)
+    mask = below | above
+    if not mask.any():
+        return []
+
+    signals: list[Signal] = []
+    for s, e in _runs(mask):
+        segment = values[s:e + 1]
+        worst = segment[np.argmax(np.abs(segment - np.clip(
+            segment, range_min if range_min is not None else -np.inf,
+            range_max if range_max is not None else np.inf)))]
+        bound = range_min if worst < (range_min or -np.inf) else range_max
+        signals.append(Signal(
+            type=AnomalyType.RANGE_VIOLATION,
+            start=pd.Timestamp(ts.iloc[s]).to_pydatetime(),
+            end=pd.Timestamp(ts.iloc[e]).to_pydatetime(),
+            detector=DETECTOR,
+            magnitude=float(abs(worst - bound)) if bound is not None else float(worst),
+            unit=unit,
+            n_points=e - s + 1,
+            detail={"worst_value": float(worst), "bound": bound,
+                    "deadband": round(tolerance, 6)},
+        ))
+    return signals
+
+
+def detect_spike(ts: pd.Series, values: np.ndarray,
+                 profile: SensorProfile | None, unit: str = "") -> list[Signal]:
+    """
+    Rate of change far beyond anything this sensor normally does.
+
+    Non-positive intervals are dropped rather than divided by: 7% of sensors
+    have duplicate timestamps and 12% have out-of-order rows, and a naive dv/dt
+    turns every one of those into an infinite-rate spike.
+    """
+    if len(values) < 3:
+        return []
+    seconds = to_epoch_seconds(ts)
+    dv = np.diff(values)
+    dt = np.diff(seconds)
+    dt = np.where(dt > 0, dt, np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rate = np.abs(dv / dt)
+    finite = rate[np.isfinite(rate)]
+    if finite.size < 5:
+        return []
+
+    med = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - med)))
+    threshold = med + SPIKE_SIGMA * 1.4826 * mad
+    if not np.isfinite(threshold) or threshold <= 0:
+        return []
+
+    mask = np.zeros(len(values), dtype=bool)
+    mask[1:] = np.nan_to_num(rate, nan=0.0) > threshold
+    if not mask.any():
+        return []
+
+    signals: list[Signal] = []
+    for s, e in _runs(mask):
+        peak = float(np.nanmax(rate[max(0, s - 1):e]))
+        signals.append(Signal(
+            type=AnomalyType.SPIKE,
+            start=pd.Timestamp(ts.iloc[max(0, s - 1)]).to_pydatetime(),
+            end=pd.Timestamp(ts.iloc[e]).to_pydatetime(),
+            detector=DETECTOR,
+            magnitude=peak,
+            unit=f"{unit}/s" if unit else "/s",
+            n_points=e - s + 1,
+            detail={"threshold": round(threshold, 6)},
+        ))
+    return signals
+
+
+def detect_reverse_flow(ts: pd.Series, values: np.ndarray,
+                        profile: SensorProfile | None,
+                        unit: str = "") -> list[Signal]:
+    """
+    Sustained negative flow — backflow through a failed non-return valve.
+
+    A real, operationally important event. The previous pipeline discarded these
+    as "invalid", which is backwards. Must be sustained and clear the noise
+    deadband, so an idle meter dithering around zero does not qualify.
+    """
+    if len(values) < 3:
+        return []
+    tolerance = RANGE_TOLERANCE_SIGMA * _scale(values, profile)
+    mask = values < -tolerance
+    if not mask.any():
+        return []
+
+    seconds = to_epoch_seconds(ts)
+    signals: list[Signal] = []
+    for s, e in _runs(mask):
+        duration = float(seconds[e] - seconds[s])
+        if duration < REVERSE_FLOW_MIN_S:
+            continue
+        signals.append(Signal(
+            type=AnomalyType.REVERSE_FLOW,
+            start=pd.Timestamp(ts.iloc[s]).to_pydatetime(),
+            end=pd.Timestamp(ts.iloc[e]).to_pydatetime(),
+            detector=DETECTOR,
+            magnitude=float(abs(np.min(values[s:e + 1]))),
+            unit=unit,
+            n_points=e - s + 1,
+            detail={"duration_s": duration, "deadband": round(tolerance, 6)},
+        ))
+    return signals
+
+
+# --------------------------------------------------------------------------- #
+def run_health_checks(ts: pd.Series, values: np.ndarray,
+                      profile: SensorProfile | None = None,
+                      *, equipment_kind: str = "measurement",
+                      range_min: float | None = None,
+                      range_max: float | None = None,
+                      unit: str = "",
+                      is_flow: bool = False,
+                      window_end: datetime | None = None) -> list[Signal]:
+    """
+    Every health detector for one sensor.
+
+    Counters (kWh, run hours) are skipped entirely: they only ever climb, so a
+    flat counter means the plant is idle and a drop means a rollover. Running
+    flatline or spike detection over them produces nothing but noise.
+
+    Config points (setpoints, simulation values) are skipped because their value
+    is an operator decision — there is nothing for an anomaly detector to say.
+    """
+    if equipment_kind in ("counter", "config"):
+        return []
+    if len(values) == 0:
+        return []
+
+    signals: list[Signal] = []
+    signals += detect_flatline(ts, values, profile)
+    signals += detect_stale(ts, profile, window_end=window_end)
+    signals += detect_range_violation(ts, values, range_min, range_max, profile, unit)
+    signals += detect_spike(ts, values, profile, unit)
+    if is_flow:
+        signals += detect_reverse_flow(ts, values, profile, unit)
+    return signals
