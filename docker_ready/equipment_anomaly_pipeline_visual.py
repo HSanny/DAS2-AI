@@ -84,6 +84,48 @@ Z_EVENT_MIN   = 5.5
 REL_JUMP_MIN  = 0.10
 ROC_EVENT_RATE= 0.20
 
+# =========================
+# Time-based windows
+# =========================
+# Every window and gate above is counted in SAMPLES, but this feed is
+# report-by-exception and sensors report at wildly different rates. Measured
+# over the same 72h window (abnormal_sensor_backup.csv):
+#
+#   PulauTekong-Dissolved-Oxygen   16482 points ->  15.7 s between reports
+#   Kranji1PS-Total-Flow-Rate       2083 points -> 124.4 s between reports
+#
+# So ROLL_WIN_Z = 24 is a 6.3-minute baseline on one sensor and a 49.8-minute
+# baseline on the other -- an 8x difference in what the detector actually does,
+# from a single constant. MIN_EVENT_LEN is worse, because it is a HARD filter:
+# a 2-minute glitch alerts on the fast sensor and is silently discarded on the
+# slow one. Neither behaviour was chosen; both fall out of the sampling rate.
+#
+# These are the same gates expressed as durations, then converted per sensor
+# using that sensor's own median inter-arrival time.
+#
+# The values are anchored to ~120 s, the median inter-arrival across the
+# sensors in the shipped sample (9 of the 10 cluster between 90 s and 125 s).
+# That is deliberate: it leaves behaviour UNCHANGED for the large majority of
+# sensors and corrects only the fast outliers, so this fix does not quietly
+# move alert volume for the whole fleet at the same time.
+#
+# Set USE_TIME_BASED_WINDOWS=0 to restore the old sample-counted behaviour --
+# needed as the control arm when shadow-comparing detector versions.
+USE_TIME_BASED_WINDOWS = os.getenv("USE_TIME_BASED_WINDOWS", "1").strip() == "1"
+
+ROLL_WIN_Z_SEC      = int(os.getenv("ROLL_WIN_Z_SEC",      "2880"))  # 48 min
+ISO_WIN_SEC         = int(os.getenv("ISO_WIN_SEC",         "1440"))  # 24 min
+MIN_EVENT_SEC       = int(os.getenv("MIN_EVENT_SEC",        "720"))  # 12 min
+MERGE_GAP_SEC       = int(os.getenv("MERGE_GAP_SEC",        "360"))  #  6 min
+COOLDOWN_SEC        = int(os.getenv("COOLDOWN_SEC",        "1440"))  # 24 min
+STEP_WINDOW_SEC     = int(os.getenv("STEP_WINDOW_SEC",     "2400"))  # 40 min
+STEP_WINDOW_MIN_SEC = int(os.getenv("STEP_WINDOW_MIN_SEC",  "600"))  # 10 min
+
+# Sample counts are clamped so a pathological rate cannot produce a window of
+# 3 points (meaningless) or 50 000 (unusably slow).
+WINDOW_MIN_SAMPLES = 3
+WINDOW_MAX_SAMPLES = 500
+
 # Sensor-level selection (for final outputs)
 MAX_ABNORMAL_SENSORS        = 10  # hard cap on sensors to send out
 REQUIRED_METHODS_PER_SENSOR = 2   # how many detection families must contribute anomalies
@@ -156,15 +198,141 @@ LOG_FILE      = "logs/detector_errors.log"
 
 
 # ================= Helpers =================
-def is_rule_invalid(equipment, value):
-    if equipment == 'Temperature':       return value < 0 or value > 60
-    elif equipment == 'Flowrate':        return value < 0 or value > 2000
-    elif equipment == 'Conductivity':    return value < 0 or value > 50000
-    elif equipment == 'Pressure':        return value < 0 or value > 20
-    elif equipment == 'Voltage':         return value < 0 or value > 500
-    elif equipment == 'Dissolved Oxygen':return value < 0 or value > 20
-    elif equipment == 'LevelSensor':     return value < 0 or value > 100
-    return False
+# Physical plausibility ranges per equipment class.
+#
+# These are fleet-wide and crude -- "Pressure 0..20" is applied to every
+# pressure sensor in Singapore, while the shipped sample contains pressure
+# sensors with medians of 0.0034 and 3.90, so the band is far too wide to be
+# useful for either. Replacing them with the per-point HH/H/L/LL limits already
+# commissioned in the SCADA is the single highest-value improvement available
+# here, but those limits are not in the current feed.
+EQUIPMENT_RANGES = {
+    'Temperature':      (0.0, 60.0),
+    'Flowrate':         (0.0, 2000.0),
+    'Conductivity':     (0.0, 50000.0),
+    'Pressure':         (0.0, 20.0),
+    'Voltage':          (0.0, 500.0),
+    'Dissolved Oxygen': (0.0, 20.0),
+    'LevelSensor':      (0.0, 100.0),
+}
+
+# A range violation must clear the sensor's OWN noise before it counts.
+#
+# Without this, the bound is applied to raw values and an idle flowmeter
+# sitting at zero with symmetric measurement noise reports negative readings
+# roughly half the time. On the shipped sample, MRRS-THOMSON FLOWMETER has
+# Median_Value 0.001302 -- it is idle almost always. Testing `value < 0`
+# against it flags ~53% of its samples as physically impossible.
+#
+# That was harmless only because violations used to be discarded. Now that they
+# alert (correctly -- see the combine step), the raw bound would turn one
+# healthy idle meter into ~1000 anomalies per run. Measured in a smoke run
+# before this deadband existed: 1079 flagged points and 542 events, from a
+# sensor doing nothing wrong.
+RANGE_TOLERANCE_SIGMA = float(os.getenv("RANGE_TOLERANCE_SIGMA", "6.0"))
+
+
+def range_tolerance(values, resolution=0.0):
+    """
+    Deadband outside the physical range, from the sensor's own spread.
+
+    Uses a robust sigma so the tolerance is not itself inflated by the
+    excursions being tested for, and floors at the measurement resolution: a
+    reading cannot meaningfully violate a bound by less than the instrument
+    can resolve.
+    """
+    v = pd.Series(values).astype(float)
+    med = v.median()
+    mad = (v - med).abs().median()
+    sigma = 1.4826 * float(mad) if pd.notna(mad) else 0.0
+    return max(RANGE_TOLERANCE_SIGMA * sigma, float(resolution), 0.0)
+
+
+def range_violation_mask(equipment, values, tolerance=0.0):
+    """
+    Boolean mask of readings outside the equipment's physical range by more
+    than `tolerance`.
+
+    Note that a genuinely negative flow beyond the deadband still flags. That
+    is intended -- reverse flow through a failed non-return valve is a real and
+    important event. It is currently reported as a range violation; typing it
+    as its own anomaly class is Phase 4 work.
+    """
+    v = np.asarray(values, dtype=float)
+    bounds = EQUIPMENT_RANGES.get(equipment)
+    if bounds is None:
+        return np.zeros(len(v), dtype=bool)
+    lo, hi = bounds
+    with np.errstate(invalid="ignore"):
+        return (v < lo - tolerance) | (v > hi + tolerance)
+
+
+def is_rule_invalid(equipment, value, tolerance=0.0):
+    """Scalar form, kept for callers that check a single reading."""
+    bounds = EQUIPMENT_RANGES.get(equipment)
+    if bounds is None:
+        return False
+    lo, hi = bounds
+    return bool(value < lo - tolerance or value > hi + tolerance)
+
+
+def median_interval_seconds(timestamps) -> float:
+    """
+    Median seconds between consecutive reports for one sensor.
+
+    Only positive intervals count: duplicate timestamps (dt == 0) and
+    out-of-order rows (dt < 0) both occur in this feed and would drag the
+    median towards zero, which would then inflate every derived window.
+
+    Returns NaN when there is nothing usable to measure.
+    """
+    ts = pd.to_datetime(pd.Series(timestamps).reset_index(drop=True))
+    dt = ts.diff().dt.total_seconds()
+    dt = dt[dt > 0]
+    return float(dt.median()) if len(dt) else float("nan")
+
+
+def samples_for(seconds: float, median_dt: float, fallback: int) -> int:
+    """
+    Convert a duration into a sample count for one sensor.
+
+    Falls back to the legacy sample-counted constant when the rate cannot be
+    measured, so a sensor with unusable timestamps still gets analysed rather
+    than silently skipped.
+    """
+    if not (median_dt and np.isfinite(median_dt) and median_dt > 0):
+        return int(fallback)
+    n = int(round(seconds / median_dt))
+    return int(np.clip(n, WINDOW_MIN_SAMPLES, WINDOW_MAX_SAMPLES))
+
+
+def compute_sensor_windows(timestamps) -> dict:
+    """
+    Per-sensor sample counts for every window and gate, derived from that
+    sensor's own reporting rate. See the time-based windows block in Tunables.
+    """
+    if not USE_TIME_BASED_WINDOWS:
+        return {
+            "median_dt_s": float("nan"),
+            "roll_win_z": ROLL_WIN_Z,
+            "iso_win": ISO_WIN,
+            "min_event_len": MIN_EVENT_LEN,
+            "merge_gap": MERGE_GAP,
+            "cooldown": COOLDOWN,
+            "step_window": STEP_WINDOW_SAMPLES,
+            "step_window_min": STEP_WINDOW_MIN,
+        }
+    dt = median_interval_seconds(timestamps)
+    return {
+        "median_dt_s": dt,
+        "roll_win_z": samples_for(ROLL_WIN_Z_SEC, dt, ROLL_WIN_Z),
+        "iso_win": samples_for(ISO_WIN_SEC, dt, ISO_WIN),
+        "min_event_len": samples_for(MIN_EVENT_SEC, dt, MIN_EVENT_LEN),
+        "merge_gap": samples_for(MERGE_GAP_SEC, dt, MERGE_GAP),
+        "cooldown": samples_for(COOLDOWN_SEC, dt, COOLDOWN),
+        "step_window": samples_for(STEP_WINDOW_SEC, dt, STEP_WINDOW_SAMPLES),
+        "step_window_min": samples_for(STEP_WINDOW_MIN_SEC, dt, STEP_WINDOW_MIN),
+    }
 
 
 def resolution_estimate(values, min_active_frac=RESOLUTION_MIN_ACTIVE_FRAC):
@@ -334,8 +502,8 @@ def auto_contamination(values, floor=0.001, ceil=0.05):
     return float(np.clip(max(est, ISO_BASE_CONTAM * 0.5), floor, ceil))
 
 
-def isolation_forest_detection(values):
-    X = features_for_iso(values, win=ISO_WIN)
+def isolation_forest_detection(values, win=ISO_WIN):
+    X = features_for_iso(values, win=win)
     cont = auto_contamination(values)
     clf = IsolationForest(
         n_estimators=ISO_N_ESTIMATORS,
@@ -436,7 +604,9 @@ def apply_cooldown(flags, cooldown=6):
     return out
 
 
-def vote_and_smooth(z_flags, iso_flags, roc_flags, hard_overrides=None):
+def vote_and_smooth(z_flags, iso_flags, roc_flags, hard_overrides=None,
+                    min_event_len=MIN_EVENT_LEN, merge_gap=MERGE_GAP,
+                    cooldown=COOLDOWN):
     zf = np.asarray(z_flags, dtype=bool)
     if iso_flags is None:
         iso_flags = np.zeros_like(zf)
@@ -446,8 +616,8 @@ def vote_and_smooth(z_flags, iso_flags, roc_flags, hard_overrides=None):
         hard_overrides = np.zeros_like(zf)
     votes = zf.astype(int) + iso_flags.astype(int) + roc_flags.astype(int)
     base = (votes >= 2) | np.asarray(hard_overrides, dtype=bool)
-    filtered = apply_run_length_filters(base, min_len=MIN_EVENT_LEN, merge_gap=MERGE_GAP)
-    cooled   = apply_cooldown(filtered, cooldown=COOLDOWN)
+    filtered = apply_run_length_filters(base, min_len=min_event_len, merge_gap=merge_gap)
+    cooled   = apply_cooldown(filtered, cooldown=cooldown)
     return cooled
 
 
@@ -500,7 +670,10 @@ def _is_step_transition(g, s, e,
     return level_diff_pct >= min_level_diff_pct
 
 
-def filter_events_by_impact(g, flags, suppress_steps=False):
+def filter_events_by_impact(g, flags, suppress_steps=False,
+                            min_event_len=MIN_EVENT_LEN,
+                            step_window=STEP_WINDOW_SAMPLES,
+                            step_window_min=STEP_WINDOW_MIN):
     flags = np.asarray(flags, dtype=bool)
     out = np.zeros_like(flags)
     runs = _runs(flags)
@@ -512,7 +685,9 @@ def filter_events_by_impact(g, flags, suppress_steps=False):
         # Edge / step-change suppression: only applied for equipment profiles
         # where suppress_steps=True (pumps/valves can cycle, so a clean step
         # transition is normal operation).
-        if suppress_steps and _is_step_transition(g, s, e):
+        if suppress_steps and _is_step_transition(g, s, e,
+                                                  window=step_window,
+                                                  min_window=step_window_min):
             continue  # skip — treat as a state transition, not a fault
 
         seg = g.iloc[s:e + 1]
@@ -521,7 +696,7 @@ def filter_events_by_impact(g, flags, suppress_steps=False):
         rel_jump = abs(seg['CurrValue'].iloc[-1] - seg['CurrValue'].iloc[0]) / med_abs
         roc_flag_frac = float(seg.get('ROC_Flag', pd.Series([False] * len(seg))).mean())
         keep = (
-            (dur >= MIN_EVENT_LEN) and
+            (dur >= min_event_len) and
             ((peak_rz >= Z_EVENT_MIN) or
              (rel_jump >= REL_JUMP_MIN) or
              (roc_flag_frac >= ROC_EVENT_RATE))
@@ -1111,7 +1286,10 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
         try:
             g = g.sort_values('DateTime').reset_index(drop=True).copy()
             n_rows = len(g)
-            if n_rows < max(MIN_SENSOR_POINTS, ROLL_WIN_Z + 5):
+            # Windows are derived from THIS sensor's reporting rate, so the
+            # same gate means the same duration on every sensor.
+            win = compute_sensor_windows(g['DateTime'])
+            if n_rows < max(MIN_SENSOR_POINTS, win['roll_win_z'] + 5):
                 if VERBOSE_LEVEL >= 2:
                     print(f"[{idx}/{total_pairs}] Skip {equipment} | {description}: not enough points ({n_rows}).", flush=True)
                 continue
@@ -1122,23 +1300,30 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
             use_roc = profile.get('use_roc', True)
 
             if VERBOSE_LEVEL >= 1:
-                print(f"[{idx}/{total_pairs}] {equipment} | {description} (rows={n_rows}) "
+                print(f"[{idx}/{total_pairs}] {equipment} | {description} (rows={n_rows}, "
+                      f"dt={win['median_dt_s']:.0f}s, z_win={win['roll_win_z']}) "
                       f"[use_z={use_z}, use_iso={use_iso}, use_roc={use_roc}]...", flush=True)
 
             values = g['CurrValue'].astype(float).values
 
             # Rule invalids
-            g['Rule_Based_Invalid'] = g['CurrValue'].apply(lambda v: is_rule_invalid(equipment, v))
+            # Deadband from this sensor's own noise -- see range_tolerance.
+            sensor_resolution = resolution_estimate(values)
+            range_tol = range_tolerance(values, sensor_resolution)
+            g['Rule_Based_Invalid'] = pd.Series(
+                range_violation_mask(equipment, values, tolerance=range_tol),
+                index=g.index,
+            )
 
             # Robust Z is always computed (used for diagnostics even if we don't vote with it)
-            rz, _, _ = robust_z(values, window=min(ROLL_WIN_Z, max(5, len(values) // 10)))
+            rz, _, _ = robust_z(values, window=win['roll_win_z'], resolution=sensor_resolution)
             g['RZ'] = rz
 
             # Isolation Forest (optional per profile)
             iso_flags = None
             iso_cont  = np.nan
             if use_iso and np.nanstd(values) > 1e-9:
-                iso_flags, iso_cont = isolation_forest_detection(values)
+                iso_flags, iso_cont = isolation_forest_detection(values, win=win['iso_win'])
             g['ISO_Flag'] = pd.Series(
                 iso_flags if iso_flags is not None else np.zeros(n_rows, dtype=bool),
                 index=g.index
@@ -1171,7 +1356,13 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
             g['ISO_Flag'] = pd.Series(iF, index=g.index)
             g['ISO_Cont'] = used_cont
 
-            voted = vote_and_smooth(zF, iF, dF, hard_overrides=(rz_abs > MAD_Z_HARD))
+            voted = vote_and_smooth(
+                zF, iF, dF,
+                hard_overrides=(rz_abs > MAD_Z_HARD),
+                min_event_len=win['min_event_len'],
+                merge_gap=win['merge_gap'],
+                cooldown=win['cooldown'],
+            )
 
             # Physically impossible readings used to be SUBTRACTED here
             # (`voted & ~Rule_Based_Invalid`), so a pressure sensor reporting
@@ -1189,7 +1380,13 @@ def equipment_aware_anomaly_pipeline(filepath, output_dir=PLOTS_DIR):
             invalid = g['Rule_Based_Invalid'].fillna(False).to_numpy(dtype=bool)
             combined = np.asarray(voted, dtype=bool) & (~invalid)
             suppress_steps_flag = bool(profile.get('suppress_steps', False))
-            gated = filter_events_by_impact(g, combined, suppress_steps=suppress_steps_flag)
+            gated = filter_events_by_impact(
+                g, combined,
+                suppress_steps=suppress_steps_flag,
+                min_event_len=win['min_event_len'],
+                step_window=win['step_window'],
+                step_window_min=win['step_window_min'],
+            )
             g['Combined_Anomaly'] = pd.Series(
                 np.asarray(gated, dtype=bool) | invalid,
                 index=g.index,
