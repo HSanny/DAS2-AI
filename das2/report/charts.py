@@ -229,13 +229,22 @@ def sensor_detail_png(ts, values, anomaly, out_path: str | Path) -> Path:
     return out_path
 
 
-def run_charts(result, out_dir: str | Path) -> dict[str, Path]:
-    """Every PNG for one run. Returns {name: path}."""
+def run_charts(result, out_dir: str | Path, *,
+               stamped: bool = True) -> dict[str, Path]:
+    """
+    Every PNG for one run. Returns {name: path}.
+
+    `stamped` puts the run id in each filename, which is what a flat output
+    directory needs. A caller writing into a per-run directory passes False:
+    the directory already carries the run id, and repeating it in every file
+    inside it reads as a mistake.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"_{result.run_id}" if stamped else ""
     return {
         "map": region_map_png(result.incidents,
-                              out_dir / f"map_{result.run_id}.png"),
+                              out_dir / f"map{suffix}.png"),
         "matrix": region_matrix_png(result.region_matrix,
-                                    out_dir / f"matrix_{result.run_id}.png"),
+                                    out_dir / f"matrix{suffix}.png"),
     }

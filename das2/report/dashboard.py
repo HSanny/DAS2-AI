@@ -145,21 +145,54 @@ def build_payload(result) -> dict[str, Any]:
     }
 
 
-def render(result, *, title: str = "DAS2 — Sensor Intelligence") -> str:
+#: OpenStreetMap's own tiles: no account, no key, no registration.
+#:
+#: The previous default was CARTO's basemap CDN, which has since started
+#: answering with tiles that read "API key required" -- so the map rendered
+#: perfectly and every tile was a notice instead of Singapore, which is a
+#: worse failure than no basemap at all because it looks like a bug in this
+#: page. OSM's tile policy is fine for an operations dashboard opened a few
+#: times an hour; a busy deployment, or an isolated network with its own tile
+#: server, should point DAS2_REPORT_MAP_TILE_URL somewhere else.
+DEFAULT_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+DEFAULT_TILE_ATTRIBUTION = (
+    '&copy; <a href="https://www.openstreetmap.org/copyright">'
+    'OpenStreetMap</a> contributors'
+)
+
+
+def render(result, *, title: str = "DAS2 — Sensor Intelligence",
+           tile_url: str = "", tile_attribution: str = "") -> str:
     """Render the full HTML page as a string."""
     payload = build_payload(result)
     data = json.dumps(payload, default=str, separators=(",", ":"))
-    return _TEMPLATE.replace("__TITLE__", html.escape(title)) \
-                    .replace("__PAYLOAD__", data.replace("</", "<\\/"))
+    return (_TEMPLATE
+            .replace("__TITLE__", html.escape(title))
+            .replace("__TILE_URL__",
+                     json.dumps(tile_url or DEFAULT_TILE_URL))
+            .replace("__TILE_ATTRIBUTION__",
+                     json.dumps(tile_attribution or DEFAULT_TILE_ATTRIBUTION))
+            .replace("__PAYLOAD__", data.replace("</", "<\\/")))
 
 
 def write(result, out_dir: str | Path, *,
-          title: str = "DAS2 — Sensor Intelligence") -> Path:
-    """Write `dashboard_<run_id>.html` and return its path."""
+          title: str = "DAS2 — Sensor Intelligence",
+          filename: str = "",
+          tile_url: str = "", tile_attribution: str = "") -> Path:
+    """
+    Write the dashboard HTML and return its path.
+
+    `filename` defaults to `dashboard_<run_id>.html`. A caller writing into a
+    per-run directory passes `dashboard.html`, since the directory already
+    carries the run id and repeating it reads as a mistake.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"dashboard_{result.run_id}.html"
-    path.write_text(render(result, title=title), encoding="utf-8")
+    path = out_dir / (filename or f"dashboard_{result.run_id}.html")
+    path.write_text(
+        render(result, title=title, tile_url=tile_url,
+               tile_attribution=tile_attribution),
+        encoding="utf-8")
     return path
 
 
@@ -357,8 +390,13 @@ if (!placed.length) {
 } else {
   try {
     const map = L.map("map").setView([1.3521, 103.8198], 11);
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-      {maxZoom: 18, attribution: "&copy; OpenStreetMap, &copy; CARTO"}).addTo(map);
+    // OpenStreetMap's own tiles, which need no account and no key. This was
+    // CARTO's basemap CDN, which now answers with tiles that read "API key
+    // required" -- so the map rendered, and every tile was a notice instead
+    // of Singapore. Swappable via DAS2_REPORT_MAP_TILE_URL for an internal
+    // tile server, which is the right answer on an isolated network.
+    L.tileLayer(__TILE_URL__, {maxZoom: 19, attribution: __TILE_ATTRIBUTION__})
+      .addTo(map);
 
     const group = [];
     placed.forEach(i => {

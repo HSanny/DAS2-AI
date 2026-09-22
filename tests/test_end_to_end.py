@@ -201,6 +201,23 @@ def main():
         # --- the deliverable -------------------------------------------------- #
         print("\nthe dashboard")
         path = dashboard.write(result, out)
+        page = path.read_text(encoding="utf-8")
+        # CARTO's basemap CDN began answering with tiles that read "API key
+        # required", so the map rendered perfectly and every tile was a
+        # notice instead of Singapore -- a worse failure than no basemap,
+        # because it looks like a bug in this page.
+        check("the basemap needs no API key",
+              "openstreetmap.org/{z}/{x}/{y}" in page
+              and "cartocdn" not in page,
+              "(OSM tiles: no account, no key)")
+        check("no template placeholder survived rendering",
+              "__TILE_URL__" not in page and "__TILE_ATTRIBUTION__" not in page)
+        custom = dashboard.write(result, out, filename="custom.html",
+                                 tile_url="https://tiles.internal/{z}/{x}/{y}.png",
+                                 tile_attribution="PUB")
+        check("an internal tile server can replace it",
+              "tiles.internal" in custom.read_text(encoding="utf-8"),
+              "(the right answer on a network with no internet)")
         check("an HTML file is written", path.exists())
         html = path.read_text()
         check("it is self-contained enough to email", len(html) > 8_000,

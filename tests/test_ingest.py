@@ -194,6 +194,18 @@ def main():
         check("an explicit file is honoured, not overridden",
               resolve_inventory_path(exact) == exact)
 
+    with _tf.TemporaryDirectory() as td:
+        # glob() is case-sensitive on Linux; the CIFS share this reads is not.
+        # The real files are `hts_HISTCURR_...` and the fixtures are
+        # `histcurr_fujitsu.csv`, so a case-sensitive pattern finds one and
+        # silently misses the other -- passing every test and failing on the
+        # only machine that matters.
+        lower = Path(td) / "histcurr_fujitsu.csv"
+        lower.write_text("x")
+        check("a lowercase HISTCURR name is found too",
+              resolve_inventory_path(Path(td)) == lower,
+              "(matching is case-insensitive, like the share)")
+
     with tempfile.TemporaryDirectory() as td:
         share = Path(td)
         # The trap: "Sep" > "Dec" alphabetically, so sorted() picks September.

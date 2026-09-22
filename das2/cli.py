@@ -256,13 +256,27 @@ def cmd_run(config: Config, args) -> int:
         log.error("no readings were analysed — check the history directory")
         return 2
 
+    # One directory per run, named for the run id, so runs are a browsable
+    # history rather than one flat folder accumulating three files an hour.
+    # Inside it the names are plain -- the directory already says which run
+    # this is, and dashboard_20260922-155447.html inside 20260922-155447/
+    # reads as a mistake.
     out_dir = Path(config.report.output_dir)
-    html_path = dashboard.write(result, out_dir)
+    per_run = getattr(config.report, "per_run_directory", True)
+    if per_run:
+        out_dir = out_dir / result.run_id
+
+    html_path = dashboard.write(
+        result, out_dir,
+        filename="dashboard.html" if per_run else "",
+        tile_url=getattr(config.report, "map_tile_url", ""),
+        tile_attribution=getattr(config.report, "map_tile_attribution", ""),
+    )
     print(f"\nDashboard: {html_path}")
 
     chart_paths = {}
     try:
-        chart_paths = charts.run_charts(result, out_dir)
+        chart_paths = charts.run_charts(result, out_dir, stamped=not per_run)
         for name, path in chart_paths.items():
             print(f"Chart ({name}): {path}")
     except Exception as exc:                               # noqa: BLE001

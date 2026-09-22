@@ -307,9 +307,27 @@ def read_history_dir(directory: str | Path, *, pattern: str = "*HISTORY*.csv",
 
 
 #: Matches any HISTCURR export, with or without a .csv extension. The real
-#: share exports `hts_HISTCURR_2026Sep22-130000` hourly; the extension is not
-#: always present, so it is not required here.
-HISTCURR_GLOB = "*HISTCURR*"
+#: share exports `hts_HISTCURR_2026Sep22-130000.csv` hourly; the extension is
+#: not always visible, so it is not required here.
+#:
+#: Matched case-INSENSITIVELY, and by hand rather than with glob(), because
+#: glob is case-sensitive on Linux while the CIFS share this reads is not.
+#: The real files are `hts_HISTCURR_...` and the fixtures are
+#: `histcurr_fujitsu.csv`; a case-sensitive pattern silently finds one and not
+#: the other, which is the kind of difference that makes a system pass every
+#: test and fail on the only machine that matters.
+HISTCURR_TOKEN = "histcurr"
+HISTCURR_GLOB = "*HISTCURR* (case-insensitive)"
+
+
+def _histcurr_files(directory: Path) -> list[Path]:
+    """Every HISTCURR export in `directory`, whatever its case."""
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return []
+    return [p for p in entries
+            if p.is_file() and HISTCURR_TOKEN in p.name.lower()]
 
 
 def resolve_inventory_path(path: str | Path) -> Path:
@@ -344,7 +362,7 @@ def resolve_inventory_path(path: str | Path) -> Path:
     if p.is_dir():
         return _newest_histcurr(p)
 
-    if p.parent.is_dir() and any(p.parent.glob(HISTCURR_GLOB)):
+    if p.parent.is_dir() and _histcurr_files(p.parent):
         chosen = _newest_histcurr(p.parent)
         log.warning(
             "%s does not exist; using %s instead. Point "
@@ -369,7 +387,7 @@ def _newest_histcurr(directory: Path) -> Path:
     file whose name carries no parseable stamp -- and it is only a fallback,
     because a re-copied share can reset mtime on every file at once.
     """
-    candidates = [f for f in directory.glob(HISTCURR_GLOB) if f.is_file()]
+    candidates = _histcurr_files(directory)
     if not candidates:
         raise FileNotFoundError(
             f"No {HISTCURR_GLOB} files in {directory}. This directory is the "

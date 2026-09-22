@@ -325,6 +325,24 @@ class ReportConfig:
     #: normal state on an isolated operations network.
     map_tiles: bool = True
 
+    #: Where the basemap comes from. Empty uses OpenStreetMap's own tiles,
+    #: which need no key. Point this at an internal tile server on a network
+    #: that cannot reach the internet, or at a commercial provider with the
+    #: key already in the URL. The default was CARTO's CDN until it began
+    #: serving tiles reading "API key required" -- a map made entirely of
+    #: error notices, which looks like a bug in this page rather than a
+    #: change of terms somewhere else.
+    map_tile_url: str = ""
+    map_tile_attribution: str = ""
+
+    #: Give each run its own directory under output_dir, named for the run id:
+    #:     output/20260922-155447/dashboard.html
+    #:                           /map.png
+    #:                           /matrix.png
+    #: Runs are then a browsable history rather than one flat directory
+    #: accumulating three files an hour. Set false for the old flat layout.
+    per_run_directory: bool = True
+
     @property
     def public_url(self) -> str:
         """Link included in alerts. Empty when the HTML is not served anywhere."""
