@@ -161,6 +161,42 @@ If your DBA wants to run the SQL by hand instead, the files are plain SQL and
 can be pasted into SSMS — see [§12](#12-the-sql-in-full) for exactly what they
 create and how to check it.
 
+### Starting completely clean
+
+**`migrate` never deletes anything.** Every statement in `migrations/` is
+`CREATE TABLE IF NOT EXISTS` or `ALTER TABLE ADD`, so running it against tables
+that already hold rows leaves those rows exactly where they are. That is
+deliberate — it has to be safe to re-run on every deploy — but it means
+`migrate` alone does **not** give you an empty database.
+
+If you want a genuinely fresh start, drop DAS2's own tables first:
+
+```bash
+# DESTRUCTIVE. Removes all 12 das2_* tables and everything in them.
+docker compose run --rm das2 python -c \
+  "from pathlib import Path; from das2.config import load_config; \
+   from das2.io.store import make_engine, apply_migrations; \
+   apply_migrations(make_engine(load_config().database.sqlalchemy_url()), \
+                    files=['reset_das2.sql'], directory=Path('tools'))"
+
+docker compose run --rm das2-migrate      # rebuild the schema, empty
+```
+
+Or paste `tools/reset_das2.sql` into SSMS and then re-run `das2-migrate`.
+
+**You do not need to drop the v1 tables** (`dim`, `data`, `inst`, `linktable`,
+`dateDim`, `alarmevent`, `abnormal_sensor_history`), and there is one concrete
+reason to keep `dbo.data` in particular:
+
+> The daily profile job reads `das2_reading` first and **falls back to
+> `dbo.data`**. `das2_reading` starts empty, so on a fresh install that
+> fallback is the only thing that gives you 28 days of history on day one.
+> Drop it and `DRIFT`, `NOISE_BURST` and the time-of-day baselines produce
+> nothing for four weeks while `das2_reading` fills up.
+
+Keeping them also lets both systems run side by side, which is what any
+comparison between old and new needs. Nothing in `das2` writes to them.
+
 ---
 
 ## 7. Prove the install works, before trusting it on your data
