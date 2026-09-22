@@ -45,7 +45,11 @@ x-common: &common
     # Paths INSIDE the container. These point at the read-only mounts above;
     # change the volume definitions at the bottom of this file, not these.
     DAS2_INGEST_HISTORY_DIR: /data/input/HISTORY
-    DAS2_INGEST_HISTCURR_PATH: /data/input/HISTCURR/histcurr_fujitsu.csv
+    # The DIRECTORY, not a file. The share exports an hourly snapshot named
+    # hts_HISTCURR_2026Sep22-130000, and the newest is always the one to read;
+    # this used to name the old pipeline's single pre-merged
+    # histcurr_fujitsu.csv, which has never existed on the real share.
+    DAS2_INGEST_HISTCURR_PATH: /data/input/HISTCURR
     DAS2_INGEST_LONGLAT_PATH: /data/config/LongLat.csv
     DAS2_REPORT_OUTPUT_DIR: /data/output
   logging:

@@ -113,8 +113,18 @@ def cmd_check(config: Config, args) -> int:
     else:
         report("history CSVs present", False, "directory not mounted")
 
-    inventory = Path(config.ingest.inventory_path)
-    report("inventory file exists", inventory.exists(), str(inventory))
+    # Resolved rather than merely tested for existence, because the inventory
+    # is an HOURLY export -- `hts_HISTCURR_2026Sep22-130000` -- not the single
+    # pre-merged file the old pipeline used. Checking the configured path
+    # literally reported FAIL while the inventory sat in the same directory
+    # under a different name, which is the least useful thing a pre-flight can
+    # say.
+    from das2.io.ingest import resolve_inventory_path
+    try:
+        inventory = resolve_inventory_path(config.ingest.inventory_path)
+        report("inventory file exists", True, str(inventory))
+    except FileNotFoundError as exc:
+        report("inventory file exists", False, str(exc)[:200])
     longlat = Path(config.ingest.longlat_path) if config.ingest.longlat_path else None
     report("LongLat.csv exists", bool(longlat and longlat.exists()),
            str(longlat) if longlat

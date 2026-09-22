@@ -80,6 +80,50 @@ def main():
     check("sensor keys unique", inv["sensor_key"].is_unique,
           "(no Hkey collisions -- verified on the real inventory)")
 
+    print("\nHISTCURR is an HOURLY export, so the inventory path resolves")
+    # The share has never held the old pipeline's single pre-merged
+    # histcurr_fujitsu.csv. It exports hts_HISTCURR_2026Sep22-130001 every
+    # hour, often with no .csv extension at all, and the deployment config
+    # pointed at the dead name -- so the pre-flight reported "inventory file
+    # exists: FAIL" while the inventory sat beside it under another name.
+    import tempfile
+    from das2.io.ingest import resolve_inventory_path
+    with tempfile.TemporaryDirectory() as td:
+        share = Path(td)
+        # Real names from the client's share. Note: no extension.
+        for stamp in ("2026Sep21-230001", "2026Sep22-000001", "2026Sep22-130001"):
+            (share / f"hts_HISTCURR_{stamp}").write_text("x")
+        check("a directory resolves to the newest snapshot",
+              resolve_inventory_path(share).name == "hts_HISTCURR_2026Sep22-130001")
+        check("a missing .csv extension is not required",
+              not resolve_inventory_path(share).suffix,
+              "(the real files carry none)")
+        check("the stale v1 filename still resolves, with a warning",
+              resolve_inventory_path(share / "histcurr_fujitsu.csv").name
+              == "hts_HISTCURR_2026Sep22-130001",
+              "(an upgrade must not break on a stale config value)")
+        exact = share / "hts_HISTCURR_2026Sep22-000001"
+        check("an explicit file is honoured, not overridden",
+              resolve_inventory_path(exact) == exact)
+
+    with tempfile.TemporaryDirectory() as td:
+        share = Path(td)
+        # The trap: "Sep" > "Dec" alphabetically, so sorted() picks September.
+        for stamp in ("2026Apr02-000000", "2026Sep22-130000", "2026Dec01-120000"):
+            (share / f"hts_HISTCURR_{stamp}.csv").write_text("x")
+        check("ordered by parsed timestamp, not by filename",
+              resolve_inventory_path(share).name == "hts_HISTCURR_2026Dec01-120000.csv",
+              "(sorted() would pick Sep over Dec)")
+
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            resolve_inventory_path(Path(td) / "nothing.csv")
+            missing = ""
+        except FileNotFoundError as e:
+            missing = str(e)
+    check("an empty share fails loudly", "No HISTCURR inventory" in missing)
+    check("and the error says what it was looking for", "hts_HISTCURR" in missing)
+
     print("\nthe old comma-separated format is rejected with a useful message")
     import tempfile
     with tempfile.TemporaryDirectory() as td:

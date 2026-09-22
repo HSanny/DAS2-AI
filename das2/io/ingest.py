@@ -39,6 +39,7 @@ a risk worth carrying for a feed this size.
 from __future__ import annotations
 
 import glob
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -46,6 +47,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+
+log = logging.getLogger("das2.io.ingest")
 
 #: Timestamps inside the CSVs.
 DATETIME_FORMAT = "%m/%d/%Y %I:%M:%S %p"
@@ -255,6 +258,81 @@ def read_history_dir(directory: str | Path, *, pattern: str = "*HISTORY*.csv",
     return out
 
 
+#: Matches any HISTCURR export, with or without a .csv extension. The real
+#: share exports `hts_HISTCURR_2026Sep22-130000` hourly; the extension is not
+#: always present, so it is not required here.
+HISTCURR_GLOB = "*HISTCURR*"
+
+
+def resolve_inventory_path(path: str | Path) -> Path:
+    """
+    The HISTCURR file to read, given a file OR a directory.
+
+    The old pipeline consumed one pre-merged `HISTCURR/histcurr_fujitsu.csv`.
+    The real share has never contained such a file: it exports an hourly
+    snapshot, `hts_HISTCURR_2026Sep22-130000`, alongside the hourly HISTORY
+    files. A deployment configured with the old name therefore fails its
+    pre-flight with "inventory file exists: FAIL" and no indication that the
+    inventory is sitting right next to it under a different name.
+
+    HISTCURR is a snapshot of current values rather than an accumulating log,
+    so "the newest one" is always the right answer and pointing at the
+    directory is the more honest configuration. Three cases:
+
+      * a file that exists          -> use it, unchanged
+      * a directory                 -> the newest HISTCURR file inside it
+      * a missing file whose parent holds HISTCURR files -> the newest of
+        those, with a warning naming the setting to change
+
+    The third exists so an upgrade does not break on a stale config value, and
+    it warns rather than substituting quietly -- reading a different file from
+    the one configured is exactly the kind of helpfulness that becomes a
+    mystery six months later.
+    """
+    p = Path(path)
+    if p.is_file():
+        return p
+
+    if p.is_dir():
+        return _newest_histcurr(p)
+
+    if p.parent.is_dir() and any(p.parent.glob(HISTCURR_GLOB)):
+        chosen = _newest_histcurr(p.parent)
+        log.warning(
+            "%s does not exist; using %s instead. Point "
+            "DAS2_INGEST_HISTCURR_PATH at the directory (%s) to silence this.",
+            p, chosen.name, p.parent)
+        return chosen
+
+    raise FileNotFoundError(
+        f"No HISTCURR inventory at {p}. Expected either that file, or a "
+        f"directory containing {HISTCURR_GLOB} (the share exports one hourly, "
+        f"e.g. hts_HISTCURR_2026Sep22-130000)."
+    )
+
+
+def _newest_histcurr(directory: Path) -> Path:
+    """
+    The most recent HISTCURR file in `directory`.
+
+    Ordered by the timestamp in the filename, not by name: `2026Sep22` sorts
+    lexically as Apr < Aug < Dec < Feb, so a plain `sorted()` would happily
+    pick April's file in December. Modification time is the fallback for a
+    file whose name carries no parseable stamp -- and it is only a fallback,
+    because a re-copied share can reset mtime on every file at once.
+    """
+    candidates = [f for f in directory.glob(HISTCURR_GLOB) if f.is_file()]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No {HISTCURR_GLOB} files in {directory}. This directory is the "
+            f"sensor inventory; without it there are no sensors to analyse."
+        )
+    return max(
+        candidates,
+        key=lambda f: (filename_timestamp(f) or datetime.min, f.stat().st_mtime),
+    )
+
+
 def read_inventory(path: str | Path, *, report: IngestReport | None = None) -> pd.DataFrame:
     """
     HISTCURR snapshot -> the sensor dimension.
@@ -262,7 +340,10 @@ def read_inventory(path: str | Path, *, report: IngestReport | None = None) -> p
     Semicolon-separated with nine columns. `POINTTYPE` is the SCADA's own
     engineering type code; it is carried through so classification can consult
     it, but it is not authoritative -- see io.classify.
+
+    `path` may be the file or the directory holding the hourly exports.
     """
+    path = resolve_inventory_path(path)
     df = pd.read_csv(path, sep=";", low_memory=False, on_bad_lines="skip",
                      encoding="utf-8", encoding_errors="replace")
     df.columns = [c.strip().upper() for c in df.columns]
