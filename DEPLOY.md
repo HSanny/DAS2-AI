@@ -161,6 +161,44 @@ If your DBA wants to run the SQL by hand instead, the files are plain SQL and
 can be pasted into SSMS — see [§12](#12-the-sql-in-full) for exactly what they
 create and how to check it.
 
+### First: clear the previous system's das2_* tables
+
+`anomaly_db` already contains ten `das2_*` tables from the system this
+replaces, and one name collides outright:
+
+| | old | new |
+|---|---|---|
+| **collision** | `das2_feedback` (10 cols) | `das2_feedback` (7 cols) |
+| near-miss | `das2_sensors` | `das2_sensor` |
+| near-miss | `das2_readings` | `das2_reading` |
+
+`CREATE TABLE IF NOT EXISTS` silently skips a table that already exists, so
+without clearing them first the new code would insert seven columns into the
+old ten-column `das2_feedback` and fail at runtime with an error pointing
+nowhere near the cause.
+
+```bash
+# 1. DESTRUCTIVE. Removes the ten legacy das2_* tables.
+#    Paste tools/drop_legacy_das2.sql into SSMS, or:
+docker compose run --rm das2 python -c \
+  "from pathlib import Path; from das2.config import load_config; \
+   from das2.io.store import make_engine, apply_migrations; \
+   apply_migrations(make_engine(load_config().database.sqlalchemy_url()), \
+                    files=['drop_legacy_das2.sql'], directory=Path('tools'))"
+
+# 2. Then create the new schema.
+docker compose run --rm das2-migrate
+```
+
+**Order matters.** Running `migrate` first would skip `das2_feedback` and leave
+the collision in place.
+
+`tools/drop_legacy_das2.sql` carries a commented one-liner to copy the old
+`das2_feedback` out to `dbo.legacy_feedback_backup` first. Those rows are
+operator labels — the only ground truth either system has, and the one input
+that cannot be regenerated from raw data later. Keeping a copy costs one
+statement; whether to bother is your call.
+
 ### Starting completely clean
 
 **`migrate` never deletes anything.** Every statement in `migrations/` is
@@ -537,11 +575,22 @@ and computes `DRIFT` and `NOISE_BURST`. Until it has run:
   `baselines:` line rather than failing silently;
 * `DRIFT` and `NOISE_BURST` produce nothing.
 
-**It needs history to read.** The hourly run now writes every reading into
-`das2_reading` (`DAS2_DATABASE_STORE_READINGS=true`, on by default), so the
-store fills as the system runs. If your v1 `data` table is readable by this
-login, the job falls back to it and you have 28 days of history immediately
-rather than in four weeks.
+**It needs history to read, and it starts empty.** The hourly run writes every
+reading into `das2_reading` (`DAS2_DATABASE_STORE_READINGS=true`, on by
+default), so the store fills as the system runs. On a fresh install the first
+`das2 profile` will report *"No history yet"* — that is the expected state, not
+a failure, and it says so.
+
+Until enough days have accumulated, `DRIFT`, `NOISE_BURST` and the L2 baseline
+layer produce nothing, and the hourly run reports that in its `baselines:`
+line rather than falling silent.
+
+If you would rather learn from an existing readings table, point
+`DAS2_DATABASE_HISTORY_FALLBACK_TABLE` at it — it must expose `sensor_key`,
+`ts` and `value` by those names, through a view if necessary. It is **off by
+default**: a job that silently reaches into a table it was not pointed at is
+surprising, and on an installation deliberately started from scratch it would
+quietly reintroduce the history that was just cleared.
 
 `DRIFT` needs **14 days minimum, 28 preferred**, and the job says plainly when
 it has too little rather than reporting a slope fitted to a fortnight of

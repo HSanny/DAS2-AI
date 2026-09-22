@@ -299,15 +299,26 @@ def cmd_profile(config: Config, args) -> int:
     engine = make_engine(config.database.sqlalchemy_url())
     days = args.days or PREFERRED_DAYS
     print(f"Reading up to {days} days of history ...")
-    history = load_history(engine, days=days)
+    history = load_history(
+        engine, days=days,
+        fallback_table=config.database.history_fallback_table)
 
     if history.empty:
-        print("\nNo history available.")
-        print("DRIFT and NOISE_BURST need at least "
-              f"{MIN_DAYS_DRIFT} days of readings, and the L2 residual layer "
-              "needs stored baselines.")
-        print("Check that das2_reading is being populated, or that the v1 "
-              "`data` table is readable by this login.")
+        print("\nNo history yet — das2_reading is empty.")
+        print("This is the expected state on a fresh install, not a failure. "
+              "The hourly run fills das2_reading as it goes; come back once it "
+              "has been running.")
+        print(f"\n  DRIFT          needs {MIN_DAYS_DRIFT} days (prefers "
+              f"{PREFERRED_DAYS})")
+        print("  NOISE_BURST    needs 7 days")
+        print("  the L2 baseline layer needs enough days to fill its "
+              "time-of-day buckets")
+        print("\nUntil then those three produce nothing, and the hourly run "
+              "says so in its `baselines:` line.")
+        if not config.database.history_fallback_table:
+            print("\nIf you have an existing readings table you would rather "
+                  "learn from, point DAS2_DATABASE_HISTORY_FALLBACK_TABLE at "
+                  "it; it must expose sensor_key, ts and value.")
         return 2
 
     observed = history.groupby("sensor_key")["ts"].apply(

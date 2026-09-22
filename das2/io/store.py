@@ -802,25 +802,38 @@ def load_baselines(engine: Engine) -> dict:
     return out
 
 
-def load_history(engine: Engine, days: int = 28):
+def load_history(engine: Engine, days: int = 28, *,
+                 fallback_table: str = ""):
     """
     Long history for the daily profile job.
 
-    Reads `das2_reading` first and falls back to the v1 `data` table, because
-    the client confirmed v1 has been writing readings there for months -- which
-    is what makes DRIFT and NOISE_BURST deliverable now rather than after a
-    month of accumulation.
+    Reads `das2_reading`, which the hourly run fills. That is the whole source
+    unless a fallback is configured, and starting empty is a deliberate choice
+    rather than an oversight: DRIFT needs 14 days and the baselines want 28, so
+    on a fresh install the long-horizon detectors produce nothing for the first
+    few weeks and say so.
+
+    `fallback_table` is OFF by default. An earlier version reached into
+    `dbo.data` automatically whenever `das2_reading` was empty, which is a
+    surprising thing for a job to do to a database it was not pointed at --
+    and on an installation deliberately started from scratch it would quietly
+    reintroduce the history that was just cleared. Set
+    DAS2_DATABASE_HISTORY_FALLBACK_TABLE to opt in.
+
+    The fallback is expected to expose sensor_key, ts and value, by those names
+    or through a view. Anything else is rejected rather than guessed at.
     """
     import pandas as pd
 
     cutoff = datetime.now() - timedelta(days=days)
-    for sql, label in (
-        ("SELECT sensor_key, ts, value FROM das2_reading WHERE ts >= :cutoff",
-         "das2_reading"),
-        # v1's schema: Hkey identifies the sensor, DateTime and Value the reading.
-        ("SELECT Hkey AS sensor_key, [DateTime] AS ts, Value AS value "
-         "FROM dbo.data WHERE [DateTime] >= :cutoff", "dbo.data"),
-    ):
+    sources = [("SELECT sensor_key, ts, value FROM das2_reading "
+                "WHERE ts >= :cutoff", "das2_reading")]
+    if fallback_table:
+        sources.append((
+            f"SELECT sensor_key, ts, value FROM {fallback_table} "
+            f"WHERE ts >= :cutoff", fallback_table))
+
+    for sql, label in sources:
         try:
             with engine.connect() as conn:
                 frame = pd.read_sql(text(sql), conn, params={"cutoff": cutoff})
@@ -843,3 +856,103 @@ def load_history(engine: Engine, days: int = 28):
         except Exception as exc:                          # noqa: BLE001
             log.info("history not available from %s (%s)", label, str(exc)[:100])
     return pd.DataFrame(columns=["sensor_key", "ts", "value"])
+
+
+def prune_readings(engine: Engine, retention_days: int) -> int:
+    """
+    Drop readings older than the retention window.
+
+    Without this the table grows without bound: months x 2,672 sensors x 120 s
+    is on the order of 10^8 rows, and an operations database quietly filling up
+    is the sort of failure that takes the monitoring down along with it.
+
+    The retention window has to stay comfortably above what the profile job
+    wants -- it reads 28 days -- so pruning below that would silently disable
+    DRIFT and the baselines. Returns the number of rows removed.
+    """
+    if retention_days <= 0:
+        return 0
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("DELETE FROM das2_reading WHERE ts < :cutoff"),
+                {"cutoff": cutoff})
+            removed = int(result.rowcount or 0)
+    except Exception as exc:                              # noqa: BLE001
+        log.warning("could not prune das2_reading: %s", str(exc)[:160])
+        return 0
+    if removed:
+        log.info("pruned %d reading(s) older than %d days", removed, retention_days)
+    return removed
+
+
+def save_baselines(engine: Engine, baselines) -> int:
+    """
+    Replace the stored time-of-day profiles.
+
+    Replace rather than merge: the daily job recomputes each sensor's whole
+    table from the full history window, so a merge would leave buckets behind
+    from a period that is no longer in scope and quietly age the baseline.
+    """
+    written = 0
+    with engine.begin() as conn:
+        for baseline in baselines.values():
+            rows = baseline.as_rows()
+            if not rows:
+                continue
+            conn.execute(text("DELETE FROM das2_sensor_profile "
+                              "WHERE sensor_key = :sensor_key"),
+                         {"sensor_key": baseline.sensor_key})
+            for row in rows:
+                row["updated_at"] = datetime.now()
+                row["days_observed"] = baseline.days_observed
+                conn.execute(text("""
+                    INSERT INTO das2_sensor_profile
+                      (sensor_key, bucket_of_day, is_weekend, median_value,
+                       mad_value, n_samples, updated_at, days_observed)
+                    VALUES
+                      (:sensor_key, :bucket_of_day, :is_weekend, :median_value,
+                       :mad_value, :n_samples, :updated_at, :days_observed)
+                """), row)
+                written += 1
+    log.info("stored %d baseline bucket(s) for %d sensor(s)",
+             written, len(baselines))
+    return written
+
+
+def load_baselines(engine: Engine) -> dict:
+    """
+    Stored time-of-day baselines, for the hourly run's L2 layer.
+
+    Returns an empty dict when the daily job has not run. The L2 detector
+    abstains on that rather than inventing a baseline from the current window,
+    which is the behaviour that made the incumbent's rolling median unable to
+    see any excursion longer than its own window.
+    """
+    from das2.profile.build import TimeOfDayBaseline
+
+    out: dict[str, TimeOfDayBaseline] = {}
+    with engine.connect() as conn:
+        try:
+            rows = conn.execute(text("""
+                SELECT sensor_key, bucket_of_day, is_weekend, median_value,
+                       mad_value, n_samples, days_observed
+                  FROM das2_sensor_profile
+            """)).mappings().all()
+        except Exception as exc:                          # noqa: BLE001
+            log.warning("could not read stored baselines: %s", exc)
+            return {}
+
+    for row in rows:
+        key = str(row["sensor_key"])
+        baseline = out.setdefault(key, TimeOfDayBaseline(sensor_key=key))
+        baseline.days_observed = max(baseline.days_observed,
+                                     int(row["days_observed"] or 0))
+        baseline.buckets[(int(row["bucket_of_day"]), int(row["is_weekend"]))] = (
+            float(row["median_value"] or 0.0),
+            float(row["mad_value"] or 0.0),
+            int(row["n_samples"] or 0),
+        )
+    log.info("loaded time-of-day baselines for %d sensor(s)", len(out))
+    return out

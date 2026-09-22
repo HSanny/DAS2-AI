@@ -349,6 +349,13 @@ class DatabaseConfig:
     #: only if the v1 `data` table is already readable and retained.
     store_readings: bool = True
 
+    #: Optional table the daily profile job may read history from when
+    #: das2_reading is empty or short. OFF by default: a job that silently
+    #: reaches into another table is surprising, and on an installation
+    #: deliberately started from scratch it would reintroduce the history that
+    #: was just cleared. Must expose sensor_key, ts and value by those names.
+    history_fallback_table: str = ""
+
     #: Drop readings older than this. Months x 2,672 sensors x 120 s is on the
     #: order of 10^8 rows, so an unbounded table is not an option; 60 days is
     #: comfortably more than the 28 the profile job wants.
