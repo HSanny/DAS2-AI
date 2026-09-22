@@ -30,6 +30,15 @@ def source_fingerprint() -> str:
     Paths are hashed alongside contents so that adding, moving or deleting a
     file changes the answer, and the file list is sorted so the result does
     not depend on filesystem ordering.
+
+    LINE ENDINGS ARE NORMALISED, and that is the whole point of this being a
+    function rather than two lines inline. Hashing raw bytes made the
+    fingerprint depend on git's `core.autocrlf`: the same commit checked out
+    on Windows produced b94d624cd922 and on Linux 14e611e38aba. A fingerprint
+    that differs between correct checkouts cannot be compared against an
+    expected value, which is the only thing anyone wants it for -- it reports
+    a mismatch precisely when there is none, which is worse than not
+    reporting at all.
     """
     root = Path(__file__).resolve().parent
     digest = hashlib.sha256()
@@ -39,7 +48,7 @@ def source_fingerprint() -> str:
         if "__pycache__" not in p.parts
     ):
         digest.update(path.relative_to(root).as_posix().encode())
-        digest.update(path.read_bytes())
+        digest.update(path.read_bytes().replace(b"\r\n", b"\n"))
     return digest.hexdigest()[:12]
 
 

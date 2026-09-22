@@ -279,6 +279,40 @@ def main():
               for k in IncidentClass))
     check("ack defaults to none", inc.ack_state is AckState.NONE)
 
+    # ------------------------------------------------------------------ #
+    print("\nthe source fingerprint survives a Windows checkout")
+    # Hashing raw bytes made the fingerprint depend on git's core.autocrlf:
+    # the same commit read b94d624cd922 on Windows and 14e611e38aba on Linux.
+    # A fingerprint that differs between two CORRECT checkouts reports a
+    # mismatch precisely when there is none -- worse than not reporting at
+    # all, since it sent a deployment chasing a rebuild it had already done.
+    import hashlib as _hl
+    from pathlib import Path as _P
+
+    import das2 as _das2
+
+    root = _P(_das2.__file__).resolve().parent
+
+    def _fingerprint(convert) -> str:
+        digest = _hl.sha256()
+        for path in sorted(
+            q for pat in ("*.py", "*.yaml", "*.yml")
+            for q in root.rglob(pat) if "__pycache__" not in q.parts
+        ):
+            digest.update(path.relative_to(root).as_posix().encode())
+            digest.update(convert(path.read_bytes()))
+        return digest.hexdigest()[:12]
+
+    lf = _fingerprint(lambda b: b.replace(b"\r\n", b"\n"))
+    crlf = _fingerprint(
+        lambda b: b.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+                   .replace(b"\r\n", b"\n"))
+    check("LF and CRLF checkouts agree", lf == crlf, lf)
+    check("and it matches what the package reports",
+          _das2.source_fingerprint() == lf)
+    check("build_stamp carries the fingerprint",
+          _das2.source_fingerprint() in _das2.build_stamp())
+
     print("\nAll config/model tests passed.")
 
 
