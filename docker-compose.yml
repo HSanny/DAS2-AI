@@ -1,0 +1,96 @@
+# DAS2-AI deployment
+# ===========================================================================
+# Two long-running services from one image:
+#
+#   das2         the analysis loop -- detects, reports, alerts
+#   das2-ack     consumes the Telegram acknowledge buttons
+#
+# and two one-shot helpers you run by hand:
+#
+#   docker compose run --rm das2-migrate     create the tables
+#   docker compose run --rm das2-check       pre-flight
+#
+# Run `das2-check` FIRST. The three things most likely to be wrong on a new
+# deployment -- the CSV path, the database credentials and the bot token -- all
+# fail in ways that look identical to "the system found nothing wrong", and
+# telling a healthy quiet network apart from a broken silent job is otherwise
+# surprisingly hard.
+#
+# Everything is configured through .env. Copy .env.example and fill it in;
+# no secret belongs in this file or in the image.
+
+x-common: &common
+  build: .
+  image: das2-ai:latest
+  env_file: [.env]
+  restart: unless-stopped
+  volumes:
+    # The historian's export, READ ONLY. This system has no business writing
+    # to the share it reads from, and :ro makes that structural rather than a
+    # promise.
+    - ${DAS2_DATA_DIR:-./data}:/data/input:ro
+    # Dashboards and PNGs. Mounted out so they survive a container rebuild and
+    # can be served by whatever already serves files on your network.
+    - ${DAS2_OUTPUT_DIR:-./output}:/data/output
+    - ${DAS2_LOG_DIR:-./logs}:/data/logs
+  environment:
+    # Paths INSIDE the container. These point at the read-only mount above;
+    # change the left-hand side of the volume mapping, not these.
+    DAS2_INGEST_HISTORY_DIR: /data/input/HISTORY
+    DAS2_INGEST_HISTCURR_PATH: /data/input/HISTCURR/histcurr_fujitsu.csv
+    DAS2_INGEST_LONGLAT_PATH: /data/input/LongLat.csv
+    DAS2_REPORT_OUTPUT_DIR: /data/output
+  logging:
+    # Without this, a container running for months fills the disk with logs and
+    # takes the analysis down with it.
+    driver: json-file
+    options: {max-size: "20m", max-file: "5"}
+
+services:
+  # --- the analysis loop ---------------------------------------------------
+  das2:
+    <<: *common
+    container_name: das2
+    command: ["python", "-m", "das2.cli", "schedule"]
+
+  # --- acknowledge worker --------------------------------------------------
+  # Long-polls Telegram for button presses and records them. Separate from the
+  # analysis loop so a slow or failing run never stops an operator from
+  # acknowledging an alert, and so restarting one does not interrupt the other.
+  #
+  # Exactly ONE of these may run per bot token. Telegram hands each update to a
+  # single getUpdates caller, so a second instance would silently steal half
+  # the button presses -- do not scale this service.
+  das2-ack:
+    <<: *common
+    container_name: das2-ack
+    command: ["python", "-m", "das2.cli", "ack-worker"]
+    depends_on: [das2]
+
+  # --- one-shot: create the tables ----------------------------------------
+  # Idempotent, so running it again after an upgrade is the correct thing to do.
+  das2-migrate:
+    <<: *common
+    container_name: das2-migrate
+    restart: "no"
+    command: ["python", "-m", "das2.cli", "migrate"]
+    profiles: ["tools"]
+
+  # --- one-shot: pre-flight ------------------------------------------------
+  das2-check:
+    <<: *common
+    container_name: das2-check
+    restart: "no"
+    command: ["python", "-m", "das2.cli", "check"]
+    profiles: ["tools"]
+
+  # --- one-shot: a single run, touching nothing ----------------------------
+  # Writes a dashboard and prints what it found, without a database write or a
+  # Telegram message. This is how to try the system against real data before
+  # letting it talk to anyone.
+  das2-dryrun:
+    <<: *common
+    container_name: das2-dryrun
+    restart: "no"
+    command: ["python", "-m", "das2.cli", "run", "--dry-run"]
+    profiles: ["tools"]

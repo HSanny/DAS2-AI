@@ -46,9 +46,13 @@ DPI = 150
 
 
 def _style(ax, title: str, subtitle: str = "") -> None:
-    ax.set_title(title, fontsize=14, fontweight="600", loc="left", pad=14)
+    # The title's pad has to clear the subtitle, which is drawn just above the
+    # axes. With the default pad the two overlap and the figure is unreadable
+    # exactly where it is meant to be most readable.
+    ax.set_title(title, fontsize=14, fontweight="600", loc="left",
+                 pad=28 if subtitle else 12)
     if subtitle:
-        ax.text(0, 1.012, subtitle, transform=ax.transAxes, fontsize=9.5,
+        ax.text(0, 1.015, subtitle, transform=ax.transAxes, fontsize=9.5,
                 color="#667080", va="bottom")
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
@@ -179,9 +183,9 @@ def region_matrix_png(matrix: dict[str, dict[str, int]], out_path: str | Path, *
     for side in ax.spines.values():
         side.set_visible(False)
 
-    ax.set_title(title, fontsize=13.5, fontweight="600", loc="left", pad=14)
-    ax.text(0, 1.02, "a column lit across regions is a fleet-wide equipment "
-                     "problem; a row lit across types is that area",
+    ax.set_title(title, fontsize=13.5, fontweight="600", loc="left", pad=30)
+    ax.text(0, 1.015, "a column lit across regions is a fleet-wide equipment "
+                      "problem; a row lit across types is that area",
             transform=ax.transAxes, fontsize=8.8, color="#667080", va="bottom")
     fig.colorbar(im, ax=ax, shrink=.75, pad=.02).set_label(
         "sensors abnormal", fontsize=9, color="#667080")

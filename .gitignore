@@ -30,3 +30,10 @@ HISTCURR/
 deploy/.env
 deploy/notes.txt
 **/notes.txt
+
+# Deployment artefacts holding real credentials or real data
+output/
+data/
+*.db
+*.sqlite
+docker-compose.override.yml

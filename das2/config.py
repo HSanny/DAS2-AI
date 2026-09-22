@@ -431,6 +431,19 @@ class Config:
         for section_field in fields(self):
             section = getattr(self, section_field.name)
             if not is_dataclass(section):
+                # A top-level scalar such as run_interval_minutes, overridden
+                # as DAS2_RUN_INTERVAL_MINUTES. Walking only the sections
+                # silently ignored these, so the documented
+                # DAS2_RUN_INTERVAL_MINUTES had no effect at all and the
+                # scheduler stayed on its default cadence whatever the
+                # deployment asked for.
+                raw = _env(f"{prefix}{section_field.name.upper()}")
+                if raw is not None:
+                    try:
+                        setattr(self, section_field.name,
+                                _coerce(raw, type(section)))
+                    except (TypeError, ValueError):
+                        pass
                 continue
             for f in fields(section):
                 env_name = f"{prefix}{section_field.name.upper()}_{f.name.upper()}"

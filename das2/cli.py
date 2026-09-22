@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -204,6 +205,70 @@ def cmd_run(config: Config, args) -> int:
     return 0
 
 
+def cmd_demo(config: Config, args) -> int:
+    """
+    Generate synthetic data with known faults and run against it.
+
+    The point is to separate "the system is installed correctly" from "the
+    system found nothing in your data", which otherwise look identical. The
+    fixture contains faults whose answers are known, so if this prints a
+    regional event across three East sites then ingest, classification,
+    detection, clustering, triage and reporting are all working, and any
+    silence on real data is a statement about the data rather than the install.
+
+    Touches nothing: no database, no Telegram, and a temporary directory it
+    cleans up unless asked to keep it.
+    """
+    import subprocess
+    import tempfile
+
+    from das2 import pipeline
+    from das2.report import charts, dashboard
+
+    root = Path(args.keep) if args.keep else Path(tempfile.mkdtemp(prefix="das2-demo-"))
+    fixtures, out = root / "fixtures", Path(config.report.output_dir)
+    print(f"Generating synthetic data with known faults in {fixtures} ...")
+    subprocess.run([sys.executable, "-m", "tools.make_fixtures",
+                    "--out", str(fixtures)], check=True,
+                   capture_output=True, cwd=str(Path(__file__).resolve().parent.parent))
+
+    demo = load_config(args.config)
+    demo.ingest.history_dir = str(fixtures / "HISTORY")
+    demo.ingest.histcurr_path = str(fixtures / "HISTCURR" / "histcurr_fujitsu.csv")
+    demo.ingest.longlat_path = str(fixtures / "LongLat.csv")
+    demo.report.output_dir = str(out)
+
+    result = pipeline.run(demo)
+    _print_summary(result)
+    print(f"\nDashboard: {dashboard.write(result, out)}")
+    try:
+        for name, path in charts.run_charts(result, out).items():
+            print(f"Chart ({name}): {path}")
+    except Exception as exc:                               # noqa: BLE001
+        log.error("chart generation failed: %s", exc)
+
+    from das2.models import IncidentClass
+    regional = [i for i in result.incidents
+                if i.incident_class is IncidentClass.REGIONAL_EVENT]
+    print("\n" + "=" * 68)
+    if regional:
+        sites = ", ".join(sorted(regional[0].cluster.sites))
+        print(f"OK — the injected regional event was found across {sites}.")
+        print("Ingest, classification, detection, clustering, triage and the")
+        print("dashboard are all working. Point it at your real data next.")
+    else:
+        print("PROBLEM — the injected regional event was NOT found.")
+        print("Something upstream is broken; the detail above says where.")
+    print("=" * 68)
+
+    if not args.keep:
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+    else:
+        print(f"\nFixtures kept in {root}")
+    return 0 if regional else 1
+
+
 def cmd_ack_worker(config: Config, args) -> int:
     from das2.alerting.telegram import TelegramConfig, run_ack_worker
     from das2.io.store import make_engine, record_ack
@@ -224,13 +289,32 @@ def cmd_ack_worker(config: Config, args) -> int:
     return 0
 
 
+#: Touched after every run. The container healthcheck reads its age, because a
+#: scheduler that has silently died looks exactly like a quiet network from the
+#: outside -- and "no alerts" is the state this system is supposed to produce
+#: most of the time, so that ambiguity would otherwise hide a dead job for days.
+HEARTBEAT_PATH = Path("/data/logs/heartbeat")
+
+
+def _touch_heartbeat(config: Config) -> None:
+    for candidate in (HEARTBEAT_PATH, Path(config.report.output_dir) / "heartbeat"):
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.touch()
+            return
+        except OSError:
+            continue        # not fatal: a missing heartbeat must not stop a run
+
+
 def cmd_schedule(config: Config, args) -> int:
     """
     Run forever on an interval.
 
     A failed run logs and waits for the next tick rather than exiting: a
     malformed CSV at 02:00 must not take the monitoring system down until
-    somebody notices in the morning.
+    somebody notices in the morning. The heartbeat is touched either way, since
+    the process is alive and the failure is already in the log -- a healthcheck
+    that restarts the container on a bad input file would just lose the log.
     """
     interval = args.interval_minutes or config.run_interval_minutes
     print(f"Scheduler started — a run every {interval} minute(s). Ctrl-C to stop.")
@@ -243,6 +327,7 @@ def cmd_schedule(config: Config, args) -> int:
             return 0
         except Exception:                                  # noqa: BLE001
             log.exception("run failed — continuing to the next interval")
+        _touch_heartbeat(config)
         elapsed = time.time() - started
         sleep_for = max(30.0, interval * 60 - elapsed)
         log.info("next run in %.0f minute(s)", sleep_for / 60)
@@ -278,11 +363,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="das2", description="Water sensor anomaly intelligence")
     parser.add_argument("--config", help="path to config.yaml")
-    parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--log-level", default=os.environ.get("DAS2_LOG_LEVEL", "INFO"),
+                        help="DEBUG | INFO | WARNING | ERROR "
+                             "(or set DAS2_LOG_LEVEL)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("migrate", help="create/update the database tables")
     sub.add_parser("check", help="verify data, database and Telegram")
+
+    demo = sub.add_parser(
+        "demo", help="run against synthetic data with known faults")
+    demo.add_argument("--keep", metavar="DIR",
+                      help="keep the generated fixtures in DIR")
 
     run = sub.add_parser("run", help="one analysis run")
     run.add_argument("--dry-run", action="store_true",
@@ -310,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {
         "migrate": cmd_migrate,
         "check": cmd_check,
+        "demo": cmd_demo,
         "run": cmd_run,
         "ack-worker": cmd_ack_worker,
         "schedule": cmd_schedule,

@@ -1,0 +1,27 @@
+# DAS2-AI runtime dependencies
+# ---------------------------------------------------------------------------
+# Deliberately short. Every dependency is something that can fail to install on
+# the client's network or break on an upgrade, and the alert path in particular
+# has none at all: Telegram is called through stdlib urllib rather than
+# `requests`, so a message can still go out even if the rest of the stack is
+# unhappy.
+#
+# Upper bounds are pinned on the two libraries whose APIs actually move
+# (pandas and SQLAlchemy). numpy and matplotlib are stable enough at these
+# major versions not to need one.
+
+pandas>=2.0,<3.0
+numpy>=1.24
+SQLAlchemy>=2.0,<3.0
+
+# SQL Server driver. Needs the system ODBC driver as well -- the Dockerfile
+# installs msodbcsql18. Comment this out and use a sqlite:/// URL to try the
+# system without a database server.
+pyodbc>=5.0
+
+# Static PNGs for Telegram, which cannot render HTML inline.
+matplotlib>=3.7
+
+# Only needed to read a YAML config file. A JSON config works without it, and
+# config.py says so explicitly if it is missing.
+PyYAML>=6.0
