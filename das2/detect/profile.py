@@ -63,6 +63,9 @@ class SensorProfile:
     change_rate_per_hour: float = 0.0   # value changes per hour, historically
     distinct_ratio: float = 0.0         # distinct values / readings
     longest_flat_seconds: float = 0.0   # longest historical unchanged run
+    #: 95th percentile of unchanged-run durations. This, not the longest run,
+    #: is what the flatline threshold is built on -- see `expected_flat_seconds`.
+    flat_run_p95_seconds: float = 0.0
 
     # --- level and spread ---
     median: float = float("nan")
@@ -101,10 +104,27 @@ class SensorProfile:
         """
         How long this sensor can normally sit unchanged.
 
-        Derived from its own longest historical flat run, with a floor so a
-        briefly-observed sensor is not held to an implausibly tight standard.
+        Built on the 95th percentile of its flat runs rather than the longest
+        one, because the longest run is a maximum -- and a maximum is maximally
+        sensitive to the single anomaly the detector is trying to find.
+
+        When a profile is built from the same window that is being analysed
+        (which is what a standalone run has, before the 28-day profile job
+        exists), using the maximum makes the detector defeat itself: a 3-hour
+        flatline becomes its own longest flat run, raising the threshold to
+        9 hours, so the fault that set the threshold cannot clear it. Measured
+        on the fixture fleet, this silently missed the injected FLATLINE
+        entirely.
+
+        A high percentile is robust to one contaminating run while still
+        reflecting a sensor that genuinely sits still for long stretches.
+
+        No floor is applied here. What counts as "normal for this sensor" and
+        what counts as "long enough to be worth an engineer's time" are two
+        different questions, and mixing them made the shortest detectable
+        freeze three hours. The detector applies its own absolute floor.
         """
-        return max(self.longest_flat_seconds, MIN_EXPECTED_FLAT_S)
+        return self.flat_run_p95_seconds
 
 
 #: Below this many value-changes per hour a sensor counts as static. 0.2/hour is
@@ -115,21 +135,22 @@ STATIC_CHANGE_RATE = 0.2
 MIN_READINGS = 50
 MIN_SPAN_HOURS = 12.0
 
-#: Floor on the expected-flat duration, so a thinly-observed sensor is not
-#: flagged the moment it exceeds a short observed run.
+#: Retained for callers that want the old combined notion. The detector uses
+#: its own floor instead -- see SensorProfile.expected_flat_seconds.
 MIN_EXPECTED_FLAT_S = 3600.0
 
 
-def _longest_flat_run_seconds(ts: np.ndarray, values: np.ndarray) -> float:
-    """Longest stretch, in seconds, over which the value did not change."""
+def _flat_run_seconds(ts: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Durations, in seconds, of every stretch over which the value held."""
     if len(values) < 2:
-        return 0.0
+        return np.array([], dtype=float)
     changed = np.flatnonzero(np.diff(values) != 0)
     if changed.size == 0:
-        return float(ts[-1] - ts[0])           # never changed at all
+        return np.array([float(ts[-1] - ts[0])])    # never changed at all
     # Boundaries: start -> first change -> ... -> last change -> end
     edges = np.concatenate(([0], changed + 1, [len(ts) - 1]))
-    return float(np.max(np.diff(ts[edges]))) if edges.size > 1 else 0.0
+    runs = np.diff(ts[edges])
+    return runs[runs >= 0].astype(float)
 
 
 def _resolution(values: np.ndarray, min_active_frac: float = 0.05,
@@ -184,6 +205,7 @@ def build_profile(sensor_key: str, frame: pd.DataFrame,
 
     n_changes = int(np.count_nonzero(np.diff(values))) if n > 1 else 0
     median = float(np.median(values))
+    flat_runs = _flat_run_seconds(ts, values)
 
     return SensorProfile(
         sensor_key=sensor_key,
@@ -191,7 +213,9 @@ def build_profile(sensor_key: str, frame: pd.DataFrame,
         span_hours=round(span_h, 3),
         change_rate_per_hour=round(n_changes / span_h, 4) if span_h > 0 else 0.0,
         distinct_ratio=round(len(np.unique(values)) / n, 4),
-        longest_flat_seconds=_longest_flat_run_seconds(ts, values),
+        longest_flat_seconds=float(np.max(flat_runs)) if flat_runs.size else 0.0,
+        flat_run_p95_seconds=(float(np.percentile(flat_runs, 95))
+                              if flat_runs.size else 0.0),
         median=median,
         mad=float(np.median(np.abs(values - median))),
         resolution=_resolution(values),

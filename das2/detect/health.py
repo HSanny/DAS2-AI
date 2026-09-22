@@ -42,6 +42,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
+from das2.detect.changepoint import detect_level_shift
 from das2.detect.profile import SensorProfile
 from das2.timeutils import to_epoch_seconds
 from das2.models import AnomalyType, Signal
@@ -57,6 +58,11 @@ DETECTOR = "health"
 #: sensor is frozen" is an engineer driving to a working instrument.
 FLATLINE_MULTIPLE = 3.0
 
+#: Absolute floor on a flatline, whatever the sensor's own history says. Below
+#: this, a frozen value is more likely a quiet half-hour than a fault, and the
+#: cost of being wrong is an engineer driving to a working instrument.
+FLATLINE_FLOOR_S = 1800.0
+
 #: Silence is judged against the sensor's own p99 reporting interval, times this.
 #: A sensor that normally reports every 120 s with a p99 of 300 s is stale after
 #: ~25 minutes; one that normally reports hourly is not.
@@ -66,8 +72,19 @@ STALE_FLOOR_S = 1800.0
 #: A range violation must clear this many robust sigma of the sensor's own noise.
 RANGE_TOLERANCE_SIGMA = 6.0
 
-#: Rate-of-change beyond this many robust sigma per second is a spike.
+#: A spike must move this many robust sigma of the sensor's own spread.
+#: Measured headroom on the fixture fleet: the injected spike is ~350 sigma,
+#: the worst step in pure sensor noise is ~5 sigma.
 SPIKE_SIGMA = 8.0
+
+#: Samples used to establish the pre-spike baseline, and to look for the
+#: return. The return window bounds how long an excursion may last and still
+#: count as a spike rather than a level shift.
+SPIKE_BASELINE_N = 5
+SPIKE_RETURN_N = 10
+
+#: How close to baseline counts as "came back".
+SPIKE_RETURN_FRACTION = 0.35
 
 #: Reverse flow must be sustained to distinguish a real backflow from noise
 #: around zero on an idle meter.
@@ -120,7 +137,8 @@ def detect_flatline(ts: pd.Series, values: np.ndarray,
         return []
 
     seconds = to_epoch_seconds(ts)
-    threshold = profile.expected_flat_seconds * FLATLINE_MULTIPLE
+    threshold = max(profile.expected_flat_seconds * FLATLINE_MULTIPLE,
+                    FLATLINE_FLOOR_S)
 
     signals: list[Signal] = []
     start = 0
@@ -255,47 +273,100 @@ def detect_range_violation(ts: pd.Series, values: np.ndarray,
 def detect_spike(ts: pd.Series, values: np.ndarray,
                  profile: SensorProfile | None, unit: str = "") -> list[Signal]:
     """
-    Rate of change far beyond anything this sensor normally does.
+    A large, brief excursion that returns to where it came from.
+
+    Two gates, both required, because either alone produces nonsense.
+
+    **Size, measured against the sensor's own spread.** The first version of
+    this detector thresholded the distribution of |dv/dt| at
+    `median + 8 x 1.4826 x MAD` of that distribution. That has no null
+    hypothesis: for ordinary Gaussian noise the MAD of |dv/dt| is comparable to
+    its own median, so the threshold sits only a few multiples above typical,
+    and over a 2,160-sample window plenty of pure noise clears it. Measured on
+    the fixture fleet it produced **11 spikes for 1 injected fault**, every one
+    of them a deviation of 0.005 to 0.07 engineering units -- while missing the
+    real injected spike, a 34.8 V drop. It was reporting noise and ignoring the
+    signal, which is the exact failure mode of the detector this replaces.
+
+    Gating on step size relative to the sensor's *value* scale separates them
+    cleanly: on the fixture the real spike is ~350 sigma while the worst noise
+    step is ~5 sigma. That is three orders of magnitude of headroom, not a
+    threshold balanced on a knife edge.
+
+    **Return.** A spike goes and comes back; a step goes and stays. Without the
+    return test this fires on every genuine level shift as well, which is a
+    different fault with a different response -- and LEVEL_SHIFT is what the
+    changepoint detector is for.
 
     Non-positive intervals are dropped rather than divided by: 7% of sensors
     have duplicate timestamps and 12% have out-of-order rows, and a naive dv/dt
     turns every one of those into an infinite-rate spike.
     """
-    if len(values) < 3:
+    n = len(values)
+    if n < 6:
         return []
+
     seconds = to_epoch_seconds(ts)
-    dv = np.diff(values)
     dt = np.diff(seconds)
-    dt = np.where(dt > 0, dt, np.nan)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        rate = np.abs(dv / dt)
-    finite = rate[np.isfinite(rate)]
-    if finite.size < 5:
-        return []
+    dv = np.diff(values)
+    scale = _scale(values, profile)
 
-    med = float(np.median(finite))
-    mad = float(np.median(np.abs(finite - med)))
-    threshold = med + SPIKE_SIGMA * 1.4826 * mad
-    if not np.isfinite(threshold) or threshold <= 0:
-        return []
+    step = np.zeros(n - 1, dtype=float)
+    usable = np.isfinite(dv) & (dt > 0)
+    step[usable] = np.abs(dv[usable]) / scale
 
-    mask = np.zeros(len(values), dtype=bool)
-    mask[1:] = np.nan_to_num(rate, nan=0.0) > threshold
-    if not mask.any():
+    candidates = np.flatnonzero(step >= SPIKE_SIGMA)
+    if candidates.size == 0:
         return []
 
     signals: list[Signal] = []
-    for s, e in _runs(mask):
-        peak = float(np.nanmax(rate[max(0, s - 1):e]))
+    consumed = -1
+    for i in candidates:
+        if i <= consumed:
+            continue                     # the far edge of a spike already emitted
+
+        # Where the sensor was sitting before the jump. A median over a short
+        # lead-in rather than the single previous sample, so one noisy reading
+        # cannot define the baseline the excursion is measured from.
+        lo = max(0, i - SPIKE_BASELINE_N + 1)
+        baseline = float(np.median(values[lo:i + 1]))
+        excursion = float(values[i + 1] - baseline)
+        if abs(excursion) < SPIKE_SIGMA * scale:
+            continue
+
+        # Does it come back? Checked over a bounded lookahead, so a spike is
+        # distinguished from a step by behaviour rather than by assumption.
+        hi = min(n, i + 2 + SPIKE_RETURN_N)
+        after = values[i + 1:hi]
+        back = np.flatnonzero(np.abs(after - baseline)
+                              <= SPIKE_RETURN_FRACTION * abs(excursion))
+        if back.size == 0:
+            continue                     # a sustained move: a level shift, not a spike
+
+        end_index = min(n - 1, i + 1 + int(back[0]))
+        consumed = end_index
+        peak_rate = float(np.max(step[i:max(i + 1, end_index)]) * scale
+                          / max(1e-9, float(np.median(dt[dt > 0]))))
+
         signals.append(Signal(
             type=AnomalyType.SPIKE,
-            start=pd.Timestamp(ts.iloc[max(0, s - 1)]).to_pydatetime(),
-            end=pd.Timestamp(ts.iloc[e]).to_pydatetime(),
+            start=pd.Timestamp(ts.iloc[i]).to_pydatetime(),
+            end=pd.Timestamp(ts.iloc[end_index]).to_pydatetime(),
             detector=DETECTOR,
-            magnitude=peak,
-            unit=f"{unit}/s" if unit else "/s",
-            n_points=e - s + 1,
-            detail={"threshold": round(threshold, 6)},
+            # Reported in ENGINEERING UNITS, not as a rate. The rate form made
+            # a 34.8 V collapse read as "0.29", which is not a number anyone
+            # can sanity-check against an instrument.
+            magnitude=round(excursion, 6),
+            unit=unit,
+            n_points=end_index - i + 1,
+            detail={
+                "baseline": round(baseline, 6),
+                "peak": round(float(values[i + 1]), 6),
+                "sigma": round(abs(excursion) / scale, 1),
+                "scale": round(scale, 6),
+                "peak_rate_per_s": round(peak_rate, 6),
+                "returned_after_samples": int(back[0]) + 1,
+            },
         ))
     return signals
 
@@ -362,6 +433,10 @@ def run_health_checks(ts: pd.Series, values: np.ndarray,
 
     signals: list[Signal] = []
     signals += detect_flatline(ts, values, profile)
+    # Level shifts are what make an AREA event visible: pressure falling across
+    # a district is not a sensor fault, and without this the clustering layer
+    # has nothing to cluster.
+    signals += detect_level_shift(ts, values, profile, unit)
     signals += detect_stale(ts, profile, window_end=window_end)
     signals += detect_range_violation(ts, values, range_min, range_max, profile, unit)
     signals += detect_spike(ts, values, profile, unit)

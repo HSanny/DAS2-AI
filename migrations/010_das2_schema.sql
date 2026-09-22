@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS das2_sensor (
     description       VARCHAR(400) NOT NULL,
     equipment         VARCHAR(64)  NOT NULL,
     signal_type       VARCHAR(16),            -- Analog | Digital
+    -- measurement | counter | config | status. Drives which detectors run:
+    -- a flat kWh counter means the pump is off, not that the sensor is stuck,
+    -- and a setpoint's value is an operator decision with nothing to detect.
+    kind              VARCHAR(16),
     rtu_number        VARCHAR(32),
     site              VARCHAR(128),           -- prefix parsed from description
     latitude          DOUBLE PRECISION,       -- RTU-level: all sensors on one

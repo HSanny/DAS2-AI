@@ -1,0 +1,325 @@
+"""
+das2.cli
+========
+
+Command line for the whole system.
+
+    python -m das2.cli migrate      # create the tables (idempotent)
+    python -m das2.cli check        # verify config, data and DB before anything else
+    python -m das2.cli run          # one analysis run: detect, report, alert
+    python -m das2.cli run --dry-run    # everything except Telegram and the DB
+    python -m das2.cli ack-worker   # long-poll for acknowledge button presses
+    python -m das2.cli schedule     # run on an interval, forever
+
+`check` exists because the three things most likely to be wrong on a new
+deployment -- the CSV path, the database credentials and the bot token -- all
+fail in ways that look like "the system found nothing". Being able to
+distinguish "healthy and quiet" from "broken and silent" is worth a command of
+its own, and it is the first thing to run after `docker compose up`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from das2.config import Config, load_config
+
+
+def _setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)-7s %(name)-22s %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
+
+
+log = logging.getLogger("das2.cli")
+
+
+# --------------------------------------------------------------------------- #
+def cmd_migrate(config: Config, args) -> int:
+    from das2.io.store import apply_migrations, make_engine
+
+    engine = make_engine(config.database.sqlalchemy_url())
+    executed = apply_migrations(engine)
+    print(f"Applied {len(executed)} statement(s) against {config.database.safe_url}")
+    for statement in executed:
+        print(f"  {statement}")
+    return 0
+
+
+def cmd_check(config: Config, args) -> int:
+    """
+    Pre-flight. Every check prints PASS/FAIL and why, and nothing is fatal --
+    the point is to show the whole picture, not to stop at the first problem.
+    """
+    ok = True
+
+    def report(label: str, passed: bool, detail: str = "") -> None:
+        nonlocal ok
+        ok = ok and passed
+        print(f"  [{'PASS' if passed else 'FAIL'}] {label}"
+              f"{('  — ' + detail) if detail else ''}")
+
+    print("\nInput data")
+    history = Path(config.ingest.history_dir)
+    files = sorted(history.glob("*HISTORY*.csv")) if history.is_dir() else []
+    report("history directory exists", history.is_dir(), str(history))
+    report("history CSVs present", bool(files),
+           f"{len(files)} file(s)" if files else "no *HISTORY*.csv found")
+    inventory = Path(config.ingest.inventory_path)
+    report("inventory file exists", inventory.exists(), str(inventory))
+    longlat = Path(config.ingest.longlat_path) if config.ingest.longlat_path else None
+    report("LongLat.csv exists", bool(longlat and longlat.exists()),
+           str(longlat) if longlat else "not configured — the map will be empty")
+
+    print("\nDatabase")
+    try:
+        from sqlalchemy import text
+        from das2.io.store import make_engine
+        engine = make_engine(config.database.sqlalchemy_url())
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        report("connection", True, config.database.safe_url)
+        with engine.connect() as conn:
+            try:
+                n = conn.execute(text("SELECT COUNT(*) FROM das2_incident")).scalar()
+                report("das2 tables present", True, f"das2_incident has {n} row(s)")
+            except Exception:                              # noqa: BLE001
+                report("das2 tables present", False,
+                       "run `python -m das2.cli migrate` first")
+    except Exception as exc:                               # noqa: BLE001
+        report("connection", False, str(exc)[:160])
+
+    print("\nTelegram")
+    if not config.alert.telegram_token or not config.alert.telegram_chat_id:
+        report("credentials configured", False,
+               "set DAS2_ALERT_TELEGRAM_TOKEN and DAS2_ALERT_TELEGRAM_CHAT_ID")
+    else:
+        from das2.alerting.telegram import TelegramClient, TelegramConfig
+        client = TelegramClient(TelegramConfig(
+            token=config.alert.telegram_token,
+            chat_id=config.alert.telegram_chat_id))
+        try:
+            me = client._call("getMe", {})
+            report("bot reachable", bool(me.get("ok")),
+                   f"@{me.get('result', {}).get('username', '?')}")
+            client.send_message("✅ DAS2 connectivity check — "
+                                "this chat will receive incident alerts.")
+            report("test message delivered to chat", True,
+                   config.alert.telegram_chat_id)
+        except Exception as exc:                           # noqa: BLE001
+            report("bot reachable", False, str(exc)[:160])
+
+    print("\nClassifier")
+    try:
+        from das2.io.classify import get_classifier
+        classifier = get_classifier(config.ingest.equipment_rules_path or None)
+        report("rules loaded", True,
+               f"{len(classifier.classes)} equipment classes")
+    except Exception as exc:                               # noqa: BLE001
+        report("rules loaded", False, str(exc)[:160])
+
+    print(f"\n{'All checks passed.' if ok else 'Some checks FAILED — see above.'}\n")
+    return 0 if ok else 1
+
+
+def cmd_run(config: Config, args) -> int:
+    from das2 import pipeline
+    from das2.report import charts, dashboard
+
+    engine = None
+    open_incidents: list = []
+    if not args.dry_run:
+        from das2.io.store import load_open_incidents, make_engine
+        engine = make_engine(config.database.sqlalchemy_url())
+        try:
+            open_incidents = load_open_incidents(engine)
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("could not load open incidents (%s) — "
+                        "every incident will be treated as new", exc)
+
+    result = pipeline.run(config, open_incidents=open_incidents)
+
+    if not result.anomalies and result.readings.empty:
+        log.error("no readings were analysed — check the history directory")
+        return 2
+
+    out_dir = Path(config.report.output_dir)
+    html_path = dashboard.write(result, out_dir)
+    print(f"\nDashboard: {html_path}")
+
+    chart_paths = {}
+    try:
+        chart_paths = charts.run_charts(result, out_dir)
+        for name, path in chart_paths.items():
+            print(f"Chart ({name}): {path}")
+    except Exception as exc:                               # noqa: BLE001
+        log.error("chart generation failed (alerting continues): %s", exc)
+
+    _print_summary(result)
+
+    if engine is not None:
+        from das2.io.store import save_run, upsert_sensors
+        try:
+            upsert_sensors(engine, result.sensors)
+            save_run(engine, result)
+            print("Persisted to the database.")
+        except Exception as exc:                           # noqa: BLE001
+            log.error("persistence failed: %s", exc)
+
+    if args.dry_run or args.no_alert:
+        print("\nAlerting skipped (dry run).")
+        return 0
+
+    from das2.alerting.telegram import TelegramConfig, send_run
+    report = send_run(
+        result,
+        TelegramConfig(token=config.alert.telegram_token,
+                       chat_id=config.alert.telegram_chat_id,
+                       enabled=config.alert.enabled),
+        charts=chart_paths,
+        dashboard_url=config.report.public_url or None,
+        max_incidents=config.alert.max_incidents_per_run,
+    )
+    print(f"Telegram: {report.as_dict()}")
+
+    if engine is not None:
+        from das2.alerting.telegram import compose
+        from das2.io.store import record_delivery
+        for incident in result.incidents:
+            sent = incident.incident_id in report.sent
+            try:
+                record_delivery(engine, incident.incident_id, "telegram",
+                                payload=compose(incident), suppressed=not sent,
+                                reason="" if sent else incident.incident_class.value)
+            except Exception:                              # noqa: BLE001
+                pass
+    return 0
+
+
+def cmd_ack_worker(config: Config, args) -> int:
+    from das2.alerting.telegram import TelegramConfig, run_ack_worker
+    from das2.io.store import make_engine, record_ack
+
+    engine = make_engine(config.database.sqlalchemy_url())
+
+    def on_ack(ref, state, user):
+        record_ack(engine, ref, state, user)
+
+    print("Acknowledge worker running. Ctrl-C to stop.")
+    run_ack_worker(
+        TelegramConfig(token=config.alert.telegram_token,
+                       chat_id=config.alert.telegram_chat_id),
+        on_ack,
+        offset_file=Path(config.report.output_dir) / "telegram_offset.json",
+        stop_after=args.cycles,
+    )
+    return 0
+
+
+def cmd_schedule(config: Config, args) -> int:
+    """
+    Run forever on an interval.
+
+    A failed run logs and waits for the next tick rather than exiting: a
+    malformed CSV at 02:00 must not take the monitoring system down until
+    somebody notices in the morning.
+    """
+    interval = args.interval_minutes or config.run_interval_minutes
+    print(f"Scheduler started — a run every {interval} minute(s). Ctrl-C to stop.")
+    while True:
+        started = time.time()
+        try:
+            cmd_run(config, args)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+            return 0
+        except Exception:                                  # noqa: BLE001
+            log.exception("run failed — continuing to the next interval")
+        elapsed = time.time() - started
+        sleep_for = max(30.0, interval * 60 - elapsed)
+        log.info("next run in %.0f minute(s)", sleep_for / 60)
+        time.sleep(sleep_for)
+
+
+def _print_summary(result) -> None:
+    print("\n" + "=" * 68)
+    print(f"RUN {result.run_id}   ({result.duration_s}s)")
+    if result.window_start:
+        print(f"Window: {result.window_start} -> {result.window_end}")
+    print("-" * 68)
+    for key in ("ingest", "coverage", "profiles", "detection",
+                "clustering", "incidents", "lifecycle"):
+        if key in result.stats:
+            print(f"{key:>12}: {result.stats[key]}")
+    print("-" * 68)
+    if not result.incidents:
+        print("No incidents. Every sensor behaved within its own normal range.")
+    for incident in result.incidents[:15]:
+        flag = " " if incident.should_alert else "~"
+        sites = ", ".join(sorted(incident.cluster.sites)) or "unnamed"
+        print(f"{flag}{incident.priority.value} {incident.incident_class.value:<18} "
+              f"{str(incident.cluster.region or '-'):<11} "
+              f"{len(incident.cluster.members):>2} sensor(s)  {sites}")
+        print(f"    -> {incident.recommendation}")
+    print("(~ = suppressed, will not page anyone)")
+    print("=" * 68)
+
+
+# --------------------------------------------------------------------------- #
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="das2", description="Water sensor anomaly intelligence")
+    parser.add_argument("--config", help="path to config.yaml")
+    parser.add_argument("--log-level", default="INFO")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("migrate", help="create/update the database tables")
+    sub.add_parser("check", help="verify data, database and Telegram")
+
+    run = sub.add_parser("run", help="one analysis run")
+    run.add_argument("--dry-run", action="store_true",
+                     help="no database writes, no Telegram")
+    run.add_argument("--no-alert", action="store_true",
+                     help="persist, but do not send Telegram messages")
+
+    worker = sub.add_parser("ack-worker", help="consume acknowledge buttons")
+    worker.add_argument("--cycles", type=int, default=None,
+                        help="stop after N poll cycles (for testing)")
+
+    sched = sub.add_parser("schedule", help="run on an interval, forever")
+    sched.add_argument("--interval-minutes", type=int, default=None)
+    sched.add_argument("--dry-run", action="store_true")
+    sched.add_argument("--no-alert", action="store_true")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    _setup_logging(args.log_level)
+    config = load_config(args.config)
+
+    handlers = {
+        "migrate": cmd_migrate,
+        "check": cmd_check,
+        "run": cmd_run,
+        "ack-worker": cmd_ack_worker,
+        "schedule": cmd_schedule,
+    }
+    try:
+        return handlers[args.command](config, args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,23 @@
+-- 011_sensor_kind.sql
+-- ---------------------------------------------------------------------------
+-- Add das2_sensor.kind for databases created before it existed.
+--
+-- `kind` decides which detectors run against a sensor at all:
+--
+--   measurement  the normal detector stack
+--   counter      monotonic (kWh, run hours). A flat counter means the plant is
+--                idle and a drop means a rollover, so flatline and spike
+--                detection over one produce nothing but noise.
+--   config       setpoints and thresholds. The value changes when an engineer
+--                edits it, so there is nothing for a detector to say.
+--   status       digital state.
+--
+-- Without it, every sensor is treated as a measurement and the counters and
+-- setpoints generate steady false alarms.
+--
+-- Safe to re-run: applying this twice raises "duplicate column", which the
+-- migration runner treats as already-applied rather than as a failure. On a
+-- fresh database 010 already creates the column and this file is a no-op.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE das2_sensor ADD kind VARCHAR(16);

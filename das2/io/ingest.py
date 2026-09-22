@@ -93,6 +93,34 @@ class IngestReport:
         total = self.sensors_with_coords + self.sensors_without_coords
         return round(100.0 * self.sensors_with_coords / total, 1) if total else 0.0
 
+    def as_dict(self) -> dict:
+        """
+        Loggable form.
+
+        `missing_hours` is reduced to a count and a range rather than the full
+        list: a feed that has been down for a week produces 168 timestamps, and
+        dumping them into every run's stats buries the numbers that matter
+        under an unreadable wall of datetimes.
+        """
+        return {
+            "history_files": self.history_files,
+            "history_rows": self.history_rows,
+            "history_rows_dropped": self.history_rows_dropped,
+            "inventory_rows": self.inventory_rows,
+            "readings_matched": self.readings_matched,
+            "readings_unmatched": self.readings_unmatched,
+            "sensors_with_coords": self.sensors_with_coords,
+            "sensors_without_coords": self.sensors_without_coords,
+            "coordinate_coverage_pct": self.coordinate_coverage_pct,
+            "window_start": self.window_start,
+            "window_end": self.window_end,
+            "missing_hours": len(self.missing_hours),
+            "missing_hours_range": (
+                f"{self.missing_hours[0]:%Y-%m-%d %H:%M} .. "
+                f"{self.missing_hours[-1]:%Y-%m-%d %H:%M}"
+                if self.missing_hours else None),
+        }
+
     def summary(self) -> str:
         lines = [
             f"HISTORY   : {self.history_files} files, {self.history_rows:,} rows "

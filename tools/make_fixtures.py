@@ -399,26 +399,42 @@ def write_history(out: Path, fleet: list[SensorSpec],
 def write_histcurr(out: Path, fleet: list[SensorSpec], snapshot: datetime,
                    series: dict[str, list[tuple[datetime, float]]]) -> None:
     """
-    Sensor inventory: the source of dim.csv. Comma-separated, unlike HISTORY.
+    Sensor inventory, in the format the LIVE feed actually uses.
+
+    This was originally written as the older comma-separated 6-column file that
+    the committed v1 code expects. The real hourly export the client supplied is
+    neither: it is **semicolon-separated with 9 columns**, carries an extra
+    POINTTYPE, orders the columns differently, and writes DATETIME as US
+    12-hour `9/20/2026 9:00:00 PM`.
+
+        committed code expects: TAGNAME,IPADDRESS,ROW_ID,DESCRIPTION,RAWTYPE,RTUNUMBER
+        the live feed sends:    ROW_ID;IPADDRESS;DESCRIPTION;TAGNAME;RTUNUMBER;
+                                RAWTYPE;POINTTYPE;DATETIME;CURRVALUE
+
+    A fixture in the old shape would have let the ingest pass its tests and then
+    fail on the client's first real file, so it is written in the live format
+    here even though that makes it disagree with the committed v1 reader.
 
     DATETIME and CURRVALUE are present because this is a *current value*
-    snapshot table, not a pure inventory. `process_histcurr` parses DATETIME
-    and drops rows with any NA before selecting its columns, so omitting it
-    fails the whole stage with `KeyError: 'DATETIME'` -- found by running the
-    real v1 pipeline against this fixture rather than by reading the code.
+    snapshot, not a pure inventory: v1's `process_histcurr` parses DATETIME and
+    drops rows with any NA before selecting columns, so omitting it fails the
+    whole stage with `KeyError: 'DATETIME'`.
     """
     d = out / "HISTCURR"
     d.mkdir(parents=True, exist_ok=True)
     with open(d / "histcurr_fujitsu.csv", "w", encoding="utf-8") as fh:
-        fh.write("TAGNAME,IPADDRESS,ROW_ID,DESCRIPTION,RAWTYPE,RTUNUMBER,"
-                 "DATETIME,CURRVALUE\n")
+        fh.write("ROW_ID;IPADDRESS;DESCRIPTION;TAGNAME;RTUNUMBER;RAWTYPE;"
+                 "POINTTYPE;DATETIME;CURRVALUE\n")
         for spec in fleet:
             tag = f"S606-{spec.site.upper()[:8]}-{spec.row_id}"
             points = series.get(spec.description) or []
             last_ts, last_val = points[-1] if points else (snapshot, spec.base)
-            fh.write(f"{tag},{spec.ip},{spec.row_id},{spec.description},"
-                     f"{spec.rawtype},{spec.rtu},"
-                     f"{last_ts:%Y-%m-%d %H:%M:%S},{last_val:.6f}\n")
+            # POINTTYPE 0 is the real feed's largest and least informative
+            # bucket (18% pure), so using it keeps the fixture honest about how
+            # little the code may lean on that column.
+            fh.write(f"{spec.row_id};{spec.ip};{spec.description};{tag};"
+                     f"{spec.rtu};{spec.rawtype};0;"
+                     f"{last_ts:%-m/%-d/%Y %-I:%M:%S %p};{last_val:.6f}\n")
 
 
 def write_longlat(out: Path) -> None:

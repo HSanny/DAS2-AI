@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
 
 # Verbatim from docker_ready/fujitsu_data_pipeline.py -- if the fixture stops
 # matching these, it has stopped resembling the real export.
@@ -63,6 +64,13 @@ def read_history(out: Path):
     return rows
 
 
+def _inventory_readable(path) -> bool:
+    """The production reader must accept the fixture, not just a CSV parser."""
+    from das2.io.ingest import read_inventory
+    frame = read_inventory(path)
+    return len(frame) > 0 and "sensor_key" in frame.columns
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         out = Path(td)
@@ -86,14 +94,26 @@ def main():
               f"({sorted(rows[0].keys())})")
         check("readings present", len(rows) > 50_000, f"({len(rows):,})")
 
+        # The LIVE format, not the one the committed v1 reader expects. The
+        # client's real export is semicolon-separated with 9 columns and an
+        # extra POINTTYPE; v1's reader wants a comma-separated 6-column file
+        # and fails outright on the real thing. A fixture in v1's shape would
+        # let the ingest pass its tests and then break on the first real file.
         with open(out / "HISTCURR" / "histcurr_fujitsu.csv", encoding="utf-8") as fh:
-            inv = list(csv.DictReader(fh))     # comma-separated, unlike HISTORY
-        check("HISTCURR uses the real inventory columns",
-              {"TAGNAME", "IPADDRESS", "ROW_ID", "DESCRIPTION", "RAWTYPE",
-               "RTUNUMBER"} <= set(inv[0].keys()))
+            inv = list(csv.DictReader(fh, delimiter=";"))
+        check("HISTCURR is ';'-separated, as the live export is",
+              {"ROW_ID", "IPADDRESS", "DESCRIPTION", "TAGNAME", "RTUNUMBER",
+               "RAWTYPE", "POINTTYPE", "DATETIME", "CURRVALUE"} == set(inv[0].keys()),
+              f"({sorted(inv[0].keys())})")
         check("HISTCURR carries DATETIME, which v1 requires",
               "DATETIME" in inv[0],
               "(process_histcurr fails with KeyError('DATETIME') without it)")
+        check("DATETIME is the historian's US 12-hour form",
+              bool(re.match(r"^\d{1,2}/\d{1,2}/\d{4} \d{1,2}:\d{2}:\d{2} [AP]M$",
+                            inv[0]["DATETIME"])),
+              f"({inv[0]['DATETIME']!r})")
+        check("the real ingest reads it without complaint",
+              _inventory_readable(out / "HISTCURR" / "histcurr_fujitsu.csv"))
 
         check("LongLat is also written where v1 looks for it",
               (out / "processed" / "LongLat.csv").exists(),

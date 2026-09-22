@@ -69,6 +69,22 @@ class IngestConfig:
     longlat_path: str = "LongLat.csv"
     raw_dir: str = "raw"
 
+    #: Equipment classification rules. Empty means the packaged
+    #: das2/data/equipment_rules.yaml, which is the normal case; pointing this
+    #: at a copy lets the client retune classification without a rebuild.
+    equipment_rules_path: str = ""
+
+    @property
+    def inventory_path(self) -> str:
+        """
+        The sensor inventory the run reads.
+
+        Named separately from `histcurr_path` because "the inventory" is the
+        concept the rest of the system depends on, while HISTCURR is merely the
+        file Fujitsu happens to export it as today.
+        """
+        return self.histcurr_path
+
     #: How much history each analysis run looks at.
     window_hours: int = 72
     #: Allowance for the network share lagging behind wall clock.
@@ -204,7 +220,13 @@ class SpatialConfig:
     within a site.
     """
 
-    cluster_radius_m: float = 2000.0
+    #: Measured from the real LongLat.csv, not guessed -- see
+    #: das2.spatial.cluster for the site-spacing and percolation figures. The
+    #: earlier 2,000 m value reached only 68% of sites and failed to link the
+    #: real 3.3-4.4 km spacing of an actual East-side event.
+    cluster_radius_m: float = 5000.0
+    #: A cluster wider than this is re-split: it is no longer one crew's job.
+    max_cluster_diameter_m: float = 5000.0
     min_cluster_size: int = 2
 
     #: Only sensors whose anomaly windows overlap in time may join a cluster:
@@ -278,9 +300,19 @@ class AlertConfig:
     #: That cut emitted ten sensors whether the network was healthy or on fire,
     #: and would silently drop a genuine ten-site regional event.
     max_alerts_per_region: int = 5
+    #: Absolute cap on messages per run, as a backstop against a bad run
+    #: flooding the chat. Anything beyond it is summarised in one line and
+    #: remains on the dashboard.
+    max_incidents_per_run: int = 10
     min_priority: str = "P3"
     dashboard_base_url: str = ""
     feedback_buttons: bool = True
+
+    #: Bot credentials. Set these via DAS2_ALERT_TELEGRAM_TOKEN and
+    #: DAS2_ALERT_TELEGRAM_CHAT_ID rather than in a config file, so they never
+    #: reach the repository.
+    telegram_token: str = field(default="", repr=False)
+    telegram_chat_id: str = ""
 
 
 @dataclass
@@ -292,6 +324,11 @@ class ReportConfig:
     #: and the region-by-type matrix when that is unreachable, which is the
     #: normal state on an isolated operations network.
     map_tiles: bool = True
+
+    @property
+    def public_url(self) -> str:
+        """Link included in alerts. Empty when the HTML is not served anywhere."""
+        return self.dashboard_base_url if hasattr(self, "dashboard_base_url") else ""
 
 
 @dataclass
@@ -305,6 +342,17 @@ class DatabaseConfig:
     password: str = field(default="", repr=False)
     driver: str = "ODBC Driver 17 for SQL Server"
     schema: str = "dbo"
+
+    @property
+    def safe_url(self) -> str:
+        """The URL with the password removed, for logs and the check command."""
+        url = self.sqlalchemy_url()
+        if self.password and self.password in url:
+            url = url.replace(self.password, "***")
+        from urllib.parse import quote_plus
+        if self.password:
+            url = url.replace(quote_plus(self.password), "***")
+        return url
 
     def sqlalchemy_url(self) -> str:
         if self.url:
@@ -332,6 +380,11 @@ class Config:
     alert: AlertConfig = field(default_factory=AlertConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+
+    #: How often `das2 schedule` runs. Configurable by decision -- nothing in
+    #: the code may assume a cadence, because every window and threshold is
+    #: expressed in time rather than in runs or samples.
+    run_interval_minutes: int = 60
 
     # ------------------------------------------------------------------ #
     # Loading
@@ -429,3 +482,13 @@ def _read_config_file(path: Path) -> dict[str, Any]:
             ) from exc
         return yaml.safe_load(text) or {}
     return json.loads(text)
+
+
+def load_config(path: str | Path | None = None) -> Config:
+    """
+    Load configuration: defaults, then the file, then environment overrides.
+
+    The module-level entry point everything else uses, so there is exactly one
+    place where "where does configuration come from" is answered.
+    """
+    return Config.load(path)
