@@ -363,6 +363,21 @@ class DatabaseConfig:
     #: 17, which produced `IM002 ... no default driver specified` on the first
     #: real deployment. Change it only alongside the Dockerfile.
     driver: str = "ODBC Driver 18 for SQL Server"
+
+    #: TLS to SQL Server. "yes" keeps the connection encrypted, which is what
+    #: you want for credentials crossing any network.
+    #:
+    #: Driver 18 changed the default to yes, and TrustServerCertificate only
+    #: skips CERTIFICATE VALIDATION -- it does not turn encryption off. On the
+    #: client's deployment the handshake stalled until the login timeout, so
+    #: the error read "Login timeout expired" and looked like an unreachable
+    #: server, while a plain TCP connect to 1433 succeeded. The cause was the
+    #: container's OpenSSL refusing the older TLS their historian offers; the
+    #: Dockerfile now relaxes that, which is the fix that KEEPS encryption.
+    #:
+    #: Set to "no" only if that is not enough. It sends the password in clear
+    #: over the wire, so it is a last resort on a trusted LAN, not a default.
+    encrypt: str = "yes"
     schema: str = "dbo"
 
     #: Persist each run's readings into das2_reading. This is what gives the
@@ -413,16 +428,17 @@ class DatabaseConfig:
 
     def sqlalchemy_url(self) -> str:
         if self.url:
-            return _complete_pyodbc_url(self.url, self.driver)
+            return _complete_pyodbc_url(self.url, self.driver, self.encrypt)
         from urllib.parse import quote_plus
         return (
             f"mssql+pyodbc://{quote_plus(self.username)}:{quote_plus(self.password)}"
             f"@{self.host}:{self.port}/{self.database}"
             f"?driver={quote_plus(self.driver)}&TrustServerCertificate=yes"
+            f"&Encrypt={quote_plus(self.encrypt)}"
         )
 
 
-def _complete_pyodbc_url(url: str, driver: str) -> str:
+def _complete_pyodbc_url(url: str, driver: str, encrypt: str = "yes") -> str:
     """
     Add `driver=` and `TrustServerCertificate=yes` to a SQL Server URL that
     omits them, and leave every other URL exactly as given.
@@ -462,6 +478,8 @@ def _complete_pyodbc_url(url: str, driver: str) -> str:
         query.append(("driver", driver))
     if "trustservercertificate" not in present:
         query.append(("TrustServerCertificate", "yes"))
+    if "encrypt" not in present:
+        query.append(("Encrypt", encrypt))
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 

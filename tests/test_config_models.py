@@ -165,6 +165,21 @@ def main():
     check("driver is supplied", "driver=ODBC+Driver+18+for+SQL+Server" in completed)
     check("TrustServerCertificate too", "TrustServerCertificate=yes" in completed,
           "(the container trusts no CA the SQL Server was issued under)")
+    # Driver 18 encrypts by default, and TrustServerCertificate only skips
+    # CERTIFICATE VALIDATION -- it does not turn encryption off. On the
+    # client's server the handshake stalled until the login timer expired, so
+    # the error said "Login timeout expired" and looked like an unreachable
+    # host while a plain TCP connect to 1433 succeeded.
+    check("the connection is encrypted by default", "Encrypt=yes" in completed,
+          "(the password crosses a network either way)")
+    off = DatabaseConfig(host="h", database="d", username="u", password="p",
+                         encrypt="no").sqlalchemy_url()
+    check("and encryption can be turned off when a server cannot do TLS",
+          "Encrypt=no" in off, "(last resort: this sends the password in clear)")
+    pinned = DatabaseConfig(url="mssql+pyodbc://u:p@h/d?Encrypt=yes",
+                            encrypt="no").sqlalchemy_url()
+    check("an Encrypt already in the URL is never overridden",
+          "Encrypt=yes" in pinned and "Encrypt=no" not in pinned)
     check("the default driver matches the one the Dockerfile installs",
           DatabaseConfig().driver == "ODBC Driver 18 for SQL Server",
           "(it said 17 for a while; the image has never carried 17)")

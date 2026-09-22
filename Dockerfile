@@ -60,6 +60,33 @@ https://packages.microsoft.com/debian/12/prod bookworm main" \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
+# --- let TLS reach an older SQL Server -------------------------------------
+# Debian 12 ships OpenSSL 3 at SECLEVEL=2 with MinProtocol TLSv1.2, which
+# refuses TLS 1.0/1.1, small RSA keys and SHA-1 certificates. Historian boxes
+# offer exactly those, and msodbcsql18 does not report the rejection: the
+# handshake stalls until the login timer expires, so the error reads
+#
+#     ('HYT00', '[Microsoft][ODBC Driver 18 for SQL Server]
+#      Login timeout expired (0) (SQLDriverConnect)')
+#
+# which is indistinguishable from an unreachable server. On the client's
+# deployment a plain TCP connect to 1433 succeeded while every login timed out
+# at exactly 15 seconds, and the same credentials logged in from Windows --
+# whose TLS stack accepts the older handshake.
+#
+# This relaxes the client side so the connection is still ENCRYPTED, just over
+# an older protocol. That is a real reduction in TLS strength and it is the
+# lesser of two evils: the alternative people reach for is Encrypt=no, which
+# sends the password across the network in clear. Remove this once the server
+# offers TLS 1.2.
+RUN set -e; \
+    conf=/etc/ssl/openssl.cnf; \
+    if [ -f "$conf" ]; then \
+        sed -i 's/^\(CipherString\s*=\s*DEFAULT\).*/\1:@SECLEVEL=0/' "$conf"; \
+        sed -i 's/^\(MinProtocol\s*=\s*\).*/\1TLSv1/' "$conf"; \
+        grep -E '^(CipherString|MinProtocol)' "$conf" || true; \
+    fi
+
 # Singapore time. Every timestamp in an alert is read by someone standing in
 # Singapore, and a container defaulting to UTC makes "03:00" mean 11:00 to the
 # person deciding whether to send a crew out.
