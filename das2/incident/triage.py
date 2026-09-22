@@ -36,6 +36,8 @@ about the wiring rather than an inference about the water.
 from __future__ import annotations
 
 from das2.models import (
+    CROSS_SIGNAL_TYPES,
+    DEFINITIVE_INSTRUMENT_FAULTS,
     MAINTENANCE_TYPES,
     SENSOR_HEALTH_TYPES,
     AnomalyType,
@@ -138,13 +140,43 @@ def classify(cluster: Cluster, *,
                        f"-- the water moved, not the instruments")
         return IncidentClass.REGIONAL_EVENT, why
 
+    # --- 3b. Instruments contradicting each other ---------------------------- #
+    # Checked before the correlation-dependent rules, because a contradiction
+    # between two instruments is already conclusive. Neighbour correlation
+    # cannot make "level, inflow and outflow disagree" go away -- it can only
+    # say which reading to doubt, and that is a question for the technician
+    # standing in front of them.
+    if types & CROSS_SIGNAL_TYPES:
+        conflicting = sorted(t.value for t in types & CROSS_SIGNAL_TYPES)
+        why.append(f"{', '.join(conflicting)}: instruments that should agree "
+                   f"do not")
+        for member in members:
+            verdict = next((s.detail.get("verdict") for s in member.signals
+                            if s.detail.get("verdict")), None)
+            if verdict:
+                why.append(verdict)
+                break
+        return IncidentClass.INSTRUMENT_CONFLICT, why
+
     # --- 4. Maintenance ----------------------------------------------------- #
     if types and types <= MAINTENANCE_TYPES:
         why.append(f"gradual {', '.join(sorted(t.value for t in types))} "
                    f"with no abrupt failure")
         return IncidentClass.DRIFT_MAINTENANCE, why
 
-    # --- 5. Instrument fault vs the process --------------------------------- #
+    # --- 5. Definitively broken instruments ---------------------------------- #
+    # Not correlation-dependent, deliberately. A sensor that has stopped
+    # reporting, or frozen, or lost its resolution, is broken whatever its
+    # neighbours did -- correlation says something about a sensor's VALUE, and
+    # these faults are not about the value.
+    if types and types <= DEFINITIVE_INSTRUMENT_FAULTS:
+        why.append(f"{', '.join(sorted(t.value for t in types))}: the "
+                   f"instrument itself has failed")
+        why.append("not a judgement about the water, so neighbour behaviour "
+                   "does not change it")
+        return IncidentClass.SENSOR_FAULT, why
+
+    # --- 6. Instrument fault vs the process --------------------------------- #
     # This is the dispatch decision, and correlation is what decides it.
     if types and types <= SENSOR_HEALTH_TYPES:
         why.append(f"sensor-health fault ({', '.join(sorted(t.value for t in types))})")
@@ -192,6 +224,9 @@ MEMBERS_SATURATE = 8
 #: exactly the wasted trip this system exists to prevent.
 CLASS_WEIGHT: dict[IncidentClass, float] = {
     IncidentClass.REGIONAL_EVENT: 1.00,
+    # A physical contradiction is as certain as this system gets: two readings
+    # cannot both be true, so there is nothing probabilistic left to discount.
+    IncidentClass.INSTRUMENT_CONFLICT: 0.90,
     IncidentClass.SENSOR_FAULT: 0.85,
     IncidentClass.PROCESS_EVENT: 0.55,
     IncidentClass.DRIFT_MAINTENANCE: 0.40,

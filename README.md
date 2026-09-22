@@ -36,7 +36,7 @@ docker compose up -d das2 das2-ack        # go live
 | `output/dashboard_*.html` | Regional map, region × equipment-type heatmap, every incident with the evidence behind its recommendation. Self-contained — email it, archive it, open it from a share. |
 | `output/*.png` | The same as images, for Telegram |
 | Telegram | One message **per incident**, not per sensor per run, with Acknowledge / Dispatched / False-alarm buttons |
-| SQL Server | Incidents with stable identity across runs, plus the operator feedback that is the only ground truth this system has |
+| SQL Server | Incidents with stable identity across runs, the reading history the daily job learns from, plus the operator feedback that is the only ground truth this system has |
 
 ## How it works
 
@@ -63,7 +63,7 @@ nothing linked them.
 ## Development
 
 ```bash
-bash tests/run_all.sh              # 579 assertions, no network needed
+bash tests/run_all.sh              # 632 assertions, no network needed
 python3 -m das2.cli demo           # synthetic data with known faults
 python3 tools/make_fixtures.py --out /tmp/fx
 ```
@@ -74,7 +74,12 @@ and the modules say which measurement and what it ruled out.
 
 ## Status
 
-Working end to end. `DEPLOY.md` §14 lists precisely what is built and what is
-not — read it before judging the output, because several detectors (DRIFT,
-NOISE_BURST, the digital-equipment set, mass balance, neighbour correlation)
-are not yet implemented and therefore produce no findings.
+Working end to end, with all fifteen detectors built. `DEPLOY.md` §14 lists
+what each one does and where it runs.
+
+Two things to know before judging the output. The **daily profile job**
+(`das2 profile`) must be scheduled: `DRIFT`, `NOISE_BURST` and the whole
+baseline layer depend on it, and until it has run those produce nothing. And
+there is **no shadow-mode harness yet**, so there is no measured precision or
+recall against real data — the evidence is 632 assertions and a fixture
+carrying 19 known faults, which is real but is not the same claim.

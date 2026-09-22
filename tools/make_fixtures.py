@@ -212,6 +212,32 @@ def build_fleet() -> list[SensorSpec]:
             unit="A", fault="TELEMETRY_FANOUT", fault_start_frac=0.80,
             fault_duration_h=1.0, fault_detail={"relative_step": 0.5})
 
+    # --- a real tank: level + metered inflow + metered outflow ---------------
+    # Mass balance is the only genuinely multivariate detector, and without a
+    # site carrying all three signals there is nothing for it to check. The
+    # outflow meter under-reads for six hours, which is the fault that makes
+    # the level, the inflow and the outflow mutually inconsistent -- and which
+    # no single-sensor detector can see, because every one of the three
+    # readings stays entirely plausible on its own.
+    add(description="Kranji1PS-Service-Reservoir-Level", equipment="LevelSensor",
+        site="Kranji1PS", rtu="1020", dt_s=120, base=3.0, noise=0.002, unit="m",
+        fault="TANK_LEVEL", fault_start_frac=0.30, fault_duration_h=6.0)
+    # Inlet steady, outlet following demand. They must NOT share a profile: if
+    # inflow and outflow track each other the net flow is ~0, the level barely
+    # moves, and there is no relationship for mass balance to fit at all --
+    # which is exactly what the first version of this fixture did, producing a
+    # fit r2 of -0.06 and a detector that correctly abstained on data carrying
+    # no information.
+    add(description="Kranji1PS-Reservoir-Inlet-Flow", equipment="Flowrate",
+        site="Kranji1PS", rtu="1020", dt_s=120, base=0.50, noise=0.008,
+        unit="m3/s", fault="TANK_INLET", fault_start_frac=0.30,
+        fault_duration_h=6.0)
+    add(description="Kranji1PS-Reservoir-Outlet-Flow", equipment="Flowrate",
+        site="Kranji1PS", rtu="1020", dt_s=120, base=0.50, noise=0.008,
+        unit="m3/s", diurnal_amp=0.18, fault="TANK_OUTLET",
+        fault_start_frac=0.30, fault_duration_h=6.0,
+        fault_detail={"under_read": 0.7})
+
     # --- rain gauges ---------------------------------------------------------
     # 188 of these exist in the real feed and are currently discarded as
     # unclassified. One rains during the regional event, which is what lets
@@ -337,6 +363,90 @@ def generate_series(spec: SensorSpec, start: datetime, end: datetime,
     if not clean and points:
         _inject_timestamp_defects(points, rng)
     return points
+
+
+#: The tank's three signals, and the geometry that ties them together.
+TANK_LEVEL = "Kranji1PS-Service-Reservoir-Level"
+TANK_INLET = "Kranji1PS-Reservoir-Inlet-Flow"
+TANK_OUTLET = "Kranji1PS-Reservoir-Outlet-Flow"
+TANK_AREA_M2 = 500.0
+TANK_UNDER_READ = 0.7
+TANK_FAULT_START_FRAC = 0.30
+TANK_FAULT_HOURS = 6.0
+
+
+def couple_tank(series: dict[str, list[tuple[datetime, float]]],
+                start: datetime, *, clean: bool = False) -> None:
+    """
+    Make the reservoir's three signals physically consistent, then break one.
+
+    The per-sensor generator cannot do this: it builds each series
+    independently, so a level, an inflow and an outflow generated separately
+    have no relationship at all and mass balance would either see violations
+    everywhere or refuse to fit. Here the level is INTEGRATED from the metered
+    flows, so `dLevel/dt * Area == Qin - Qout` holds exactly, up to noise.
+
+    Then the outflow meter is made to under-read by 30% for six hours. That is
+    the fault worth testing, because it is invisible to every single-sensor
+    detector: the level is plausible, the inflow is plausible, and the outflow
+    is plausible. Only the three together are impossible, which is the entire
+    reason mass balance exists.
+    """
+    if not all(k in series for k in (TANK_LEVEL, TANK_INLET, TANK_OUTLET)):
+        return
+
+    inlet = series[TANK_INLET]
+    outlet = series[TANK_OUTLET]
+    level = series[TANK_LEVEL]
+    if not (inlet and outlet and level):
+        return
+
+    if not clean:
+        # The outlet METER under-reads; the water itself is unaffected, which
+        # is exactly why the books stop balancing.
+        fault_start = start + timedelta(
+            seconds=(outlet[-1][0] - start).total_seconds() * TANK_FAULT_START_FRAC)
+        fault_end = fault_start + timedelta(hours=TANK_FAULT_HOURS)
+        true_outlet = [(t, v) for t, v in outlet]
+        series[TANK_OUTLET] = [
+            (t, v * TANK_UNDER_READ if fault_start <= t < fault_end else v)
+            for t, v in outlet
+        ]
+    else:
+        true_outlet = [(t, v) for t, v in outlet]
+
+    # Integrate the TRUE flows to get the level the water actually reaches.
+    def at(points, when):
+        best = points[0][1]
+        for t, v in points:
+            if t > when:
+                break
+            best = v
+        return best
+
+    # Integrate over SORTED time. `generate_series` has already injected the
+    # duplicate and out-of-order timestamps the real feed contains, and
+    # integrating straight over those gives dt <= 0 and a level that wanders
+    # off into nonsense -- destroying the very relationship this tank exists to
+    # provide. The defects stay in the emitted series; they are simply not
+    # allowed to corrupt the physics.
+    inlet = sorted(inlet, key=lambda row: row[0])
+    true_outlet = sorted(true_outlet, key=lambda row: row[0])
+    ordered = sorted(level, key=lambda row: row[0])
+
+    height = ordered[0][1]
+    previous = ordered[0][0]
+    rebuilt = [(previous, height)]
+    for t, _ in ordered[1:]:
+        dt = (t - previous).total_seconds()
+        if dt <= 0:
+            rebuilt.append((t, height))
+            continue
+        net = at(inlet, t) - at(true_outlet, t)
+        height += net * dt / TANK_AREA_M2
+        rebuilt.append((t, height))
+        previous = t
+    series[TANK_LEVEL] = rebuilt
 
 
 def _inject_timestamp_defects(points: list[tuple[datetime, float]],
@@ -579,6 +689,7 @@ def main() -> None:
     fleet = build_fleet()
     series = {s.description: generate_series(s, start, end, rng, clean=args.clean)
               for s in fleet}
+    couple_tank(series, start, clean=args.clean)
 
     n_files = write_history(out, fleet, series, start, end)
     write_histcurr(out, fleet, end, series)

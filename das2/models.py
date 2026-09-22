@@ -98,6 +98,32 @@ MAINTENANCE_TYPES: frozenset[AnomalyType] = frozenset({
     AnomalyType.SHORT_CYCLING,
 })
 
+#: Faults where the instrument is definitively broken, and no amount of
+#: agreement from the neighbours changes that.
+#:
+#: This distinction matters because correlation is only informative about a
+#: sensor's *value*. A transmitter that has stopped reporting has stopped
+#: reporting; a frozen reading is frozen; a collapsed ADC has collapsed. None
+#: of those become acceptable because a sensor two kilometres away happened to
+#: move in sympathy. Measured on the fixture, treating these as
+#: correlation-dependent downgraded a genuine frozen flowmeter from
+#: SENSOR_FAULT to a suppressed WATCH, purely because an unrelated conductivity
+#: sensor at the next site correlated weakly with the flat line.
+DEFINITIVE_INSTRUMENT_FAULTS: frozenset[AnomalyType] = frozenset({
+    AnomalyType.FLATLINE,
+    AnomalyType.STALE,
+    AnomalyType.QUANTISATION_COLLAPSE,
+    AnomalyType.DITHERING_DEAD,
+})
+
+#: Contradictions between two or more instruments. Physically impossible rather
+#: than statistically unusual, so they are never held for more evidence: the
+#: evidence is already conclusive, and only the culprit is unknown.
+CROSS_SIGNAL_TYPES: frozenset[AnomalyType] = frozenset({
+    AnomalyType.MASS_BALANCE_VIOLATION,
+    AnomalyType.RUN_STATE_INCONSISTENT,
+})
+
 
 class Priority(str, Enum):
     P1 = "P1"   # act now
@@ -329,6 +355,10 @@ class IncidentClass(str, Enum):
     DRIFT_MAINTENANCE = "DRIFT_MAINTENANCE"      # schedule calibration
     PROCESS_EVENT = "PROCESS_EVENT"              # the water moved -> monitor
     WEATHER_DRIVEN = "WEATHER_DRIVEN"            # rain explains it -> do not dispatch
+    # Two instruments cannot both be right. Physically conclusive, so it is a
+    # dispatch rather than a WATCH -- what is unknown is which one to believe,
+    # not whether something is wrong.
+    INSTRUMENT_CONFLICT = "INSTRUMENT_CONFLICT"
     WATCH = "WATCH"                              # weak/conflicting -> re-evaluate
 
 
@@ -362,6 +392,8 @@ RECOMMENDATION: dict[IncidentClass, str] = {
         "Rainfall nearby explains this - monitor only, do not dispatch.",
     IncidentClass.WATCH:
         "Evidence is weak or conflicting - re-evaluate on the next run.",
+    IncidentClass.INSTRUMENT_CONFLICT:
+        "Instruments contradict each other - check all of them; one is wrong.",
 }
 
 

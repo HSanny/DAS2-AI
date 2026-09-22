@@ -343,6 +343,17 @@ class DatabaseConfig:
     driver: str = "ODBC Driver 17 for SQL Server"
     schema: str = "dbo"
 
+    #: Persist each run's readings into das2_reading. This is what gives the
+    #: daily profile job its history, and therefore what makes DRIFT,
+    #: NOISE_BURST and the time-of-day baselines possible at all. Turn it off
+    #: only if the v1 `data` table is already readable and retained.
+    store_readings: bool = True
+
+    #: Drop readings older than this. Months x 2,672 sensors x 120 s is on the
+    #: order of 10^8 rows, so an unbounded table is not an option; 60 days is
+    #: comfortably more than the 28 the profile job wants.
+    reading_retention_days: int = 60
+
     @property
     def safe_url(self) -> str:
         """The URL with the password removed, for logs and the check command."""

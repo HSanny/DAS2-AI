@@ -137,6 +137,7 @@ def cmd_run(config: Config, args) -> int:
 
     engine = None
     open_incidents: list = []
+    baselines: dict = {}
     if not args.dry_run:
         from das2.io.store import load_open_incidents, make_engine
         engine = make_engine(config.database.sqlalchemy_url())
@@ -145,8 +146,15 @@ def cmd_run(config: Config, args) -> int:
         except Exception as exc:                           # noqa: BLE001
             log.warning("could not load open incidents (%s) — "
                         "every incident will be treated as new", exc)
+        try:
+            from das2.io.store import load_baselines
+            baselines = load_baselines(engine)
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("could not load time-of-day baselines (%s) — "
+                        "the L2 residual layer will abstain", exc)
 
-    result = pipeline.run(config, open_incidents=open_incidents)
+    result = pipeline.run(config, open_incidents=open_incidents,
+                          baselines=baselines)
 
     if not result.anomalies and result.readings.empty:
         log.error("no readings were analysed — check the history directory")
@@ -167,10 +175,17 @@ def cmd_run(config: Config, args) -> int:
     _print_summary(result)
 
     if engine is not None:
-        from das2.io.store import save_run, upsert_sensors
+        from das2.io.store import (prune_readings, save_readings, save_run,
+                                   upsert_sensors)
         try:
             upsert_sensors(engine, result.sensors)
             save_run(engine, result)
+            if config.database.store_readings:
+                # Feeds the daily profile job. Without it DRIFT, NOISE_BURST
+                # and the L2 baselines have no source of history.
+                save_readings(engine, result.readings)
+                # ...and bound it, or the table grows without limit.
+                prune_readings(engine, config.database.reading_retention_days)
             print("Persisted to the database.")
         except Exception as exc:                           # noqa: BLE001
             log.error("persistence failed: %s", exc)
@@ -269,6 +284,50 @@ def cmd_demo(config: Config, args) -> int:
     return 0 if regional else 1
 
 
+def cmd_profile(config: Config, args) -> int:
+    """
+    The daily job: long-history baselines, DRIFT and NOISE_BURST.
+
+    Separate from the hourly run because these answers change slowly, cost far
+    more to compute, and genuinely cannot be derived from a 72-hour window --
+    a 1%/day drift is 3% across it while the daily demand cycle is 10-30%.
+    Run it once a day; the hourly run scores against what it stores.
+    """
+    from das2.io.store import load_history, make_engine, save_baselines
+    from das2.profile.build import MIN_DAYS_DRIFT, PREFERRED_DAYS, run_profile_job
+
+    engine = make_engine(config.database.sqlalchemy_url())
+    days = args.days or PREFERRED_DAYS
+    print(f"Reading up to {days} days of history ...")
+    history = load_history(engine, days=days)
+
+    if history.empty:
+        print("\nNo history available.")
+        print("DRIFT and NOISE_BURST need at least "
+              f"{MIN_DAYS_DRIFT} days of readings, and the L2 residual layer "
+              "needs stored baselines.")
+        print("Check that das2_reading is being populated, or that the v1 "
+              "`data` table is readable by this login.")
+        return 2
+
+    observed = history.groupby("sensor_key")["ts"].apply(
+        lambda s: s.dt.normalize().nunique())
+    print(f"{len(history):,} readings, {history['sensor_key'].nunique()} sensors, "
+          f"median {observed.median():.0f} days each")
+
+    result = run_profile_job(history)
+    print(f"\n{result.summary()}")
+
+    if observed.median() < MIN_DAYS_DRIFT:
+        print(f"\nNOTE: median history is under {MIN_DAYS_DRIFT} days, so DRIFT "
+              f"is not being computed. It is not a failure -- the slope simply "
+              f"cannot be separated from the daily cycle over a shorter span.")
+
+    save_baselines(engine, result.baselines)
+    print("Baselines stored. The hourly run will score against them from now on.")
+    return 0
+
+
 def cmd_ack_worker(config: Config, args) -> int:
     from das2.alerting.telegram import TelegramConfig, run_ack_worker
     from das2.io.store import make_engine, record_ack
@@ -340,8 +399,9 @@ def _print_summary(result) -> None:
     if result.window_start:
         print(f"Window: {result.window_start} -> {result.window_end}")
     print("-" * 68)
-    for key in ("ingest", "coverage", "profiles", "detection",
-                "clustering", "incidents", "lifecycle"):
+    for key in ("ingest", "coverage", "profiles", "baselines", "detection",
+                "mass_balance", "correlation", "clustering", "incidents",
+                "lifecycle", "selection"):
         if key in result.stats:
             print(f"{key:>12}: {result.stats[key]}")
     print("-" * 68)
@@ -376,6 +436,11 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--keep", metavar="DIR",
                       help="keep the generated fixtures in DIR")
 
+    profile = sub.add_parser(
+        "profile", help="daily job: baselines, DRIFT and NOISE_BURST")
+    profile.add_argument("--days", type=int, default=None,
+                         help="how much history to read (default 28)")
+
     run = sub.add_parser("run", help="one analysis run")
     run.add_argument("--dry-run", action="store_true",
                      help="no database writes, no Telegram")
@@ -403,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
         "migrate": cmd_migrate,
         "check": cmd_check,
         "demo": cmd_demo,
+        "profile": cmd_profile,
         "run": cmd_run,
         "ack-worker": cmd_ack_worker,
         "schedule": cmd_schedule,

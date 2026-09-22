@@ -80,6 +80,20 @@ MIN_SHIFT_SIGMA = 6.0
 #: ones on a sensor with too few samples to tell.
 MIN_SHIFT_SE = 8.0
 
+#: ...and it must stand out against how much THIS SENSOR's level normally moves
+#: over the same span. This is the gate that makes the detector safe on
+#: integrating vessels. A reservoir level is the integral of net flow, which is
+#: a random walk: its level genuinely wanders, so shifts that would be alarming
+#: on a pressure transducer are simply Tuesday. Measured on a fixture reservoir,
+#: the first two gates alone raised LEVEL_SHIFT from 4 to 20 across the fleet,
+#: all of the new ones on the tank.
+#:
+#: Unlike the incumbent's per-sensor quantile -- which always won, so its
+#: thresholds never bound and it emitted a fixed rate regardless of reality --
+#: this is an ADDITIONAL gate on top of two absolute ones. It can only ever
+#: make the detector quieter, never force it to speak.
+MIN_SHIFT_MAD = 6.0
+
 #: A step must hold for this long to count. Shorter excursions that return are
 #: spikes, and `detect_spike` owns those.
 MIN_SUSTAIN_S = 1800.0
@@ -159,8 +173,16 @@ def detect_level_shift(ts: pd.Series, values: np.ndarray,
     # Standard error of the difference of two medians of `half` samples each.
     se = 1.253 * sigma * np.sqrt(2.0 / half)
 
+    # How much this sensor's level moves over this span anyway. On a stable
+    # sensor almost every sliding comparison is near zero, so a real step is a
+    # vast outlier; on a random-walking reservoir level the spread is wide and
+    # nothing stands out, which is the correct answer.
+    shift_scale = 1.4826 * float(np.median(np.abs(shift - np.median(shift))))
+
     strong = (np.abs(shift) >= MIN_SHIFT_SIGMA * sigma) & \
              (np.abs(shift) >= MIN_SHIFT_SE * se)
+    if shift_scale > 0:
+        strong &= np.abs(shift) >= MIN_SHIFT_MAD * shift_scale
     if not strong.any():
         return []
 
@@ -207,6 +229,7 @@ def detect_level_shift(ts: pd.Series, values: np.ndarray,
                 "after": round(pre + magnitude, 6),
                 "sigma": round(abs(magnitude) / sigma, 1),
                 "sample_noise": round(sigma, 6),
+                "level_wander": round(shift_scale, 6),
                 "relative": (round(magnitude / pre, 4) if pre else None),
             },
         ))

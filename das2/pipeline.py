@@ -30,13 +30,19 @@ from typing import Any
 import pandas as pd
 
 from das2.config import Config
+from das2.detect.baseline import baseline_summary, score_window
+from das2.detect.digital import run_digital_checks
 from das2.detect.fusion import fuse_all, fusion_summary
 from das2.detect.health import run_health_checks
+from das2.detect.massbalance import balance_summary, find_groups, run_mass_balance
 from das2.detect.profile import build_profiles, profile_summary
+from das2.detect.selection import select
 from das2.incident.build import build_incidents, incident_summary
 from das2.io.classify import get_classifier
 from das2.io.ingest import load_all
 from das2.models import Cluster, Incident, SensorAnomaly, SensorMeta
+from das2.profile.build import TimeOfDayBaseline
+from das2.spatial.correlation import cluster_correlation, correlation_summary
 from das2.spatial.cluster import (
     ClusterParams,
     cluster_anomalies,
@@ -64,11 +70,24 @@ class RunResult:
     loose: list[SensorAnomaly] = field(default_factory=list)
     incidents: list[Incident] = field(default_factory=list)
     rainfall_by_region: dict[str, float] = field(default_factory=dict)
+    correlations: dict[str, float] = field(default_factory=dict)
+    neighbour_results: list = field(default_factory=list)
+    selected: list[Incident] = field(default_factory=list)
+    held: list = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
     duration_s: float = 0.0
 
     @property
     def alertable(self) -> list[Incident]:
+        """
+        What will actually be sent.
+
+        Once selection has run this is its output, not merely "everything whose
+        class is alertable" -- otherwise the per-region budgets would be
+        computed and then ignored by the sender.
+        """
+        if self.selected:
+            return self.selected
         return [i for i in self.incidents if i.should_alert]
 
     @property
@@ -101,7 +120,8 @@ def _sensor_meta(row: pd.Series) -> SensorMeta:
 
 
 def run(config: Config, *, now: datetime | None = None,
-        open_incidents: list[Incident] | None = None) -> RunResult:
+        open_incidents: list[Incident] | None = None,
+        baselines: dict[str, TimeOfDayBaseline] | None = None) -> RunResult:
     """
     Execute one analysis run.
 
@@ -150,28 +170,70 @@ def run(config: Config, *, now: datetime | None = None,
     result.stats["profiles"] = profile_summary(profiles)
     log.info("profiles: %s", result.stats["profiles"])
 
+    # Stored time-of-day baselines from the daily job, if it has run. Without
+    # them the L2 residual layer abstains, which is stated rather than silent.
+    baselines = baselines or {}
+    result.stats["baselines"] = baseline_summary(baselines)
+    if not baselines:
+        log.info("no stored time-of-day baselines -- L2 residual scoring is "
+                 "inactive until the daily profile job has run")
+
     # --- detect ------------------------------------------------------------- #
     meta_by_key = {str(r["sensor_key"]): _sensor_meta(r) for _, r in sensors.iterrows()}
     ranges = _range_lookup(classifier)
 
     signals_by_sensor: dict[str, tuple[SensorMeta, list]] = {}
+    series: dict[str, tuple[pd.Series, Any]] = {}
     for key, group in readings.groupby("sensor_key", sort=False):
         meta = meta_by_key.get(str(key))
         if meta is None or not _analysable(meta, sensors, key):
             continue
         group = group.sort_values("ts")
+        values = group["value"].to_numpy(dtype=float)
+        series[str(key)] = (group["ts"], values)
+        kind = _kind_of(sensors, key)
         lo, hi = ranges.get(meta.equipment, (None, None))
-        signals = run_health_checks(
-            group["ts"], group["value"].to_numpy(dtype=float),
-            profiles.get(str(key)),
-            equipment_kind=_kind_of(sensors, key),
-            range_min=lo, range_max=hi,
-            unit=meta.unit or "",
-            is_flow=meta.equipment == "Flowrate",
-            window_end=result.window_end,
-        )
+
+        if _is_digital(meta, kind):
+            # Binary state signals get counting and consistency checks, not the
+            # analog stack. v1 ran ~1,567 of these through robust-Z and DTW on
+            # a 0/1 series, which can only produce silence or noise.
+            signals = run_digital_checks(group["ts"], values, profiles.get(str(key)))
+        else:
+            signals = run_health_checks(
+                group["ts"], values, profiles.get(str(key)),
+                equipment_kind=kind,
+                range_min=lo, range_max=hi,
+                unit=meta.unit or "",
+                is_flow=meta.equipment == "Flowrate",
+                window_end=result.window_end,
+            )
+            # L2: score against the stored time-of-day baseline, when the daily
+            # profile job has built one. Abstains otherwise rather than
+            # inventing a baseline from this window.
+            signals += score_window(
+                group["ts"], values, baselines.get(str(key)),
+                unit=meta.unit or "",
+                resolution=(profiles[str(key)].resolution
+                            if str(key) in profiles else 0.0),
+            )
         if signals:
             signals_by_sensor[str(key)] = (meta, signals)
+
+    # --- mass balance: the one genuinely multivariate detector -------------- #
+    # Grouped per site from level + inflow + outflow. Abstains wherever the
+    # group is not actually a closed system, which the fit quality decides.
+    groups = find_groups(sensors)
+    result.stats["mass_balance"] = balance_summary(groups)
+    for level_key, mb_signals in run_mass_balance(sensors, series).items():
+        meta = meta_by_key.get(level_key)
+        if meta is None:
+            continue
+        existing = signals_by_sensor.get(level_key)
+        if existing:
+            existing[1].extend(mb_signals)
+        else:
+            signals_by_sensor[level_key] = (meta, mb_signals)
 
     result.anomalies = fuse_all(signals_by_sensor,
                                 window_start=result.window_start,
@@ -206,8 +268,34 @@ def run(config: Config, *, now: datetime | None = None,
     result.stats["clustering"] = cluster_summary(result.clusters, result.loose)
     log.info("clustering: %s", result.stats["clustering"])
 
+    # --- neighbour correlation ------------------------------------------------ #
+    # The single most decision-relevant signal: neighbours moving together means
+    # the water moved, neighbours flat means the instrument is lying. Computed
+    # per cluster, because that is what triage asks about.
+    all_meta = list(meta_by_key.values())
+    for cluster in result.clusters:
+        median_r, pairs = cluster_correlation(
+            cluster, all_meta, series,
+            radius_m=config.spatial.correlation_radius_m)
+        if median_r is not None:
+            result.correlations[",".join(sorted(cluster.sensor_keys))] = median_r
+        result.neighbour_results.extend(pairs)
+    for anomaly in result.loose:
+        from das2.spatial.correlation import correlate_anomaly
+        pairs = correlate_anomaly(anomaly, all_meta, series,
+                                  radius_m=config.spatial.correlation_radius_m)
+        values = [p.pearson_r for p in pairs if p.pearson_r is not None]
+        if values:
+            import numpy as _np
+            result.correlations[anomaly.sensor.sensor_key] = round(
+                float(_np.median(_np.abs(values))), 3)
+        result.neighbour_results.extend(pairs)
+    result.stats["correlation"] = correlation_summary(result.neighbour_results)
+    log.info("correlation: %s", result.stats["correlation"])
+
     # --- incidents ------------------------------------------------------------ #
     candidates = build_incidents(result.clusters, now=now, loose=result.loose,
+                                 correlations=result.correlations,
                                  rainfall=result.rainfall_by_region)
 
     if open_incidents:
@@ -227,6 +315,21 @@ def run(config: Config, *, now: datetime | None = None,
     result.incidents.sort(key=lambda i: -i.severity)
     result.stats["incidents"] = incident_summary(result.incidents)
     log.info("incidents: %s", result.stats["incidents"])
+
+    # --- selection ------------------------------------------------------------- #
+    # Per-region budgets, replacing v1's global top-10 rank cut. Nothing is
+    # discarded: what is held back stays on the dashboard and in the database,
+    # and the reason is recorded.
+    from das2.models import Priority
+    chosen = select(
+        result.incidents,
+        per_region=config.alert.max_alerts_per_region,
+        global_cap=config.alert.max_incidents_per_run,
+        min_priority=_priority(config.alert.min_priority),
+    )
+    result.selected, result.held = chosen.selected, chosen.held
+    result.stats["selection"] = chosen.summary()
+    log.info("selection: %s", result.stats["selection"])
 
     result.duration_s = round(time.time() - started, 2)
     log.info("run %s finished in %.2fs", run_id, result.duration_s)
@@ -254,6 +357,27 @@ def _range_lookup(classifier) -> dict[str, tuple[float | None, float | None]]:
 def _kind_of(sensors: pd.DataFrame, key) -> str:
     row = sensors.loc[sensors["sensor_key"] == key, "kind"]
     return str(row.iloc[0]) if len(row) else "measurement"
+
+
+def _is_digital(meta: SensorMeta, kind: str) -> bool:
+    """
+    Binary state signals, which need counting checks rather than statistics.
+
+    Both the declared signal type and the equipment kind are consulted, because
+    the classifier reaches these two ways: RawType marks the signal Digital, and
+    the rule table marks pump/valve classes as `status`.
+    """
+    return (str(meta.signal_type).lower() == "digital"
+            or kind == "status"
+            or meta.equipment in ("Pump", "Valve", "DigitalStatus"))
+
+
+def _priority(name: str):
+    from das2.models import Priority
+    try:
+        return Priority(str(name).upper())
+    except ValueError:
+        return Priority.P3
 
 
 def _analysable(meta: SensorMeta, sensors: pd.DataFrame, key) -> bool:

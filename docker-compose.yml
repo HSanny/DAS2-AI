@@ -84,6 +84,22 @@ services:
     command: ["python", "-m", "das2.cli", "check"]
     profiles: ["tools"]
 
+  # --- daily: baselines, DRIFT and NOISE_BURST -----------------------------
+  # Schedule this ONCE A DAY from cron or Task Scheduler:
+  #     docker compose run --rm das2-profile
+  #
+  # Not optional. DRIFT, NOISE_BURST and the whole L2 baseline layer depend on
+  # it, and until it has run they produce nothing at all. It is separate from
+  # the hourly loop because these answers change slowly, cost far more to
+  # compute, and genuinely cannot be derived from a 72-hour window -- a 1%/day
+  # drift is 3% across it while the daily demand cycle is 10-30%.
+  das2-profile:
+    <<: *common
+    container_name: das2-profile
+    restart: "no"
+    command: ["python", "-m", "das2.cli", "profile"]
+    profiles: ["tools"]
+
   # --- one-shot: a single run, touching nothing ----------------------------
   # Writes a dashboard and prints what it found, without a database write or a
   # Telegram message. This is how to try the system against real data before

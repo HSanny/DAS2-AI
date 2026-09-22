@@ -65,6 +65,7 @@ CLASS_COLOR = {
     IncidentClass.PROCESS_EVENT.value: "#4393c3",
     IncidentClass.DRIFT_MAINTENANCE.value: "#92c5de",
     IncidentClass.WEATHER_DRIVEN.value: "#2166ac",
+    IncidentClass.INSTRUMENT_CONFLICT.value: "#c0504d",
     IncidentClass.WATCH.value: "#999999",
     IncidentClass.TELEMETRY_FANOUT.value: "#777777",
 }
@@ -263,7 +264,8 @@ const DATA = __PAYLOAD__;
 const PC = {"P1":"#b2182b","P2":"#ef8a62","P3":"#f7d08a","P4":"#9fb8c8"};
 const CC = {"REGIONAL_EVENT":"#b2182b","SENSOR_FAULT":"#d6604d",
             "PROCESS_EVENT":"#4393c3","DRIFT_MAINTENANCE":"#92c5de",
-            "WEATHER_DRIVEN":"#2166ac","WATCH":"#999999",
+            "WEATHER_DRIVEN":"#2166ac","INSTRUMENT_CONFLICT":"#c0504d",
+            "WATCH":"#999999",
             "TELEMETRY_FANOUT":"#777777"};
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));

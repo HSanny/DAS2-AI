@@ -43,7 +43,7 @@ import numpy as np
 import pandas as pd
 
 from das2.detect.changepoint import detect_level_shift
-from das2.detect.profile import SensorProfile
+from das2.detect.profile import SensorProfile, _resolution
 from das2.timeutils import to_epoch_seconds
 from das2.models import AnomalyType, Signal
 
@@ -89,6 +89,36 @@ SPIKE_RETURN_FRACTION = 0.35
 #: Reverse flow must be sustained to distinguish a real backflow from noise
 #: around zero on an idle meter.
 REVERSE_FLOW_MIN_S = 300.0
+
+#: Quantisation collapse: the later part of the window must resolve steps this
+#: many times coarser than the earlier part. A failing ADC or a transmitter
+#: dropping bits shows up as the signal snapping to an increasingly coarse
+#: grid, long before the value itself becomes implausible -- which is what
+#: makes it worth detecting at all.
+QUANT_COLLAPSE_FACTOR = 4.0
+
+#: ...and the coarsened step must be this many robust sigma of the sensor's own
+#: noise. Without it, a sensor that merely reports to three decimal places
+#: registers as "quantised" and any rounding change looks like a collapse.
+QUANT_COLLAPSE_SIGMA = 3.0
+
+#: Each half of the window needs this many points before its resolution can be
+#: estimated at all.
+QUANT_MIN_POINTS = 60
+
+#: Dithering-dead: a live analog input normally jitters by at least a count or
+#: two of noise. A window whose entire range fits inside this many resolution
+#: steps is reporting a number rather than measuring one -- the classic
+#: symptom of an input stuck upstream of the ADC, which FLATLINE misses
+#: because the value is not exactly constant.
+DITHER_MAX_STEPS = 2.0
+
+#: ...and it only counts if the sensor normally moves far more than that.
+DITHER_FRACTION_OF_NORMAL = 0.1
+
+#: Window over which dithering is judged. Long enough that a genuinely quiet
+#: process period does not look dead.
+DITHER_WINDOW_S = 21600.0        # 6 hours
 
 
 def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -408,6 +438,184 @@ def detect_reverse_flow(ts: pd.Series, values: np.ndarray,
 
 
 # --------------------------------------------------------------------------- #
+def detect_quantisation_collapse(ts: pd.Series, values: np.ndarray,
+                                 profile: SensorProfile | None,
+                                 unit: str = "") -> list[Signal]:
+    """
+    The sensor's resolution has degraded: it now moves in coarser steps.
+
+    A failing ADC, a transmitter dropping bits, or a comms path silently
+    truncating shows up first as the signal snapping to a coarser grid. The
+    *value* stays plausible throughout, so nothing else here notices -- range,
+    spike and flatline all see a healthy-looking number. That is precisely why
+    it is worth detecting: it is a warning that arrives before the reading
+    becomes wrong.
+
+    Scanned in blocks rather than by splitting the window in half. The
+    half-split was the first implementation and it failed on the realistic
+    case: a collapse that begins midway and lasts 20 of 72 hours leaves the
+    later half a mixture of coarse and fine steps, and a mixture reads as
+    "not quantised" -- so the detector was blind to exactly the shape it was
+    written for. Blocks also localise *when* it started, which the half-split
+    could not.
+
+    Each block is compared against the sensor's early behaviour, so the sensor
+    is its own control and no fleet-wide notion of "normal resolution" is
+    needed -- just as well, since resolution spans three orders of magnitude
+    across this fleet.
+    """
+    n = len(values)
+    if n < QUANT_MIN_POINTS * 3:
+        return []
+
+    block = max(QUANT_MIN_POINTS, n // 12)
+    bounds = [(i, min(n, i + block)) for i in range(0, n, block)]
+    bounds = [(a, b) for a, b in bounds if b - a >= QUANT_MIN_POINTS]
+    if len(bounds) < 3:
+        return []
+
+    resolutions = [_resolution(values[a:b]) for a, b in bounds]
+
+    # Reference: the earliest third of the window, before anything went wrong.
+    # Noise is taken from the same early stretch and deliberately NOT from the
+    # profile, which is built over the whole window and so already contains the
+    # collapse -- on the fixture that inflated sigma nearly tenfold and hid the
+    # fault. Same self-contamination that made FLATLINE unable to fire.
+    reference_blocks = max(1, len(bounds) // 3)
+    early_end = bounds[reference_blocks - 1][1]
+    sigma = _scale(values[:early_end], None)
+    early = [r for r in resolutions[:reference_blocks] if r > 0]
+    reference = float(np.median(early)) if early else 0.0
+
+    flagged = []
+    for k in range(reference_blocks, len(bounds)):
+        r = resolutions[k]
+        if r <= 0:
+            continue
+        if r < QUANT_COLLAPSE_SIGMA * sigma:
+            continue
+        if reference > 0 and r < QUANT_COLLAPSE_FACTOR * reference:
+            continue
+        flagged.append(k)
+
+    if not flagged:
+        return []
+
+    # Merge adjacent flagged blocks into one event.
+    runs: list[list[int]] = [[flagged[0]]]
+    for k in flagged[1:]:
+        if k == runs[-1][-1] + 1:
+            runs[-1].append(k)
+        else:
+            runs.append([k])
+
+    signals: list[Signal] = []
+    for run in runs:
+        i = bounds[run[0]][0]
+        j = bounds[run[-1]][1] - 1
+        coarsest = max(resolutions[k] for k in run)
+        signals.append(Signal(
+            type=AnomalyType.QUANTISATION_COLLAPSE,
+            start=pd.Timestamp(ts.iloc[i]).to_pydatetime(),
+            end=pd.Timestamp(ts.iloc[j]).to_pydatetime(),
+            detector=DETECTOR,
+            magnitude=round(coarsest, 6),
+            unit=unit,
+            n_points=j - i + 1,
+            detail={
+                "resolution_before": round(reference, 6),
+                "resolution_after": round(coarsest, 6),
+                "ratio": (round(coarsest / reference, 1) if reference > 0 else None),
+                "was_continuous_before": reference <= 0,
+                "sigma": round(sigma, 6),
+                "blocks_affected": len(run),
+            },
+        ))
+    return signals
+
+
+def detect_dithering_dead(ts: pd.Series, values: np.ndarray,
+                          profile: SensorProfile | None,
+                          unit: str = "") -> list[Signal]:
+    """
+    Alive, reporting, not quite constant -- and measuring nothing.
+
+    A live analog input jitters by a count or two of noise simply because the
+    world and the ADC are noisy. An input that has come adrift upstream of the
+    converter often keeps reporting a *nearly* constant number: it wanders by
+    one least-significant bit and no more. FLATLINE cannot see that, because
+    the value is not exactly constant, and the reading stays perfectly
+    plausible.
+
+    So this asks a different question from FLATLINE: not "has it stopped
+    changing?" but "has it stopped changing *enough to be measuring
+    anything*?", judged against how much this sensor normally moves.
+
+    Requires a non-zero range on purpose, so the two detectors are disjoint and
+    an exactly frozen sensor is reported once, as a flatline.
+    """
+    if profile is None or not profile.is_well_observed or profile.is_static:
+        return []
+    if len(values) < 20:
+        return []
+
+    resolution = profile.resolution
+    if resolution <= 0:
+        return []                       # not a quantised sensor; nothing to count
+
+    normal_spread = 1.4826 * profile.mad if np.isfinite(profile.mad) else 0.0
+    if normal_spread <= 0:
+        return []
+    ceiling = min(DITHER_MAX_STEPS * resolution,
+                  DITHER_FRACTION_OF_NORMAL * normal_spread)
+    if ceiling <= 0:
+        return []
+
+    seconds = to_epoch_seconds(ts)
+    n = len(values)
+    signals: list[Signal] = []
+
+    # Two-pointer scan with a running min/max, rather than re-measuring a
+    # growing slice. The slice form was not just slower, it was wrong: the
+    # sample that BROKE the stretch was still inside the slice being measured,
+    # so every candidate's range included the jump that ended it and nothing
+    # ever qualified.
+    start = 0
+    while start < n:
+        lo = hi = float(values[start])
+        end = start
+        j = start + 1
+        while j < n:
+            value = float(values[j])
+            new_lo, new_hi = min(lo, value), max(hi, value)
+            if new_hi - new_lo > ceiling:
+                break
+            lo, hi, end = new_lo, new_hi, j
+            j += 1
+
+        duration = seconds[end] - seconds[start]
+        held_span = hi - lo
+        if (duration >= DITHER_WINDOW_S and held_span > 0
+                and (end - start) >= 20):
+            signals.append(Signal(
+                type=AnomalyType.DITHERING_DEAD,
+                start=pd.Timestamp(ts.iloc[start]).to_pydatetime(),
+                end=pd.Timestamp(ts.iloc[end]).to_pydatetime(),
+                detector=DETECTOR,
+                magnitude=round(held_span, 6),
+                unit=unit,
+                n_points=end - start + 1,
+                detail={
+                    "range_observed": round(held_span, 6),
+                    "resolution": round(resolution, 6),
+                    "normal_spread": round(normal_spread, 6),
+                    "duration_h": round(duration / 3600.0, 2),
+                },
+            ))
+        start = end + 1
+    return signals
+
+
 def run_health_checks(ts: pd.Series, values: np.ndarray,
                       profile: SensorProfile | None = None,
                       *, equipment_kind: str = "measurement",
@@ -440,6 +648,8 @@ def run_health_checks(ts: pd.Series, values: np.ndarray,
     signals += detect_stale(ts, profile, window_end=window_end)
     signals += detect_range_violation(ts, values, range_min, range_max, profile, unit)
     signals += detect_spike(ts, values, profile, unit)
+    signals += detect_quantisation_collapse(ts, values, profile, unit)
+    signals += detect_dithering_dead(ts, values, profile, unit)
     if is_flow:
         signals += detect_reverse_flow(ts, values, profile, unit)
     return signals

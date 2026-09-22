@@ -467,35 +467,74 @@ Turn up detail with `DAS2_LOG_LEVEL=DEBUG` in `.env` and restart.
 
 ## 14. What is and is not finished
 
-Be aware of this before judging the output.
+**Every detector is now built.** Fifteen anomaly types, all producing findings,
+all tested against faults whose answers are known:
 
-**Working and verified end to end:** ingest of the real formats · full-coverage
-equipment classification · per-sensor profiles · FLATLINE, STALE,
-RANGE_VIOLATION, SPIKE, REVERSE_FLOW, LEVEL_SHIFT · typed fusion ·
-spatio-temporal clustering with parameters measured from your real
-`LongLat.csv` · incident identity across runs · triage and recommendations ·
-rain context from your own gauges · dashboard · charts · Telegram with
-acknowledgement · persistence.
+| Layer | Types | Where |
+|---|---|---|
+| Sensor health | `FLATLINE` `STALE` `RANGE_VIOLATION` `SPIKE` `REVERSE_FLOW` `QUANTISATION_COLLAPSE` `DITHERING_DEAD` | hourly run |
+| Change | `LEVEL_SHIFT` | hourly run |
+| Baseline | `RESIDUAL_OUTLIER` | hourly run, against stored profiles |
+| Digital | `SHORT_CYCLING` `STUCK_IN_STATE` `RUN_STATE_INCONSISTENT` | hourly run |
+| Multivariate | `MASS_BALANCE_VIOLATION` | hourly run |
+| Long horizon | `DRIFT` `NOISE_BURST` | **daily job** |
 
-**Not yet built**, and therefore producing no findings:
+Also working: full-coverage classification · per-sensor profiles · typed fusion
+· spatio-temporal clustering with parameters measured from your real
+`LongLat.csv` · **neighbour correlation** · incident identity across runs ·
+triage and recommendations · per-region alert budgets · rain context from your
+own gauges · dashboard · charts · Telegram with acknowledgement · persistence.
 
-* **DRIFT** and **NOISE_BURST** — these need ≥14 days of history and a daily
-  profile job. They cannot be computed inside a 72-hour window: a 1%/day drift
-  is 3% across the window, while the daily demand cycle is routinely 10–30%.
-* **Digital detectors** — short-cycling, stuck-in-state, run/flow consistency.
-  Roughly 1,567 pump and valve sensors are currently analysed by the analog
-  stack, which produces little of value for them.
-* **Mass balance** — `dLevel/dt·A ≈ Qin − Qout`, which localises *which* of
-  three instruments is lying.
-* **Neighbour correlation** — the field is in the schema and the alert, but is
-  not yet computed, so it reads as "not available". This is the single most
-  decision-relevant signal still outstanding: neighbours moving together means
-  the water moved; neighbours flat means the instrument is lying.
-* **Quantisation collapse** and **dithering-dead**.
+### The daily job — set this up, it is not optional
 
-**The weakest input in the system** is the per-equipment physical range limits.
-They are fleet-wide defaults — "Pressure 0–20" applied to every pressure sensor
-in Singapore — which is close to meaningless when your real sensors have
+Two detectors and the whole L2 baseline layer depend on it:
+
+```bash
+# Once a day. Add to cron, or Task Scheduler on Windows.
+docker compose run --rm das2 python -m das2.cli profile
+```
+
+It reads up to 28 days of history, builds each sensor's time-of-day baseline,
+and computes `DRIFT` and `NOISE_BURST`. Until it has run:
+
+* `RESIDUAL_OUTLIER` produces nothing — the hourly run says so in its
+  `baselines:` line rather than failing silently;
+* `DRIFT` and `NOISE_BURST` produce nothing.
+
+**It needs history to read.** The hourly run now writes every reading into
+`das2_reading` (`DAS2_DATABASE_STORE_READINGS=true`, on by default), so the
+store fills as the system runs. If your v1 `data` table is readable by this
+login, the job falls back to it and you have 28 days of history immediately
+rather than in four weeks.
+
+`DRIFT` needs **14 days minimum, 28 preferred**, and the job says plainly when
+it has too little rather than reporting a slope fitted to a fortnight of
+weather. This is not a limitation that can be engineered around: a 1%/day drift
+is 3% across a 72-hour window while your daily demand cycle is 10–30%, so the
+slope would be measuring which hour the window happened to start on.
+
+### What is still missing
+
+* **The shadow-mode harness.** There is no measured precision/recall against
+  your real data yet, and so no statement of the form *"a flatline of 25
+  minutes or more is caught 95% of the time; below 12 minutes it is not."*
+  That is the statement worth giving PUB, and it needs a replay corpus and a
+  fortnight of parallel running to produce. The evidence today is 632 test
+  assertions and a fixture carrying 19 known faults — real, but not the same
+  thing.
+* **Sensor-level coordinates.** Positions come from an `RTUNumber → LKey` join,
+  so every sensor at one site shares one point. Clustering answers "which
+  *sites* went wrong together", which is the right granularity for dispatch but
+  cannot resolve within a site.
+* **Stuck-OFF pumps.** `STUCK_IN_STATE` only judges the active state. Within a
+  72-hour window a seized-shut valve and a standby pump correctly sitting idle
+  produce the identical signal, and the detector abstains rather than guessing.
+  It becomes answerable once the profile job has weeks of history showing
+  whether that pump normally runs.
+
+**The weakest input in the system** remains the per-equipment physical range
+limits. They are fleet-wide defaults — "Pressure 0–20" applied to every pressure
+sensor in Singapore — which is close to meaningless when your real sensors have
 medians of 0.0034 and 3.90. They are deadbanded against each sensor's own noise
 so they do not produce nonsense, but the right fix is your own data:
 
@@ -503,3 +542,18 @@ so they do not produce nonsense, but the right fix is your own data:
 > engineering ranges, that single file replaces about ninety hand-chosen
 > thresholds with your plant's own commissioned values.** It is the
 > highest-value, lowest-effort improvement available, and worth asking for now.
+
+---
+
+## 15. Reading the new incident classes
+
+Two classes were added once the cross-signal detectors existed:
+
+| Class | What it means | What to do |
+|---|---|---|
+| `INSTRUMENT_CONFLICT` | Two or more instruments contradict each other — a reservoir's level, inflow and outflow cannot all be right; or a pump reports running with no discharge flow | **Check all of them.** One is wrong and the readings alone cannot say which. This is as close to certain as the system gets: it is a physical impossibility, not a statistical oddity |
+| `DRIFT_MAINTENANCE` | Slow, consistent calibration walk over weeks | Schedule recalibration. Not urgent, and not a dispatch |
+
+`INSTRUMENT_CONFLICT` is deliberately **not** downgraded by neighbour
+correlation. Correlation says something about whether a sensor's *value* is
+believable; it cannot make two instruments that disagree agree.
