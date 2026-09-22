@@ -45,7 +45,17 @@ log = logging.getLogger("das2.cli")
 
 # --------------------------------------------------------------------------- #
 def cmd_migrate(config: Config, args) -> int:
-    from das2.io.store import apply_migrations, make_engine
+    from das2.io.store import apply_migrations, make_engine, render_migrations
+
+    # --print-sql emits exactly what would be executed and connects to nothing,
+    # so a DBA can review it, or run it in SSMS themselves, without this system
+    # holding credentials at all. It renders through the same translation the
+    # migration path uses, so the printed script cannot drift from the applied
+    # one -- which a hand-maintained copy of the schema inevitably would.
+    if getattr(args, "print_sql", False):
+        for statement in render_migrations(args.dialect or "mssql"):
+            print(statement.rstrip().rstrip(";") + ";\n")
+        return 0
 
     engine = make_engine(config.database.sqlalchemy_url())
     executed = apply_migrations(engine)
@@ -498,7 +508,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "(or set DAS2_LOG_LEVEL)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("migrate", help="create/update the database tables")
+    p_migrate = sub.add_parser("migrate",
+                               help="create/update the database tables")
+    p_migrate.add_argument("--print-sql", action="store_true",
+                           help="print the SQL instead of running it, for "
+                                "review or for pasting into SSMS. Connects to "
+                                "nothing.")
+    p_migrate.add_argument("--dialect", default="mssql",
+                           choices=["mssql", "sqlite"],
+                           help="dialect for --print-sql (default: mssql)")
     sub.add_parser("check", help="verify data, database and Telegram")
 
     demo = sub.add_parser(

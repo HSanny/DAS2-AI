@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -165,6 +166,122 @@ def _split_go_batches(block: str) -> list[str]:
     return parts
 
 
+#: Rewrites that turn the portable migration SQL into T-SQL.
+#:
+#: The .sql files are written in the SQLite dialect because that is what the
+#: tests run against, and 010's header claimed the result was portable. It was
+#: not. Three constructs in it are wrong on SQL Server, and every one of them
+#: stayed invisible until the system met a real server:
+#:
+#:   CREATE TABLE IF NOT EXISTS    No such form in T-SQL, in any version, and
+#:                                 `DROP TABLE IF EXISTS` existing makes it
+#:                                 look supported. Confirmed against the
+#:                                 client's SQL Server:
+#:                                   [42000] Incorrect syntax near the
+#:                                   keyword 'IF'. (156)
+#:
+#:   TIMESTAMP                     NOT a datetime on SQL Server. It is a
+#:                                 deprecated synonym for ROWVERSION, an
+#:                                 auto-generated binary(8) row counter, so the
+#:                                 tables would be created happily and then
+#:                                 reject every INSERT with "Cannot insert an
+#:                                 explicit value into a timestamp column."
+#:                                 This is the dangerous one: it fails late,
+#:                                 far from its cause, and only after the
+#:                                 migration has reported success.
+#:
+#:   TEXT                          Deprecated since 2005 and unusable with
+#:                                 normal string comparison.
+#:
+#: Comments are stripped before this runs, and the migrations contain exactly
+#: one string literal ('NONE'), so a word-boundary substitution cannot corrupt
+#: anything. No column is named `text` or `timestamp`; a test asserts that,
+#: because the day one is added this has to become a parser.
+_MSSQL_REWRITES = (
+    (r"(?is)\b(CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX))\s+IF\s+NOT\s+EXISTS\s+", r"\1 "),
+    (r"(?i)\bTIMESTAMP\b", "DATETIME2"),
+    (r"(?i)\bTEXT\b", "VARCHAR(MAX)"),
+)
+
+#: Existence guards, so the T-SQL is idempotent in its own right.
+#:
+#: Dropping IF NOT EXISTS alone would leave re-runs depending on
+#: ALREADY_APPLIED matching the text of the error -- and SQL Server localises
+#: its messages. On a non-English server "There is already an object named ..."
+#: never appears, the match fails, and the second run raises instead of
+#: continuing. Matching English error strings is not a sound way to decide
+#: whether a table exists.
+#:
+#: It also makes the printed script safe to paste into SSMS twice, which is
+#: what anyone reviewing it will do.
+_RE_CREATE_TABLE = re.compile(r"(?is)^\s*CREATE\s+TABLE\s+(\w+)\s*\(")
+_RE_CREATE_INDEX = re.compile(
+    r"(?is)^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(\w+)\s+ON\s+(\w+)\s*\(")
+_RE_ALTER_ADD = re.compile(r"(?is)^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+(\w+)\b")
+
+
+def _guard_mssql(statement: str) -> str:
+    """Prefix a T-SQL existence test, so the statement is a no-op if applied."""
+    match = _RE_CREATE_TABLE.match(statement)
+    if match:
+        return (f"IF OBJECT_ID(N'{match.group(1)}', N'U') IS NULL\n"
+                f"{statement}")
+
+    match = _RE_CREATE_INDEX.match(statement)
+    if match:
+        index, table = match.group(1), match.group(2)
+        return (f"IF NOT EXISTS (SELECT 1 FROM sys.indexes\n"
+                f"               WHERE name = N'{index}'\n"
+                f"                 AND object_id = OBJECT_ID(N'{table}'))\n"
+                f"{statement}")
+
+    match = _RE_ALTER_ADD.match(statement)
+    if match:
+        table, column = match.group(1), match.group(2)
+        return (f"IF COL_LENGTH(N'{table}', N'{column}') IS NULL\n"
+                f"{statement}")
+
+    return statement
+
+
+def translate_sql(statement: str, dialect: str) -> str:
+    """
+    Adapt one portable migration statement to `dialect`.
+
+    Everything but `mssql` is returned untouched: SQLite is the dialect the
+    files are written in.
+    """
+    if dialect != "mssql":
+        return statement
+    for pattern, replacement in _MSSQL_REWRITES:
+        statement = re.sub(pattern, replacement, statement)
+    return _guard_mssql(statement)
+
+
+def render_migrations(dialect: str, *,
+                      files: Iterable[str] = DAS2_MIGRATIONS,
+                      directory: Path | None = None) -> list[str]:
+    """
+    The statements `apply_migrations` would run, without running them.
+
+    Shares the split-and-translate path with `apply_migrations`, so a printed
+    script and an applied one cannot disagree. That matters more than it
+    sounds: the alternative is a hand-maintained T-SQL copy of the schema,
+    which drifts the first time a column is added and is then wrong in a way
+    nobody notices until a run fails on a missing column.
+    """
+    directory = directory or MIGRATIONS_DIR
+    out: list[str] = []
+    for name in files:
+        path = directory / name
+        if not path.exists():
+            log.warning("migration %s not found at %s", name, path)
+            continue
+        for raw in _split_statements(path.read_text(encoding="utf-8")):
+            out.append(translate_sql(raw, dialect))
+    return out
+
+
 def apply_migrations(engine: Engine, *,
                      files: Iterable[str] = DAS2_MIGRATIONS,
                      directory: Path | None = None) -> list[str]:
@@ -182,7 +299,8 @@ def apply_migrations(engine: Engine, *,
             if not path.exists():
                 log.warning("migration %s not found at %s", name, path)
                 continue
-            for statement in _split_statements(path.read_text(encoding="utf-8")):
+            for raw in _split_statements(path.read_text(encoding="utf-8")):
+                statement = translate_sql(raw, engine.dialect.name)
                 try:
                     conn.execute(text(statement))
                     executed.append(statement.split("\n")[0][:90])
