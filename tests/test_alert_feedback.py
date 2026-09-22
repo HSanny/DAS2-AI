@@ -17,8 +17,9 @@ import json
 import os
 import sys
 import threading
+import time
 import types
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -66,7 +67,11 @@ class StubTelegram(BaseHTTPRequestHandler):
 
 
 def start_stub():
-    srv = HTTPServer(("127.0.0.1", 0), StubTelegram)
+    # Threading, because the real Telegram API serves concurrent requests and
+    # a single-threaded stub makes the test's timing depend on the order the
+    # poller happens to interleave its long-poll GET with the POSTs that
+    # answer each callback.
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), StubTelegram)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, srv.server_address[1]
 
@@ -192,14 +197,33 @@ def main():
     offset_file.unlink(missing_ok=True)
     t = threading.Thread(target=bot.feedback_poller, daemon=True)
     t.start()
-    for _ in range(100):
-        if offset_file.exists() and len(recorded) >= 2:
+    # Wait for the value being asserted, not for the file to merely EXIST.
+    #
+    # The poller writes the offset independently of recording the feedback, so
+    # "the file is there and two updates arrived" can be true while the file
+    # still holds an earlier offset. The test then read 501 and failed, about
+    # one run in two -- an intermittent failure in the suite, which is worse
+    # than a consistent one because it teaches everyone to re-run rather than
+    # look. Nothing was ever wrong with the poller.
+    def offset() -> str:
+        try:
+            return offset_file.read_text().strip()
+        except OSError:
+            return ""
+
+    # Budget generously -- this exits the moment the condition holds, so the
+    # only cost is in the failing case. The poller backs off on any transport
+    # hiccup (1s, then 2s, then 4s), and against a 10s budget two of those
+    # were enough to time out and report a defect that was not there.
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        if len(recorded) >= 2 and offset() == "502":
             break
         threading.Event().wait(0.05)
 
     check("both updates handled", sorted(r[0] for r in recorded) == [777, 888])
     check("labels preserved", {r[1] for r in recorded} == {"noise", "unsure"})
-    check("offset advanced past last update_id", offset_file.read_text().strip() == "502")
+    check("offset advanced past last update_id", offset() == "502")
     getu = next(p for m, p in StubTelegram.calls if m == "getUpdates")
     check("restricts to callback_query",
           json.loads(getu["allowed_updates"]) == ["callback_query"])
