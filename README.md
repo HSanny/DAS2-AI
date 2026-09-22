@@ -13,20 +13,26 @@ instead of from a van.
 
 ## Getting started
 
-**[DEPLOY.md](DEPLOY.md) is the guide.** It covers Docker, the database, the
-Telegram bot, and how to verify the whole thing against real data before it is
-allowed to alert anyone.
+**[RUNBOOK.md](RUNBOOK.md) — every command for a first deployment, in order.**
+Follow that one.
 
-The short version:
+[DEPLOY.md](DEPLOY.md) is the reference behind it: why each step exists, the
+full SQL, and what is and is not built yet.
+
+The shape of it:
 
 ```bash
-cp .env.example .env && $EDITOR .env      # data path, DB, bot token
+sudo apt install cifs-utils               # the daemon mounts the share
+cp .env.example .env && $EDITOR .env      # share creds, DB, bot token
+cp /path/to/LongLat.csv ./config/         # not on the share; no map without it
 docker compose build
-docker compose run --rm das2-migrate      # create the tables
-docker compose run --rm das2 python -m das2.cli demo   # prove it works
-docker compose run --rm das2-check        # check YOUR setup
-docker compose run --rm das2-dryrun       # a real run, alerting nobody
+# paste tools/drop_legacy_das2.sql into SSMS   <- DESTRUCTIVE, before migrate
+docker compose run --rm das2-migrate
+docker compose run --rm das2 python -m das2.cli demo   # prove the install
+docker compose run --rm das2-check        # prove YOUR setup
+docker compose run --rm das2-dryrun       # real data, alerting nobody
 docker compose up -d das2 das2-ack        # go live
+# then schedule `docker compose run --rm das2-profile` daily
 ```
 
 ## What it produces
