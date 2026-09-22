@@ -80,6 +80,48 @@ def main():
     check("sensor keys unique", inv["sensor_key"].is_unique,
           "(no Hkey collisions -- verified on the real inventory)")
 
+    print("\none unreadable HISTORY file does not take the run down")
+    # The share is written hourly, so the newest file is routinely mid-write
+    # and arrives as zero bytes. pandas answers that with "No columns to parse
+    # from file", and one such file out of 10,334 aborted the client's entire
+    # first run. A monitoring system must not go quiet because a file it does
+    # not need yet is still being copied.
+    import tempfile as _tf
+    from das2.io.ingest import IngestReport, read_history_dir
+    hdr = ("ROW_ID;IPADDRESS;DESCRIPTION;TAGNAME;RTUNUMBER;RAWTYPE;"
+           "POINTTYPE;DATETIME;CURRVALUE")
+    row = "1;10;Some-Sensor;T1;1010;1;22;9/22/2026 1:00:00 PM;4.2"
+    with _tf.TemporaryDirectory() as td:
+        d = Path(td)
+        for h in ("120000", "130000"):
+            (d / f"hts_2026_09_HISTORY_2026Sep22-{h}.csv").write_text(
+                f"{hdr}\n{row}\n")
+        (d / "hts_2026_09_HISTORY_2026Sep22-140000.csv").write_text("")
+        rep = IngestReport()
+        got = read_history_dir(d, report=rep)
+        check("the good files are still read", len(got) == 2, f"({len(got)} rows)")
+        check("the empty file is counted, not ignored",
+              rep.history_files_skipped == 1 and rep.history_files == 2,
+              "(missing data wearing a filename)")
+        check("it appears in the run stats",
+              rep.as_dict()["history_files_skipped"] == 1)
+        check("and is excluded from the window, not treated as present",
+              rep.window_end == datetime(2026, 9, 22, 13, 0, 0),
+              f"({rep.window_end})")
+
+    with _tf.TemporaryDirectory() as td:
+        d = Path(td)
+        for h in ("120000", "130000"):
+            (d / f"hts_2026_09_HISTORY_2026Sep22-{h}.csv").write_text("")
+        try:
+            read_history_dir(d)
+            broke = ""
+        except ValueError as e:
+            broke = str(e)
+    check("but a wholly unreadable feed still fails loudly",
+          "broken feed" in broke,
+          "(silently analysing nothing is the failure this prevents)")
+
     print("\nHISTCURR is an HOURLY export, so the inventory path resolves")
     # The share has never held the old pipeline's single pre-merged
     # histcurr_fujitsu.csv. It exports hts_HISTCURR_2026Sep22-130001 every

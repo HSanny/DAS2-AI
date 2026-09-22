@@ -77,6 +77,10 @@ class IngestReport:
     """What a load actually produced. Logged every run rather than assumed."""
 
     history_files: int = 0
+    #: Files present but unreadable -- empty, truncated or malformed. Counted
+    #: rather than ignored: they are missing data wearing a filename, and a
+    #: feed quietly losing half its files must not look like a quiet network.
+    history_files_skipped: int = 0
     history_rows: int = 0
     history_rows_dropped: int = 0
     inventory_rows: int = 0
@@ -107,6 +111,7 @@ class IngestReport:
         """
         return {
             "history_files": self.history_files,
+            "history_files_skipped": self.history_files_skipped,
             "history_rows": self.history_rows,
             "history_rows_dropped": self.history_rows_dropped,
             "inventory_rows": self.inventory_rows,
@@ -233,20 +238,55 @@ def read_history_dir(directory: str | Path, *, pattern: str = "*HISTORY*.csv",
             f"No HISTORY files matched {os.path.join(str(directory), pattern)}"
         )
 
-    frames, rows_in = [], 0
+    # One unreadable file must not take the monitoring system down.
+    #
+    # The share is written hourly, so the newest file is routinely being
+    # written while this reads it, and arrives as zero bytes. pandas answers
+    # that with `EmptyDataError: No columns to parse from file` -- and one such
+    # file out of 10,334 aborted the entire run on the client's first attempt.
+    # A monitoring system that stops because a file it does not need yet is
+    # mid-copy is worse than useless: it goes quiet exactly when someone is
+    # watching.
+    #
+    # Skipped files are COUNTED, logged, and excluded from the hourly stamps
+    # below, so they register as missing data rather than vanishing. A file
+    # present but unreadable is missing data wearing a filename, and a feed
+    # quietly losing half its files must not look like a quiet network -- that
+    # is the failure this module exists to make visible.
+    frames, rows_in, skipped = [], 0, []
     for path in files:
-        raw_rows = sum(1 for _ in open(path, encoding="utf-8", errors="replace")) - 1
+        try:
+            raw_rows = sum(1 for _ in open(path, encoding="utf-8",
+                                           errors="replace")) - 1
+            frame = read_history_file(path)
+        except (pd.errors.EmptyDataError, pd.errors.ParserError,
+                ValueError, OSError) as exc:
+            skipped.append(path)
+            log.warning("skipping unreadable HISTORY file %s (%s: %s)",
+                        os.path.basename(path), type(exc).__name__,
+                        str(exc)[:80])
+            continue
         rows_in += max(0, raw_rows)
-        frames.append(read_history_file(path))
+        frames.append(frame)
 
-    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-        columns=["sensor_key", "ts", "value"])
+    if not frames:
+        raise ValueError(
+            f"All {len(files)} HISTORY file(s) under {directory} were "
+            f"unreadable. This is a broken feed, not a quiet network."
+        )
+    if skipped:
+        log.warning("%d of %d HISTORY file(s) were unreadable and skipped",
+                    len(skipped), len(files))
+
+    out = pd.concat(frames, ignore_index=True)
 
     if report is not None:
-        report.history_files = len(files)
+        report.history_files = len(files) - len(skipped)
+        report.history_files_skipped = len(skipped)
         report.history_rows = len(out)
         report.history_rows_dropped = max(0, rows_in - len(out))
-        stamps = sorted(t for t in (filename_timestamp(f) for f in files) if t)
+        readable = [f for f in files if f not in set(skipped)]
+        stamps = sorted(t for t in (filename_timestamp(f) for f in readable) if t)
         if stamps:
             report.window_start, report.window_end = stamps[0], stamps[-1]
             expected = set()
