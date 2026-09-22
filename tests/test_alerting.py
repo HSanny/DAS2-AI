@@ -237,6 +237,36 @@ def main():
     check("the most severe are the ones sent",
           report.sent[0] == "E-29", f"({report.sent[:3]})")
 
+    # Telegram is the ONLY channel: the dashboard is written to disk and
+    # nothing serves it. "See the dashboard for the full list" was therefore a
+    # dangling reference -- worse than no line at all, because it implies the
+    # information was delivered somewhere reachable.
+    digest = "\n".join(fake.messages())
+    check("the remainder is listed, not pointed at",
+          "dashboard" not in digest.lower(),
+          "(nothing may exist only on a page no one can open)")
+    for ref in ("E-0", "E-5", "E-19"):
+        inc = next(i for i in flood.incidents if i.incident_id == ref)
+        sites = sorted(inc.cluster.sites)[0]
+        check(f"{ref} appears in the digest",
+              sites in digest and inc.incident_class.value in digest)
+    check("every digest message fits Telegram's limit",
+          all(len(m) <= telegram.MESSAGE_MAX for m in fake.messages()),
+          "(an over-long message is rejected whole, delivering nothing)")
+
+    print("\nsuppression is stated, so silence is visibly deliberate")
+    fake = FakeTelegram().install()
+    mixed = FakeResult(
+        [make_incident(IncidentClass.SENSOR_FAULT, "S-1", severity=60.0)]
+        + [make_incident(IncidentClass.TELEMETRY_FANOUT, f"F-{i}")
+           for i in range(4)])
+    send_run(mixed, TelegramConfig(token="t", chat_id="c"))
+    held = "\n".join(fake.messages())
+    check("the withheld count is reported", "withheld" in held)
+    check("and broken down by class", "TELEMETRY_FANOUT: 4" in held,
+          "(a run that suppressed 151 and a crashed job look identical "
+          "otherwise)")
+
     print("\nTelegram being down must not lose the run")
     fake = FakeTelegram(fail_on={"sendMessage"}).install()
     report = send_run(FakeResult([make_incident(IncidentClass.SENSOR_FAULT)]),

@@ -314,16 +314,96 @@ def send_run(result, config: TelegramConfig, *,
             log.error("telegram send failed for %s: %s", incident.incident_id, exc)
             report.failed.append((incident.incident_id, str(exc)))
 
-    if len(alertable) > max_incidents:
+    # Everything past the cap, as a digest rather than a pointer.
+    #
+    # This used to read "See the dashboard for the full list", which is a
+    # dangling reference: the dashboard is written to disk but nothing serves
+    # it, and Telegram is the only channel anyone actually reads. An alert
+    # that says "the rest is somewhere you cannot go" is worse than no line at
+    # all, because it implies the information was delivered.
+    #
+    # Full messages are capped at ten so one bad run cannot flood the chat;
+    # the digest is one line each, so the remainder stays visible without
+    # becoming a hundred notifications.
+    for chunk in _digest(alertable[max_incidents:]):
         try:
-            client.send_message(
-                f"…and {len(alertable) - max_incidents} further incident(s). "
-                f"See the dashboard for the full list.")
-        except (error.URLError, error.HTTPError, OSError):
-            pass
+            client.send_message(chunk)
+        except (error.URLError, error.HTTPError, OSError) as exc:
+            log.error("telegram digest failed: %s", exc)
+            break
+
+    # What was withheld, and why. Silence has to be visibly deliberate: a run
+    # that suppressed 151 incidents and one that crashed look identical from
+    # the chat unless the suppression is stated.
+    try:
+        summary = _suppression_summary(result)
+        if summary:
+            client.send_message(summary)
+    except (error.URLError, error.HTTPError, OSError):
+        pass
 
     log.info("telegram: %s", report.as_dict())
     return report
+
+
+def _digest(incidents: list) -> list[str]:
+    """
+    One line per incident, split into messages under the 4096-byte limit.
+
+    Enough to recognise an incident and ask about it -- priority, class,
+    region, sites, scale -- without the evidence and sensor list a full alert
+    carries. Splitting on whole lines matters: Telegram rejects the message
+    outright when it is too long, so a single over-long digest would deliver
+    nothing rather than deliver less.
+    """
+    if not incidents:
+        return []
+
+    lines = [f"<b>{len(incidents)} further incident(s)</b>, one line each:"]
+    for inc in incidents:
+        sites = ", ".join(sorted(inc.cluster.sites)) or "unnamed site"
+        if len(sites) > 60:
+            sites = sites[:57] + "…"
+        lines.append(
+            f"{PRIORITY_ICON.get(inc.priority.value, '')} "
+            f"{inc.priority.value} {_esc(inc.incident_class.value)} · "
+            f"{_esc(inc.cluster.region or 'unplaced')} · "
+            f"{len(inc.cluster.members)} sensor(s) · {_esc(sites)}")
+
+    chunks, current = [], []
+    size = 0
+    for line in lines:
+        # +1 for the newline that joins it.
+        if size + len(line) + 1 > MESSAGE_MAX and current:
+            chunks.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _suppression_summary(result) -> str:
+    """
+    What the run decided NOT to send, by class.
+
+    Suppression is the product here, not a side effect -- v1 sent every
+    sensor every run and the complaint was noise. But an unexplained silence
+    is indistinguishable from a dead job, so the withheld count and its
+    reasons are stated rather than assumed.
+    """
+    held = [i for i in result.incidents if i not in result.alertable]
+    if not held:
+        return ""
+    by_class: dict[str, int] = {}
+    for inc in held:
+        key = inc.incident_class.value
+        by_class[key] = by_class.get(key, 0) + 1
+    rows = "\n".join(f"• {_esc(k)}: {v}"
+                     for k, v in sorted(by_class.items(), key=lambda kv: -kv[1]))
+    return (f"<b>{len(held)} incident(s) withheld</b> — deliberate, not a "
+            f"quiet run:\n{rows}")
 
 
 def _run_header(result, alertable: int) -> str:
