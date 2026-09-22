@@ -340,7 +340,11 @@ class DatabaseConfig:
     database: str = ""
     username: str = ""
     password: str = field(default="", repr=False)
-    driver: str = "ODBC Driver 17 for SQL Server"
+    #: Must name a driver that is actually installed. The Dockerfile installs
+    #: msodbcsql18, so this is 18 -- it was 17 and the image has never carried
+    #: 17, which produced `IM002 ... no default driver specified` on the first
+    #: real deployment. Change it only alongside the Dockerfile.
+    driver: str = "ODBC Driver 18 for SQL Server"
     schema: str = "dbo"
 
     #: Persist each run's readings into das2_reading. This is what gives the
@@ -363,24 +367,84 @@ class DatabaseConfig:
 
     @property
     def safe_url(self) -> str:
-        """The URL with the password removed, for logs and the check command."""
+        """
+        The URL with the password removed, for logs and the check command.
+
+        Masking `self.password` is not enough. When the credentials arrive as
+        a whole `DAS2_DATABASE_URL` -- which is how the deployment guide
+        recommends configuring SQL Server -- that field is empty and the
+        password lives in the URL's userinfo, so it survived into every log
+        line that printed this. The userinfo is therefore rewritten
+        structurally, and `self.password` masked afterwards in case a value
+        also appears elsewhere in the string.
+        """
+        from urllib.parse import quote_plus, urlsplit, urlunsplit
+
         url = self.sqlalchemy_url()
-        if self.password and self.password in url:
-            url = url.replace(self.password, "***")
-        from urllib.parse import quote_plus
+        parts = urlsplit(url)
+        if parts.password:
+            host = parts.hostname or ""
+            if parts.port:
+                host = f"{host}:{parts.port}"
+            userinfo = f"{parts.username or ''}:***"
+            url = urlunsplit(parts._replace(netloc=f"{userinfo}@{host}"))
         if self.password:
+            url = url.replace(self.password, "***")
             url = url.replace(quote_plus(self.password), "***")
         return url
 
     def sqlalchemy_url(self) -> str:
         if self.url:
-            return self.url
+            return _complete_pyodbc_url(self.url, self.driver)
         from urllib.parse import quote_plus
         return (
             f"mssql+pyodbc://{quote_plus(self.username)}:{quote_plus(self.password)}"
             f"@{self.host}:{self.port}/{self.database}"
             f"?driver={quote_plus(self.driver)}&TrustServerCertificate=yes"
         )
+
+
+def _complete_pyodbc_url(url: str, driver: str) -> str:
+    """
+    Add `driver=` and `TrustServerCertificate=yes` to a SQL Server URL that
+    omits them, and leave every other URL exactly as given.
+
+    A hand-written `DAS2_DATABASE_URL` without `?driver=...` is accepted by
+    SQLAlchemy and fails only at connect time, as
+
+        SAWarning: No driver name specified ...
+        pyodbc.InterfaceError: ('IM002', '[unixODBC][Driver Manager]
+        Data source name not found and no default driver specified')
+
+    which names neither the setting at fault nor the file it is in. Since the
+    image ships exactly one driver, the value is never ambiguous, so filling it
+    in is better than reporting it. Anything the URL *does* specify wins --
+    this only supplies what is missing.
+
+    SQLite and every non-pyodbc URL pass through untouched; a DSN-style URL
+    (`mssql+pyodbc://user:pass@SomeDSN`) does too, because there the driver
+    comes from the DSN and adding one would override it. A DSN URL is
+    recognised by having no database in the path -- not by the absence of an
+    `@`, which it has whenever credentials are given.
+    """
+    if not url.startswith("mssql+pyodbc:"):
+        return url
+
+    from urllib.parse import parse_qsl, urlsplit, urlunsplit, urlencode
+
+    parts = urlsplit(url)
+    if not parts.path.strip("/"):
+        return url                                   # DSN form: leave alone
+
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    present = {k.lower() for k, _ in query}
+    if "odbc_connect" in present:
+        return url                                   # fully pre-baked; hands off
+    if "driver" not in present:
+        query.append(("driver", driver))
+    if "trustservercertificate" not in present:
+        query.append(("TrustServerCertificate", "yes"))
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 @dataclass

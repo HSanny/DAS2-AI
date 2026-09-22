@@ -22,7 +22,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from das2.config import Config  # noqa: E402
+from das2.config import Config, DatabaseConfig  # noqa: E402
 from das2.models import (  # noqa: E402
     AckState,
     AnomalyType,
@@ -134,8 +134,54 @@ def main():
     check("to_dict masks the password", cfg.to_dict()["database"]["password"] == "***")
     check("repr does not contain it", "hunter2" not in repr(cfg))
     check("but the real URL still uses it", "hunter2" in cfg.database.sqlalchemy_url())
+    check("safe_url masks it", "hunter2" not in cfg.database.safe_url)
+
+    # The leak that mattered: with the whole URL in DAS2_DATABASE_URL -- which
+    # is how DEPLOY.md recommends configuring SQL Server -- `password` is empty
+    # and masking it alone is a no-op, so the credential went into every log
+    # line that printed safe_url, including the connection-failure error.
+    leaky = DatabaseConfig(url="mssql+pyodbc://sa:hunter2@10.0.0.5:1433/anomaly_db")
+    check("a password inside DAS2_DATABASE_URL is masked too",
+          "hunter2" not in leaky.safe_url, leaky.safe_url)
+    check("and the rest of the URL survives masking",
+          "sa:***@10.0.0.5:1433/anomaly_db" in leaky.safe_url)
+    escaped = DatabaseConfig(url="mssql+pyodbc://sa:p%40ss%3Aword@h/db")
+    check("a percent-escaped password is masked", "p%40ss" not in escaped.safe_url)
     cfg.database.url = "sqlite:///x.db"
     check("explicit url wins", cfg.database.sqlalchemy_url() == "sqlite:///x.db")
+
+    # ------------------------------------------------------------------ #
+    # A hand-written DAS2_DATABASE_URL that omits ?driver= is accepted by
+    # SQLAlchemy and fails only at connect time, as
+    #   IM002 ... Data source name not found and no default driver specified
+    # which names neither the setting at fault nor the file it lives in. It
+    # cost a real deployment its first run. The image ships exactly one ODBC
+    # driver, so the value is never ambiguous -- fill it in rather than
+    # report it.
+    print("\nconfig: a URL without ?driver= is completed, not left to fail")
+    cfg = Config()
+    cfg.database.url = "mssql+pyodbc://sa:pass@10.0.0.5:1433/anomaly_db"
+    completed = cfg.database.sqlalchemy_url()
+    check("driver is supplied", "driver=ODBC+Driver+18+for+SQL+Server" in completed)
+    check("TrustServerCertificate too", "TrustServerCertificate=yes" in completed,
+          "(the container trusts no CA the SQL Server was issued under)")
+    check("the default driver matches the one the Dockerfile installs",
+          DatabaseConfig().driver == "ODBC Driver 18 for SQL Server",
+          "(it said 17 for a while; the image has never carried 17)")
+
+    cfg.database.url = ("mssql+pyodbc://sa:pass@h:1433/db"
+                        "?driver=ODBC+Driver+17+for+SQL+Server")
+    check("an explicit driver is never overridden",
+          "Driver+17" in cfg.database.sqlalchemy_url()
+          and "Driver+18" not in cfg.database.sqlalchemy_url())
+
+    for untouched in ("sqlite:////data/output/das2.db",
+                      "postgresql://u:p@h/db",
+                      "mssql+pyodbc://sa:pass@SomeDSN",
+                      "mssql+pyodbc:///?odbc_connect=DRIVER%3D%7BODBC+18%7D"):
+        cfg.database.url = untouched
+        check(f"passed through unchanged: {untouched[:38]}",
+              cfg.database.sqlalchemy_url() == untouched)
 
     # ------------------------------------------------------------------ #
     print("\nmodels: severity is physical, and comparable across equipment")

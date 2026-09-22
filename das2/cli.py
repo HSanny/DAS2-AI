@@ -169,8 +169,37 @@ def cmd_run(config: Config, args) -> int:
     open_incidents: list = []
     baselines: dict = {}
     if not args.dry_run:
+        from sqlalchemy import text
+
         from das2.io.store import load_open_incidents, make_engine
-        engine = make_engine(config.database.sqlalchemy_url())
+
+        # Build the engine and probe it before anything else, and STOP if
+        # either fails. Construction is inside the guard because it is not
+        # merely lazy bookkeeping: create_engine imports the DBAPI, so a
+        # missing pyodbc or an unparseable URL raises here, and an uncaught
+        # traceback out of a scheduled container is a poor way to say
+        # "the database settings are wrong".
+        #
+        # The loads below degrade gracefully, which is right for a table that
+        # is empty or a query that failed once. It is wrong for a database that
+        # cannot be reached at all: the run would carry on, treat every
+        # incident as new because it could not read the open ones, fail to
+        # persist them, and then alert -- repeating the whole set every run
+        # forever. Suppressing exactly that repetition is what the incident
+        # layer is for, so a database outage must not be allowed to turn it off
+        # quietly. Better to run nothing than to flood the operators' chat.
+        try:
+            engine = make_engine(config.database.sqlalchemy_url())
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+        except Exception as exc:                           # noqa: BLE001
+            log.error("cannot reach the database at %s: %s",
+                      config.database.safe_url, exc)
+            log.error("run `docker compose run --rm das2-check` for the full "
+                      "pre-flight, or `--dry-run` to analyse without a "
+                      "database.")
+            return 3
+
         try:
             open_incidents = load_open_incidents(engine)
         except Exception as exc:                           # noqa: BLE001

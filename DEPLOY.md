@@ -560,7 +560,9 @@ SELECT equipment, COUNT(*) AS sensors,
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `IM002 ... Data source name not found and no default driver specified`, with `SAWarning: No driver name specified` just above it | `DAS2_DATABASE_URL` was written without `?driver=...` | Nothing to do — the driver is now appended automatically for `mssql+pyodbc` URLs. If you see it after a rebuild, the URL names a driver that is not installed |
 | `Can't open lib 'ODBC Driver 18 for SQL Server'` | Driver missing — you are not running in the image | Use the container, or install `msodbcsql18` on the host |
+| `cannot reach the database at ...` and the run exits 3 | The database is unreachable | `docker compose run --rm das2-check`. The run now stops instead of continuing: without the incident table it cannot tell a new incident from one already sent, so carrying on would re-alert the whole set every hour |
 | `Login failed for user` | Credentials, or the login has no user in that database | Re-check `.env`; run the `CREATE USER` in §12 |
 | `no such table: das2_incident` | Migrations not applied | `docker compose run --rm das2-migrate` |
 | `HISTCURR missing ['IPADDRESS', ...]` | Old comma-separated inventory file | Supply the live semicolon 9-column export (§2) |
