@@ -65,12 +65,29 @@ def cmd_migrate(config: Config, args) -> int:
     return 0
 
 
+def cmd_version(config: Config, args) -> int:
+    """
+    What code this image actually contains.
+
+    Answers "did my rebuild take?" without running the pipeline, which is
+    otherwise only answerable by noticing whether some log line appears.
+    """
+    from das2 import build_stamp, source_fingerprint
+    print(f"das2 source fingerprint : {source_fingerprint()}")
+    print(f"written into the image  : {build_stamp().split('(written ')[1][:-1]}")
+    print("\nIf that timestamp predates your last `git pull`, the image was "
+          "never rebuilt:\n  docker compose build")
+    return 0
+
+
 def cmd_check(config: Config, args) -> int:
     """
     Pre-flight. Every check prints PASS/FAIL and why, and nothing is fatal --
     the point is to show the whole picture, not to stop at the first problem.
     """
     ok = True
+    from das2 import build_stamp
+    print(f"\nCode\n  das2 source {build_stamp()}")
 
     def report(label: str, passed: bool, detail: str = "") -> None:
         nonlocal ok
@@ -518,6 +535,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "(or set DAS2_LOG_LEVEL)")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("version",
+                   help="print the code fingerprint baked into this image")
     p_migrate = sub.add_parser("migrate",
                                help="create/update the database tables")
     p_migrate.add_argument("--print-sql", action="store_true",
@@ -564,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
 
     handlers = {
         "migrate": cmd_migrate,
+        "version": cmd_version,
         "check": cmd_check,
         "demo": cmd_demo,
         "profile": cmd_profile,

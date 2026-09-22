@@ -134,7 +134,12 @@ def run(config: Config, *, now: datetime | None = None,
     started = time.time()
     now = now or datetime.now()
     run_id = now.strftime("%Y%m%d-%H%M%S")
-    log.info("run %s starting", run_id)
+    # The code identity goes in the FIRST line of every run. A container
+    # running yesterday's image looks exactly like one running today's, and
+    # finding that out by noticing an absent log line requires already knowing
+    # which commit added it.
+    from das2 import build_stamp
+    log.info("run %s starting -- das2 source %s", run_id, build_stamp())
 
     result = RunResult(run_id=run_id, started_at=now)
 
