@@ -378,6 +378,11 @@ class IncidentClass(str, Enum):
     """What the evidence says is going on, which determines what to do."""
 
     TELEMETRY_FANOUT = "TELEMETRY_FANOUT"        # one panel/RTU, many sensors -> suppress
+    # Many instruments, several SITES, all gone quiet together. Instruments do
+    # not fail in hundreds across kilometres; the path carrying their readings
+    # does. Separate from FANOUT, which is one panel, because the remedy is
+    # different: a link or an RTU group, not a fuse.
+    TELEMETRY_OUTAGE = "TELEMETRY_OUTAGE"
     REGIONAL_EVENT = "REGIONAL_EVENT"            # several sites, several types -> escalate
     SENSOR_FAULT = "SENSOR_FAULT"                # instrument is broken -> dispatch
     DRIFT_MAINTENANCE = "DRIFT_MAINTENANCE"      # schedule calibration
@@ -412,6 +417,9 @@ RECOMMENDATION: dict[IncidentClass, str] = {
         "Multiple sites affected together - investigate the area, not one sensor.",
     IncidentClass.SENSOR_FAULT:
         "Instrument fault with no corroboration from neighbours - dispatch a technician.",
+    IncidentClass.TELEMETRY_OUTAGE:
+        "Many sensors across several sites stopped reporting together - check "
+        "the comms path or the historian feed. Do NOT dispatch per sensor.",
     IncidentClass.DRIFT_MAINTENANCE:
         "Gradual drift - schedule recalibration, not urgent.",
     IncidentClass.PROCESS_EVENT:

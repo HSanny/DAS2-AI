@@ -313,6 +313,57 @@ def main():
     check("build_stamp carries the fingerprint",
           _das2.source_fingerprint() in _das2.build_stamp())
 
+    # ------------------------------------------------------------------ #
+    print("\ntriage: a hundred quiet sensors is a feed, not a hundred faults")
+    # On the client's first real run, three of five P1 alerts read
+    # "Instrument fault ... dispatch a technician" over 116, 123 and 115
+    # sensors spanning six sites each. The cause was visible in the same run's
+    # ingest stats: a 24-hour hole in the historian feed, which makes every
+    # sensor STALE at once. Sending crews to six sites for a comms outage is
+    # exactly the wasted trip this system exists to prevent.
+    from das2.incident.triage import (  # noqa: E402
+        OUTAGE_MIN_MEMBERS,
+        classify,
+    )
+
+    def cluster_of(n, sites, atype=AnomalyType.STALE):
+        members = []
+        for i in range(n):
+            site = sites[i % len(sites)]
+            members.append(anomaly(key=f"k{i}", atype=atype, site=site,
+                                   rtu_number=str(1000 + i)))
+        return Cluster(members=members)
+
+    big = cluster_of(116, ["Jurong PS", "Jurong TG", "Pandan 1 PS",
+                           "Pandan 2 PS", "Pandan TG", "Pandan 1 Ext"])
+    klass, why = classify(big)
+    check("116 stale sensors over 6 sites is an outage",
+          klass is IncidentClass.TELEMETRY_OUTAGE, f"({klass.value})")
+    inc = Incident(incident_id="x", cluster=big, incident_class=klass)
+    check("it still alerts -- a dead feed blinds the detector",
+          inc.should_alert)
+    check("but nobody is dispatched", not inc.should_dispatch,
+          "(the remedy is a link, not a truck)")
+    check("and the recommendation says so",
+          "Do NOT dispatch per sensor" in inc.recommendation)
+    check("the evidence names the reasoning",
+          any("telemetry path" in w for w in why))
+
+    # The rule must not swallow the case it was carved out of.
+    small = cluster_of(4, ["Bedok PS", "Tampines Pond B"])
+    check("a handful of stale sensors is still a sensor fault",
+          classify(small)[0] is IncidentClass.SENSOR_FAULT,
+          f"(n=4, below the threshold of {OUTAGE_MIN_MEMBERS})")
+    one_site = cluster_of(40, ["Bedok PS"])
+    check("many sensors at ONE site remains fan-out",
+          classify(one_site)[0] is IncidentClass.TELEMETRY_FANOUT,
+          "(one panel, already handled, and never paged)")
+    process = cluster_of(30, ["Jurong PS", "Jurong TG", "Pandan TG"],
+                         atype=AnomalyType.LEVEL_SHIFT)
+    check("a large PROCESS event is not mistaken for an outage",
+          classify(process)[0] is not IncidentClass.TELEMETRY_OUTAGE,
+          "(the water moving is not the feed failing)")
+
     print("\nAll config/model tests passed.")
 
 

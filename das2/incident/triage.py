@@ -54,6 +54,20 @@ from das2.spatial.cluster import is_single_site
 REGIONAL_MIN_SITES = 2
 REGIONAL_MIN_MEMBERS = 3
 
+#: When "many sensors, all quiet" stops meaning broken instruments and starts
+#: meaning a broken feed.
+#:
+#: 20 is deliberately well above anything a site visit could plausibly fix and
+#: well below what the client's real run produced (116, 123 and 115 sensors
+#: across six sites each, every one of them recommending a technician). It is
+#: a guess in the same sense the other thresholds are -- nobody has labelled
+#: data for it -- but the cost is asymmetric: calling a genuine multi-site
+#: instrument failure an outage costs one wrong line in an alert that still
+#: pages someone, while calling an outage an instrument fault sends crews to
+#: six sites. Raise it once real outages have been seen and counted.
+OUTAGE_MIN_MEMBERS = 20
+OUTAGE_MIN_SITES = 2
+
 #: Neighbours moving with the suspect sensor means the water moved. Neighbours
 #: sitting still while one instrument swings means the instrument is lying.
 #: These are the thresholds on Pearson r over the incident window.
@@ -115,7 +129,38 @@ def classify(cluster: Cluster, *,
         why.append("a shared cause in the telemetry, not several faults")
         return IncidentClass.TELEMETRY_FANOUT, why
 
-    # --- 2. Rain explains it ------------------------------------------------ #
+    # --- 2. The telemetry path, not the instruments ------------------------- #
+    # Structural, like fan-out above, so it is decided early -- and it MUST
+    # precede the instrument-fault rules, which match STALE outright and
+    # would otherwise answer first. That is not hypothetical: placed after
+    # them, this branch was unreachable and the test below caught it.
+    #
+    # On the client's first real run this branch did not exist, and three of
+    # the five P1 alerts were "Instrument fault ... dispatch a technician" over
+    # 116, 123 and 115 sensors spanning six sites each. A hundred instruments
+    # do not fail together across kilometres. The path carrying their readings
+    # does -- and in that run the cause was visible in the ingest stats: a
+    # 24-hour hole in the historian feed, which makes every sensor look STALE
+    # at once.
+    #
+    # Sending crews to six sites for a comms outage is precisely the wasted
+    # trip this system exists to prevent, so the generic dispatch line must not
+    # be reachable at this scale. TELEMETRY_FANOUT already covers one panel or
+    # one RTU; this covers the wider case, where the remedy is a link or a
+    # feed rather than a fuse.
+    if (len(members) >= OUTAGE_MIN_MEMBERS and len(sites) >= OUTAGE_MIN_SITES
+            and types and types <= SENSOR_HEALTH_TYPES):
+        why.append(f"{len(members)} sensors across {len(sites)} sites stopped "
+                   f"reporting together "
+                   f"({', '.join(sorted(t.value for t in types))})")
+        why.append("instruments do not fail in this number across this "
+                   "distance -- the telemetry path is the suspect, not the "
+                   "sensors")
+        why.append("check the comms link, the RTU group and the historian "
+                   "feed before dispatching anyone")
+        return IncidentClass.TELEMETRY_OUTAGE, why
+
+    # --- 3. Rain explains it ------------------------------------------------ #
     # Checked before the area rules, because a regional flow excursion during a
     # downpour is the single most common false dispatch in a water network.
     if (rainfall_mm is not None and rainfall_mm >= RAIN_EXPLAINS_MM
@@ -125,7 +170,7 @@ def classify(cluster: Cluster, *,
                    f"are all rain-explicable")
         return IncidentClass.WEATHER_DRIVEN, why
 
-    # --- 3. Area event ------------------------------------------------------ #
+    # --- 4. Area event ------------------------------------------------------ #
     # An area event means the WATER moved, so it needs enough members whose
     # anomaly is about a process rather than an instrument. Without this test,
     # any three independent broken sensors at nearby sites whose windows happen
@@ -151,7 +196,7 @@ def classify(cluster: Cluster, *,
                        f"-- the water moved, not the instruments")
         return IncidentClass.REGIONAL_EVENT, why
 
-    # --- 3b. Instruments contradicting each other ---------------------------- #
+    # --- 5. Instruments contradicting each other ----------------------------- #
     # Checked before the correlation-dependent rules, because a contradiction
     # between two instruments is already conclusive. Neighbour correlation
     # cannot make "level, inflow and outflow disagree" go away -- it can only
@@ -169,13 +214,13 @@ def classify(cluster: Cluster, *,
                 break
         return IncidentClass.INSTRUMENT_CONFLICT, why
 
-    # --- 4. Maintenance ----------------------------------------------------- #
+    # --- 6. Maintenance ----------------------------------------------------- #
     if types and types <= MAINTENANCE_TYPES:
         why.append(f"gradual {', '.join(sorted(t.value for t in types))} "
                    f"with no abrupt failure")
         return IncidentClass.DRIFT_MAINTENANCE, why
 
-    # --- 5. Definitively broken instruments ---------------------------------- #
+    # --- 7. Definitively broken instruments ---------------------------------- #
     # Not correlation-dependent, deliberately. A sensor that has stopped
     # reporting, or frozen, or lost its resolution, is broken whatever its
     # neighbours did -- correlation says something about a sensor's VALUE, and
@@ -187,7 +232,7 @@ def classify(cluster: Cluster, *,
                    "does not change it")
         return IncidentClass.SENSOR_FAULT, why
 
-    # --- 6. Instrument fault vs the process --------------------------------- #
+    # --- 8. Instrument fault vs the process --------------------------------- #
     # This is the dispatch decision, and correlation is what decides it.
     if types and types <= SENSOR_HEALTH_TYPES:
         why.append(f"sensor-health fault ({', '.join(sorted(t.value for t in types))})")
@@ -239,6 +284,12 @@ CLASS_WEIGHT: dict[IncidentClass, float] = {
     # cannot both be true, so there is nothing probabilistic left to discount.
     IncidentClass.INSTRUMENT_CONFLICT: 0.90,
     IncidentClass.SENSOR_FAULT: 0.85,
+    # Real and worth fixing -- a feed that has stopped blinds the whole
+    # detector -- but it is one job for whoever owns the link, not a severity
+    # that should outrank a genuine regional event just because it swept up a
+    # hundred sensors. Member count is already part of the raw score, so left
+    # unweighted an outage would dominate every run it appears in.
+    IncidentClass.TELEMETRY_OUTAGE: 0.45,
     IncidentClass.PROCESS_EVENT: 0.55,
     IncidentClass.DRIFT_MAINTENANCE: 0.40,
     IncidentClass.WEATHER_DRIVEN: 0.30,
