@@ -70,7 +70,10 @@ class FakeTelegram:
         telegram.TelegramClient.send_photo = self._send_photo
         return self
 
-    def _call(self, method, payload):
+    def _call(self, method, payload, *, timeout_s=None):
+        # Mirrors the real signature, including the per-call socket
+        # timeout getUpdates needs. A mock that lags the interface it
+        # stands in for hides the very bug it should catch.
         if self.http_error and method == "getUpdates":
             raise error.HTTPError("url", self.http_error, "boom", {}, None)
         if method in self.fail_on:
@@ -266,6 +269,40 @@ def main():
     check("and broken down by class", "TELEMETRY_FANOUT: 4" in held,
           "(a run that suppressed 151 and a crashed job look identical "
           "otherwise)")
+
+    print("\nthe long poll must outlive its own timeout")
+    # getUpdates asks Telegram to HOLD the connection for `timeout` seconds.
+    # With the socket timeout at 20 s and the poll at 25 s, the client hung up
+    # five seconds before Telegram was due to reply -- every call, on every
+    # network -- so the acknowledge worker could never succeed. It reported
+    # this as "getUpdates network error: The read operation timed out" every
+    # 25 seconds, which reads like a flaky link rather than a guaranteed
+    # failure, and went unrecognised in production for exactly that reason.
+    seen = {}
+
+    class TimingTelegram(FakeTelegram):
+        def _call(self, method, payload, *, timeout_s=None):
+            seen[method] = timeout_s
+            return {"ok": True, "result": []}
+
+
+    TimingTelegram().install()
+    client = telegram.TelegramClient(TelegramConfig(token="t", chat_id="c"))
+    client.get_updates(offset=None, timeout=25)
+    check("the socket outlives the poll it asked for",
+          seen["getUpdates"] is not None and seen["getUpdates"] > 25,
+          f"(socket {seen['getUpdates']}s vs poll 25s)")
+    check("with real margin, not one second",
+          seen["getUpdates"] - 25 >= 10,
+          f"(+{seen['getUpdates'] - 25}s for the round trip)")
+    for poll in (0, 10, 50):
+        seen.clear()
+        client.get_updates(offset=None, timeout=poll)
+        check(f"and it holds at poll={poll}s", seen["getUpdates"] > poll,
+              f"(socket {seen['getUpdates']}s)")
+    check("ordinary sends keep the short timeout",
+          TelegramConfig().timeout_s == 20,
+          "(a message that cannot be sent in 20s is not going to be)")
 
     print("\nTelegram being down must not lose the run")
     fake = FakeTelegram(fail_on={"sendMessage"}).install()

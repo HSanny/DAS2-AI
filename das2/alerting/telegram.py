@@ -52,6 +52,12 @@ API = "https://api.telegram.org/bot{token}/{method}"
 
 #: Telegram hard limits.
 CALLBACK_DATA_MAX = 64
+#: Seconds the socket is allowed BEYOND the long-poll duration, for the
+#: round trip and for Telegram's own slack in honouring the timeout. It only
+#: has to be comfortably positive; the call returns as soon as Telegram
+#: answers, so a generous margin costs nothing.
+LONG_POLL_MARGIN_S = 15
+
 MESSAGE_MAX = 4096
 CAPTION_MAX = 1024
 
@@ -79,6 +85,8 @@ class TelegramConfig:
     token: str = ""
     chat_id: str = ""
     enabled: bool = True
+    #: Socket timeout for ordinary calls -- sending a message or a photo.
+    #: getUpdates does NOT use this; see LONG_POLL_MARGIN_S.
     timeout_s: int = 20
 
     @property
@@ -186,7 +194,8 @@ class TelegramClient:
     def __init__(self, config: TelegramConfig):
         self.config = config
 
-    def _call(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _call(self, method: str, payload: dict[str, Any], *,
+              timeout_s: int | None = None) -> dict[str, Any]:
         url = API.format(token=self.config.token, method=method)
         data = parse.urlencode(
             {k: (json.dumps(v) if isinstance(v, (dict, list)) else v)
@@ -194,7 +203,8 @@ class TelegramClient:
         req = request.Request(url, data=data,
                               headers={"Content-Type":
                                        "application/x-www-form-urlencoded"})
-        with request.urlopen(req, timeout=self.config.timeout_s) as resp:
+        with request.urlopen(req,
+                             timeout=timeout_s or self.config.timeout_s) as resp:
             return json.loads(resp.read().decode())
 
     def send_message(self, text: str, *, reply_markup=None,
@@ -256,10 +266,23 @@ class TelegramClient:
 
     def get_updates(self, offset: int | None = None,
                     timeout: int = 25) -> list[dict[str, Any]]:
+        # The socket must outlive the long poll, or every call dies waiting.
+        #
+        # getUpdates is a LONG POLL: Telegram is asked to hold the connection
+        # open for `timeout` seconds and answer early only if an update
+        # arrives. With the socket timeout at 20 s and the poll at 25 s, the
+        # client hung up five seconds before Telegram was due to reply --
+        # every call, on every network. The acknowledge worker could never
+        # succeed, and it announced this as
+        #
+        #     WARNING getUpdates network error: The read operation timed out
+        #
+        # every 25 seconds, which reads like a flaky link rather than a
+        # guaranteed failure. It went unrecognised for exactly that reason.
         result = self._call("getUpdates", {
             "offset": offset, "timeout": timeout,
             "allowed_updates": ["callback_query"],
-        })
+        }, timeout_s=timeout + LONG_POLL_MARGIN_S)
         return result.get("result", [])
 
 
