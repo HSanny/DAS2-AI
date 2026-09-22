@@ -38,6 +38,7 @@ taking whichever interpretation the data supports.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Protocol
 
@@ -45,6 +46,8 @@ import numpy as np
 import pandas as pd
 
 from das2.spatial.regions import haversine_m
+
+log = logging.getLogger("das2.weather")
 
 #: Equipment class the classifier assigns to rain gauges.
 RAINFALL_EQUIPMENT = "Rainfall"
@@ -56,7 +59,39 @@ DEFAULT_GAUGE_RADIUS_M = 5000.0
 
 #: Above this, a single reading is a running total rather than an increment --
 #: no tipping bucket reports 50 mm in one 5-minute scan.
+#:
+#: Kept for reference. It is NOT the test any more: deciding the convention
+#: from a magnitude was wrong, and wrong in the dangerous direction. See
+#: _gauge_total.
 CUMULATIVE_HINT_MM = 50.0
+
+#: Above this over one analysis window, the number is not rainfall.
+#:
+#: Singapore receives about 2,300 mm in a YEAR and its heaviest recorded day is
+#: around 500 mm. A 72-hour total beyond this is arithmetic, not weather, so it
+#: is reported as unknown rather than passed on. The first real run produced
+#: 26,118 mm -- twenty-six metres -- and nothing downstream noticed, because
+#: nothing downstream was checking.
+MAX_PLAUSIBLE_WINDOW_MM = 1000.0
+
+#: How close to monotonic a series must be to count as a running total. Not 1.0
+#: because a counter that resets, or a single out-of-order scan, should not
+#: disqualify it.
+MONOTONIC_SHARE = 0.99
+
+#: A tipping bucket that is not tipping reports zero. If most of the window is
+#: zeros, the non-zero readings are increments and summing them is right.
+ZERO_SHARE_INCREMENTS = 0.5
+
+#: Below this, a reading is the gauge's noise floor, not a tip.
+#:
+#: Standard tipping buckets resolve 0.1, 0.2 or 0.254 mm, so nothing real
+#: arrives under 0.05. Testing against exact zero instead was wrong twice over:
+#: a gauge idling at 0.01 counted as never dry, so the series read as neither
+#: convention and rainfall came back unknown -- and had it been summed, 0.01
+#: across 2,160 scans is 21.6 mm of rain invented out of noise, which is the
+#: 26-metre defect again at a size small enough to be believed.
+GAUGE_NOISE_FLOOR_MM = 0.05
 
 
 class WeatherProvider(Protocol):
@@ -123,10 +158,59 @@ class InternalRainGaugeProvider:
         if values.size == 0:
             return None
 
-        if float(np.max(values)) >= CUMULATIVE_HINT_MM:
-            rise = float(values[-1] - values[0])
-            return max(0.0, rise)
-        return float(np.sum(values[values > 0]))
+        if values.size < 2:
+            return None
+
+        # Decide the convention from the SHAPE of the series, not from how big
+        # the numbers are.
+        #
+        # The magnitude test this replaces -- "any reading over 50 mm means a
+        # running total, otherwise sum the readings" -- produced 26,118 mm over
+        # 72 hours on the client's real gauges. Twenty-six metres, against a
+        # Singapore ANNUAL average near 2,300 mm. The gauges sit at a constant
+        # value of about 10, which is under 50, so every scan was added to the
+        # total: 10 x 2,160 readings.
+        #
+        # The damage was not the number. RAIN_EXPLAINS_MM is 2.0, so a
+        # permanent 21,600 mm held the rain gate wide open, and any incident
+        # whose types were all rain-explicable was classified WEATHER_DRIVEN
+        # and withheld from dispatch -- in a country where it rains most days,
+        # silently, on the strength of arithmetic.
+        diffs = np.diff(values)
+
+        # Constant: nothing accumulated, whichever convention this gauge uses.
+        # A running total that has not moved means no rain; a tipping bucket
+        # reporting the same non-zero figure every scan for three days is not
+        # reporting rain either.
+        if np.allclose(diffs, 0.0):
+            return 0.0
+
+        # Running total: non-decreasing apart from resets and the odd
+        # out-of-order scan. Summing the positive steps handles a midnight
+        # reset, which last-minus-first silently turns negative.
+        if float(np.mean(diffs >= -1e-9)) >= MONOTONIC_SHARE:
+            total = float(np.sum(diffs[diffs > 0]))
+        # Tipping bucket: mostly dry, with increments when it tips. "Dry" means
+        # below the gauge's resolution, not exactly zero -- a real instrument
+        # idles at a few hundredths, and only values above the floor are summed
+        # so that idling cannot accumulate into rain.
+        elif float(np.mean(np.abs(values) <= GAUGE_NOISE_FLOOR_MM)) >= ZERO_SHARE_INCREMENTS:
+            total = float(np.sum(values[values > GAUGE_NOISE_FLOOR_MM]))
+        else:
+            # Neither shape. A gauge wandering around a non-zero value is
+            # reporting something this code cannot read as depth -- an
+            # intensity, a raw count, a fault. Unknown is the honest answer,
+            # and triage treats it as "no information" rather than "dry", so
+            # the rain rule simply does not fire.
+            log.debug("gauge %s fits neither convention; rainfall unknown", key)
+            return None
+
+        if total > MAX_PLAUSIBLE_WINDOW_MM:
+            log.warning(
+                "gauge %s totals %.0f mm over the window, which is not "
+                "weather -- reporting rainfall as unknown", key, total)
+            return None
+        return max(0.0, total)
 
     def rainfall_mm(self, lat: float | None, lon: float | None,
                     start: datetime, end: datetime) -> float | None:
