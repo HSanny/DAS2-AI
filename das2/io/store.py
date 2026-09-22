@@ -66,7 +66,28 @@ DAS2_MIGRATIONS = ("010_das2_schema.sql", "011_sensor_kind.sql",
                    "012_profile_days.sql")
 
 
-def make_engine(url: str, *, echo: bool = False) -> Engine:
+#: Seconds to allow for the SQL Server LOGIN handshake.
+#:
+#: ODBC Driver 18 defaults to 15, and on the client's historian that is not
+#: enough: every connection failed at exactly 15 seconds with
+#:
+#:     ('HYT00', '... Login timeout expired (0) (SQLDriverConnect)')
+#:
+#: while a plain TCP connect to 1433 from the same container succeeded
+#: immediately. A login taking longer than fifteen seconds is unusual -- a
+#: loaded server, a slow directory lookup, a reverse-DNS wait -- but it is the
+#: server's business, not a reason for an hourly job to give up.
+#:
+#: 60 rather than 30 because the cost is asymmetric. A server that is merely
+#: slow costs one longer wait; a run abandoned for want of a few seconds costs
+#: the whole hour, and the incident layer needs the database to tell a new
+#: incident from one already sent. A genuinely dead server still fails, just
+#: later.
+DEFAULT_LOGIN_TIMEOUT_S = 60
+
+
+def make_engine(url: str, *, echo: bool = False,
+                login_timeout_s: int = DEFAULT_LOGIN_TIMEOUT_S) -> Engine:
     """
     Engine for either SQL Server (pyodbc) or SQLite.
 
@@ -74,8 +95,16 @@ def make_engine(url: str, *, echo: bool = False) -> Engine:
     idle gaps, and a SQL Server connection that has been idle for an hour is
     routinely dead by the time the next run starts. Without it the first
     statement of every run fails.
+
+    `login_timeout_s` reaches pyodbc as its `timeout` argument, which sets
+    SQL_ATTR_LOGIN_TIMEOUT. It is applied only to pyodbc URLs; SQLite's driver
+    has no such parameter and rejects it.
     """
-    return create_engine(url, echo=echo, pool_pre_ping=True, future=True)
+    kwargs: dict = {}
+    if url.startswith("mssql+pyodbc:") and login_timeout_s:
+        kwargs["connect_args"] = {"timeout": int(login_timeout_s)}
+    return create_engine(url, echo=echo, pool_pre_ping=True, future=True,
+                         **kwargs)
 
 
 def _split_statements(sql: str) -> list[str]:

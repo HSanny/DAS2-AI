@@ -101,6 +101,39 @@ def main() -> int:
           not any(re.search(r"(?i)text|timestamp", lit) for lit in literals),
           f"literals: {literals}")
 
+    print("\nthe login timeout must outlast a slow server")
+    # Driver 18 allows 15 seconds for the LOGIN handshake. On the client's
+    # historian that was not enough: every connection died at exactly 15 s
+    # with HYT00 Login timeout expired, while a plain TCP connect to 1433
+    # from the same container returned instantly. The one connection that DID
+    # succeed during debugging carried `Login Timeout=30` -- and it also
+    # carried Encrypt=no, so two things changed at once and the success was
+    # credited to the wrong one. The timeout is the variable that matters.
+    import sqlalchemy as _sa
+
+    from das2.io import store as _store
+
+    seen = {}
+    real_create = _sa.create_engine
+
+    def _spy(url, **kw):
+        seen["connect_args"] = kw.get("connect_args")
+        return object() if str(url).startswith("mssql") else real_create(url, **kw)
+
+    _store.create_engine = _spy
+    try:
+        _store.make_engine("mssql+pyodbc://u:p@h:1433/d?driver=x")
+        check("SQL Server gets a login timeout",
+              (seen["connect_args"] or {}).get("timeout") == _store.DEFAULT_LOGIN_TIMEOUT_S,
+              f"({_store.DEFAULT_LOGIN_TIMEOUT_S}s, against the driver default of 15)")
+        check("and it is well clear of the 15 s that failed",
+              _store.DEFAULT_LOGIN_TIMEOUT_S >= 30)
+        _store.make_engine("sqlite:///x.db")
+        check("SQLite is not given one", seen["connect_args"] is None,
+              "(its driver has no such parameter and rejects it)")
+    finally:
+        _store.create_engine = real_create
+
     print("\nmigrations: SQLite is untouched, and still applies")
     sqlite_sql = render_migrations("sqlite")
     check("sqlite statements pass through verbatim",
