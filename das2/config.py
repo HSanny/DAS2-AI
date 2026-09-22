@@ -403,32 +403,36 @@ class DatabaseConfig:
         """
         The URL with the password removed, for logs and the check command.
 
-        Masking `self.password` is not enough. When the credentials arrive as
-        a whole `DAS2_DATABASE_URL` -- which is how the deployment guide
-        recommends configuring SQL Server -- that field is empty and the
-        password lives in the URL's userinfo, so it survived into every log
-        line that printed this. The userinfo is therefore rewritten
-        structurally, and `self.password` masked afterwards in case a value
-        also appears elsewhere in the string.
-        """
-        from urllib.parse import quote_plus, urlsplit, urlunsplit
+        Parsed with SQLAlchemy's own parser, NOT urllib's. They disagree, and
+        the disagreement cost hours: with a raw `@` in the password, urllib
+        splits the userinfo at the LAST `@` and SQLAlchemy at the FIRST, so
 
+            mssql+pyodbc://flotech:P@ssword1234@192.168.25.16:1433/anomaly_db
+
+        printed here as a healthy `flotech:***@192.168.25.16:1433/anomaly_db`
+        while the driver was handed `Server=ssword1234@192.168.25.16,1433`
+        and `PWD=P`. Every log line said the configuration was right about a
+        connection that had never reached the server.
+
+        A diagnostic that parses differently from the thing it describes is
+        worse than no diagnostic, so this now reports what will actually be
+        used -- host and all.
+        """
         url = self.sqlalchemy_url()
-        parts = urlsplit(url)
-        if parts.password:
-            host = parts.hostname or ""
-            if parts.port:
-                host = f"{host}:{parts.port}"
-            userinfo = f"{parts.username or ''}:***"
-            url = urlunsplit(parts._replace(netloc=f"{userinfo}@{host}"))
-        if self.password:
-            url = url.replace(self.password, "***")
-            url = url.replace(quote_plus(self.password), "***")
-        return url
+        try:
+            from sqlalchemy.engine.url import make_url
+            parsed = make_url(url)
+        except Exception:                                  # noqa: BLE001
+            return "<unparseable database URL>"
+        # SQLAlchemy's own masking, rather than substituting "***" and
+        # re-rendering: render_as_string percent-encodes whatever it is given,
+        # so an injected mask comes back as %2A%2A%2A.
+        return parsed.render_as_string(hide_password=True)
 
     def sqlalchemy_url(self) -> str:
         if self.url:
-            return _complete_pyodbc_url(self.url, self.driver, self.encrypt)
+            return _complete_pyodbc_url(_escape_userinfo(self.url),
+                                        self.driver, self.encrypt)
         from urllib.parse import quote_plus
         return (
             f"mssql+pyodbc://{quote_plus(self.username)}:{quote_plus(self.password)}"
@@ -436,6 +440,57 @@ class DatabaseConfig:
             f"?driver={quote_plus(self.driver)}&TrustServerCertificate=yes"
             f"&Encrypt={quote_plus(self.encrypt)}"
         )
+
+
+def _escape_userinfo(url: str) -> str:
+    """
+    Percent-escape a password that was written into the URL unescaped.
+
+    This is the defect that cost the client's deployment an evening. Their
+    password contains `@`:
+
+        mssql+pyodbc://flotech:P@ssword1234@192.168.25.16:1433/anomaly_db
+
+    SQLAlchemy's URL parser takes the password as `[^@]*`, so it stops at the
+    FIRST `@` and everything after it becomes the host. pyodbc was handed
+
+        Server=ssword1234@192.168.25.16,1433 ... PWD=P
+
+    and spent every run waiting on a host that does not exist, reporting
+
+        ('HYT00', '... Login timeout expired (0) (SQLDriverConnect)')
+
+    which is what an unreachable SERVER looks like -- so a plain TCP connect
+    to the real address succeeded while every login "timed out", and the
+    diagnosis went to the network, then to TLS, then to the timeout. None of
+    those were it.
+
+    The documentation said to percent-escape. Documentation that must be
+    followed for the system to work at all, whose breach presents as an
+    unrelated error, is not a safeguard. The last `@` separates userinfo from
+    host, so the split is unambiguous and the escaping can simply be done.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep or "@" not in rest:
+        return url
+
+    authority, slash, tail = rest.partition("/")
+    if "@" not in authority:
+        return url
+
+    userinfo, _, host = authority.rpartition("@")
+    if not userinfo:
+        return url
+
+    from urllib.parse import quote
+
+    user, colon, password = userinfo.partition(":")
+    # Already escaped, or nothing troublesome in it: leave it exactly as is.
+    if not colon or ("@" not in password and "%" in password) or "@" not in password:
+        return url
+
+    safe = quote(password, safe="")
+    return f"{scheme}://{quote(user, safe='')}:{safe}@{host}{slash}{tail}"
 
 
 def _complete_pyodbc_url(url: str, driver: str, encrypt: str = "yes") -> str:

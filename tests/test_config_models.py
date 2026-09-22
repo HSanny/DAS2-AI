@@ -180,6 +180,50 @@ def main():
                             encrypt="no").sqlalchemy_url()
     check("an Encrypt already in the URL is never overridden",
           "Encrypt=yes" in pinned and "Encrypt=no" not in pinned)
+    # ------------------------------------------------------------------ #
+    # The defect that cost an evening. The client's password contains `@`:
+    #
+    #   mssql+pyodbc://flotech:P@ssword1234@192.168.25.16:1433/anomaly_db
+    #
+    # SQLAlchemy parses the password as [^@]*, stopping at the FIRST `@`, so
+    # pyodbc received Server=ssword1234@192.168.25.16,1433 and PWD=P. Every
+    # run then waited on a host that does not exist and reported HYT00 Login
+    # timeout expired -- which is what an unreachable SERVER looks like. A
+    # plain TCP connect to the real address succeeded throughout, so the
+    # diagnosis went to the network, then TLS, then the login timeout.
+    print("\nconfig: a raw @ in the password does not become the hostname")
+    import sqlalchemy as _sa
+
+    raw = DatabaseConfig(
+        url="mssql+pyodbc://flotech:P@ssword1234@192.168.25.16:1433/anomaly_db")
+    parsed = _sa.engine.url.make_url(raw.sqlalchemy_url())
+    check("the host is the host", parsed.host == "192.168.25.16",
+          f"({parsed.host!r}; it was 'ssword1234@192.168.25.16')")
+    check("and the whole password survives", parsed.password == "P@ssword1234",
+          f"({parsed.password!r}; it was 'P')")
+
+    already = DatabaseConfig(
+        url="mssql+pyodbc://flotech:P%40ssword1234@192.168.25.16:1433/anomaly_db")
+    ap = _sa.engine.url.make_url(already.sqlalchemy_url())
+    check("a correctly escaped password is left alone",
+          ap.host == "192.168.25.16" and ap.password == "P@ssword1234")
+
+    many = DatabaseConfig(url="mssql+pyodbc://u:a@b@c@192.168.25.16:1433/d")
+    mp = _sa.engine.url.make_url(many.sqlalchemy_url())
+    check("several @ still split at the last one",
+          mp.host == "192.168.25.16" and mp.password == "a@b@c",
+          f"({mp.password!r})")
+
+    # urlsplit and SQLAlchemy disagree about where userinfo ends, and safe_url
+    # used the wrong one -- so every log line showed a healthy URL for a
+    # connection that had never reached the server. A diagnostic that parses
+    # differently from the thing it describes is worse than none.
+    check("safe_url reports the host that will actually be used",
+          "192.168.25.16" in raw.safe_url
+          and "ssword1234@" not in raw.safe_url,
+          raw.safe_url)
+    check("and still hides the password", "ssword1234" not in raw.safe_url)
+
     check("the default driver matches the one the Dockerfile installs",
           DatabaseConfig().driver == "ODBC Driver 18 for SQL Server",
           "(it said 17 for a while; the image has never carried 17)")
