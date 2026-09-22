@@ -250,6 +250,46 @@ def main():
     check("five sites within 800 m stay one cluster",
           len(clusters) == 1 and len(clusters[0].members) == 5)
 
+    # --- temporal chaining is bounded too ------------------------------------- #
+    print("\noverlap is transitive; SIMULTANEITY is not")
+    # One long-running fault whose window covers everything, plus three short
+    # unrelated ones that do not overlap each other. Single linkage on time
+    # chains all four through the long one.
+    bridge = [
+        anomaly("L", "BedokPS", "Pressure", start_min=0, dur_min=1200),
+        anomaly("s1", "BedokPond4", "Flowrate", start_min=100, dur_min=20),
+        anomaly("s2", "TampinesPS", "Pressure", start_min=600, dur_min=20),
+        anomaly("s3", "TampinesPS", "Flowrate", start_min=1100, dur_min=20),
+    ]
+    clusters = cluster_anomalies(bridge)
+    biggest = max((len(c.members) for c in clusters), default=0)
+    check("the four are NOT reported as one event", biggest < 4,
+          f"(largest cluster {biggest} of 4 -- on the fixture this shape made a "
+          f"19.7 h quantisation collapse absorb a stale sensor, a pump "
+          f"contradiction and a reverse-flow event into one P1 'regional "
+          f"event' that never happened)")
+    for c in clusters:
+        latest_start = max(m.start for m in c.members)
+        earliest_end = min(m.end for m in c.members)
+        check(f"every {len(c.members)}-member cluster shares a common instant",
+              latest_start - timedelta(minutes=30) <= earliest_end,
+              f"({latest_start:%H:%M} vs {earliest_end:%H:%M})")
+
+    print("\n  but genuinely simultaneous members still cluster")
+    together = [
+        anomaly("t1", "BedokPS", "Pressure", start_min=0, dur_min=1200),
+        anomaly("t2", "BedokPond4", "Flowrate", start_min=30, dur_min=1100),
+        anomaly("t3", "TampinesPS", "Pressure", start_min=60, dur_min=1000),
+    ]
+    clusters = cluster_anomalies(together)
+    check("three overlapping windows form one cluster",
+          len(clusters) == 1 and len(clusters[0].members) == 3,
+          f"({[len(c.members) for c in clusters]})")
+
+    check("nothing is lost to the time split",
+          sum(len(c.members) for c in cluster_anomalies(bridge))
+          + len(unclustered(bridge, cluster_anomalies(bridge))) == 4)
+
     # --- region gating is available, and has the cost the docs claim ---------- #
     print("\nregion gating is off by default, and this is why")
     # a region boundary drawn straight through one event

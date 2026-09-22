@@ -102,6 +102,15 @@ map. Chaining is bounded by the diameter cap instead, which is physical.
 `require_same_region` remains available for anyone who wants the stricter
 behaviour, with its measured cost recorded here.
 
+Chaining is bounded in TIME as well as space
+--------------------------------------------
+Overlap is transitive; simultaneity is not. If A overlaps B and B overlaps C,
+single linkage puts all three together even when A and C are nineteen hours
+apart -- which is not what "these went wrong together" claims, and is a
+reliable way to manufacture a severe incident out of unrelated faults. Members
+of a cluster are therefore required to share one common instant, not merely a
+chain of overlaps.
+
 Chaining is bounded by splitting, and splitting can refuse
 ----------------------------------------------------------
 Single linkage can chain (A near B, B near C, A far from C), which for a fault
@@ -317,6 +326,49 @@ def _bounded_components(members: list[int], compat: np.ndarray, dist: np.ndarray
     return out
 
 
+def _share_an_instant(members: list[SensorAnomaly], tolerance_min: int) -> bool:
+    """True when every member's window covers one common moment."""
+    gap = timedelta(minutes=tolerance_min)
+    latest_start = max(m.start for m in members)
+    earliest_end = min(m.end for m in members)
+    return latest_start - gap <= earliest_end + gap
+
+
+def _split_by_time(members: list[SensorAnomaly],
+                   tolerance_min: int) -> list[list[SensorAnomaly]]:
+    """
+    Partition a component into groups that are genuinely SIMULTANEOUS.
+
+    Time overlap is transitive under single linkage and simultaneity is not,
+    and the difference is not academic. Measured on the fixture: a
+    quantisation collapse whose window legitimately spans 19.7 hours overlapped
+    a stale sensor, a pump contradiction, a reverse-flow event and the real
+    four-sensor level shift -- none of which overlapped each other. Chained
+    together they formed one 8-member "REGIONAL_EVENT", scored P1, and would
+    have sent a crew to investigate an area event that never happened. Five
+    independent faults, presented as the most severe thing on the map.
+
+    So a cluster is required to share a common instant, which is what "these
+    happened together" actually claims. The greedy sweep below takes the
+    earliest-ending window, groups everything that has started by then, and
+    repeats -- the standard interval-stabbing construction, and it yields
+    groups each of which genuinely overlaps at a point.
+    """
+    if len(members) < 2 or _share_an_instant(members, tolerance_min):
+        return [members]
+
+    gap = timedelta(minutes=tolerance_min)
+    remaining = sorted(members, key=lambda m: m.end)
+    groups: list[list[SensorAnomaly]] = []
+    while remaining:
+        pivot = remaining[0].end + gap
+        group = [m for m in remaining if m.start - gap <= pivot]
+        groups.append(group)
+        keep = {id(m) for m in group}
+        remaining = [m for m in remaining if id(m) not in keep]
+    return groups
+
+
 def _centroid(members: list[SensorAnomaly]) -> tuple[float | None, float | None]:
     placed = [m.sensor for m in members if m.sensor.has_coords]
     if not placed:
@@ -374,17 +426,21 @@ def cluster_anomalies(anomalies: list[SensorAnomaly],
 
     clusters: list[Cluster] = []
     for comp in components:
-        members = [placed[i] for i in comp]
-        if len(members) < params.min_size:
-            continue
-        lat, lon = _centroid(members)
-        clusters.append(Cluster(
-            members=sorted(members, key=lambda m: -m.score),
-            region=_dominant_region(members),
-            centroid_lat=lat,
-            centroid_lon=lon,
-            radius_m=round(_radius(members, lat, lon), 1),
-        ))
+        # Spatial components are bounded by the diameter cap; they must also be
+        # bounded in TIME, or one long-running fault bridges every unrelated
+        # anomaly near it into a single severe-looking incident.
+        for members in _split_by_time([placed[i] for i in comp],
+                                      params.time_tolerance_min):
+            if len(members) < params.min_size:
+                continue
+            lat, lon = _centroid(members)
+            clusters.append(Cluster(
+                members=sorted(members, key=lambda m: -m.score),
+                region=_dominant_region(members),
+                centroid_lat=lat,
+                centroid_lon=lon,
+                radius_m=round(_radius(members, lat, lon), 1),
+            ))
 
     clusters.sort(key=lambda c: (-len(c.members), -max(m.score for m in c.members)))
     return clusters

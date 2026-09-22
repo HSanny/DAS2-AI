@@ -98,6 +98,21 @@ MIN_SHIFT_MAD = 6.0
 #: spikes, and `detect_spike` owns those.
 MIN_SUSTAIN_S = 1800.0
 
+#: A sensor producing more than this many level shifts in one window is
+#: DUTY-CYCLING, not faulting, and the detector abstains on it entirely.
+#:
+#: This is the gate the MAD test cannot provide. A pump's discharge flow is a
+#: square wave between 0 and its running rate, so the sliding shift statistic
+#: is exactly zero almost everywhere and jumps at each transition -- which
+#: makes its MAD zero, which silently disables the MAD gate altogether.
+#: Measured on the fixture the moment a duty-cycled pump was added:
+#: LEVEL_SHIFT went from 5 to 12, every new one a pump doing its job.
+#:
+#: A genuine step change is a one-off. Nine of them in three days is a
+#: schedule, and reporting a schedule as an anomaly is how an alerting system
+#: teaches its operators to ignore it.
+MAX_SHIFT_EVENTS = 3
+
 #: Candidate changes closer together than this are one event.
 MERGE_GAP_S = 1800.0
 
@@ -195,6 +210,10 @@ def detect_level_shift(ts: pd.Series, values: np.ndarray,
             groups[-1].append(int(c))
         else:
             groups.append([int(c)])
+
+    if len(groups) > MAX_SHIFT_EVENTS:
+        # Routine duty cycling. See MAX_SHIFT_EVENTS.
+        return []
 
     signals: list[Signal] = []
     for group in groups:

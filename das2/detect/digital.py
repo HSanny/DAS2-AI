@@ -44,6 +44,8 @@ abstains.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -289,23 +291,30 @@ def detect_run_state_inconsistent(run_ts: pd.Series, run_values: np.ndarray,
     if running_state <= 0:
         return []
 
-    # What this meter reads when the pump IS running and flow is present: the
-    # reference for "near zero". Taken from the meter's own behaviour rather
-    # than a configured range, which for flow is close to meaningless here.
-    positive = flow_values[np.isfinite(flow_values) & (flow_values > 0)]
-    if positive.size < 10:
-        return []
-    running_flow = float(np.median(positive))
-    if running_flow <= 0:
-        return []
-    floor = RUN_FLOW_FRACTION * running_flow
-
     # Last-observation-carried-forward: for each run sample, the most recent
     # flow reading at or before it.
     order = np.searchsorted(flow_seconds, run_seconds, side="right") - 1
     valid = order >= 0
     aligned = np.full(len(run_seconds), np.nan)
     aligned[valid] = flow_values[order[valid]]
+
+    # What this meter reads WHILE THE PUMP SAYS IT IS RUNNING. The reference
+    # has to be conditioned on the run state: taking the median of every
+    # positive reading instead lets the pump's off-periods dominate it, and on
+    # a pump that is idle half the time that median collapses toward the noise
+    # floor -- so "near zero" became "near zero flow", nothing ever cleared it,
+    # and the detector was silent on a fault it had been given directly.
+    #
+    # The median tolerates the fault being present in its own reference: a
+    # four-hour contradiction inside thirty-six hours of running does not move
+    # a median. A mean would.
+    while_running = aligned[(run_values == running_state) & np.isfinite(aligned)]
+    if while_running.size < 10:
+        return []
+    running_flow = float(np.median(while_running))
+    if running_flow <= 0:
+        return []
+    floor = RUN_FLOW_FRACTION * running_flow
 
     bad = (run_values == running_state) & np.isfinite(aligned) & (aligned <= floor)
     if not bad.any():
@@ -340,12 +349,151 @@ def detect_run_state_inconsistent(run_ts: pd.Series, run_values: np.ndarray,
     return signals
 
 
+#: Words marking a digital point as a pump/valve RUN state rather than some
+#: other status bit (a fault flag, a mode, a local/remote selector). Counting
+#: "the pump is running" against a flowmeter only means anything if the point
+#: really is a run state.
+RUN_STATE_WORDS = ("run", "running", "started", "on-status", "status")
+
+#: ...and words that mark a status point as something else entirely, checked
+#: first. "Pump1-Fault-Status" contains "status" but says nothing about whether
+#: the pump is turning.
+NOT_RUN_STATE_WORDS = ("fault", "alarm", "trip", "fail", "mode", "local",
+                       "remote", "auto", "available", "healthy", "comms")
+
+#: Words marking a flow meter as measuring what a pump discharges.
+DISCHARGE_WORDS = ("discharge", "delivery", "deliver", "outlet", "outflow",
+                   "out-flow", "export")
+
+#: Pump/unit identifier, so `Pump3-Run-Status` is paired with `Pump3` flow
+#: rather than with `Pump1`'s.
+_UNIT_PATTERN = re.compile(r"(?:pump|unit|p|set)\s*[-_ ]?(\d+)", re.IGNORECASE)
+
+
+def _unit_number(description: str) -> str | None:
+    match = _UNIT_PATTERN.search(description or "")
+    return match.group(1) if match else None
+
+
+def _is_run_state(description: str) -> bool:
+    text = (description or "").lower()
+    if any(word in text for word in NOT_RUN_STATE_WORDS):
+        return False
+    return any(word in text for word in RUN_STATE_WORDS)
+
+
+def _is_discharge_flow(description: str) -> bool:
+    text = (description or "").lower()
+    return any(word in text for word in DISCHARGE_WORDS)
+
+
+def find_pump_flow_pairs(sensors) -> list[tuple[str, str]]:
+    """
+    Pair each pump run-state signal with the flow meter on its discharge.
+
+    Returns `[(run_state_key, flow_key), ...]`.
+
+    This pairing is the reason RUN_STATE_INCONSISTENT needs a step of its own:
+    it is the only detector here that reads two different sensors, and nothing
+    in the feed declares which flowmeter belongs to which pump. The only place
+    that relationship exists is the description, so it is recovered from there
+    -- same site first, then a matching unit number, then a discharge word.
+
+    Deliberately conservative. Where a site has several pumps and one
+    unattributable flow meter, no pair is made: a wrong pairing would report a
+    contradiction between two instruments that were never meant to agree, and
+    a false "your pump is running dry" is exactly the wasted trip this system
+    exists to prevent.
+    """
+    import pandas as pd
+
+    runs, flows = [], []
+    for _, row in sensors.iterrows():
+        site = row.get("site")
+        if site is None or pd.isna(site) or not str(site):
+            continue
+        description = str(row.get("description") or "")
+        key, site = str(row["sensor_key"]), str(site)
+        equipment = str(row.get("equipment") or "")
+        signal_type = str(row.get("signal_type") or "")
+        kind = str(row.get("kind") or "")
+
+        if equipment == "Flowrate":
+            flows.append((key, site, description))
+        elif (signal_type.lower() == "digital" or kind == "status"
+              or equipment in ("Pump", "Valve", "DigitalStatus")):
+            if _is_run_state(description):
+                runs.append((key, site, description))
+
+    pairs: list[tuple[str, str]] = []
+    for run_key, site, run_description in runs:
+        same_site = [f for f in flows if f[1] == site]
+        if not same_site:
+            continue
+
+        unit = _unit_number(run_description)
+        if unit:
+            # A run state that names its unit may ONLY pair with a meter naming
+            # the same one. Falling back to "any discharge meter at this site"
+            # when no unit matches looks harmless and is not: on the fixture it
+            # paired Pump3's run state with Pump2's discharge meter, which
+            # would report a contradiction between two instruments that were
+            # never measuring the same thing -- a fabricated "your pump is
+            # running dry", which is exactly the wasted trip this system exists
+            # to prevent.
+            candidates = [f for f in same_site if _unit_number(f[2]) == unit]
+        else:
+            # No unit named, so the site's single discharge meter is the only
+            # reasonable reading of it.
+            candidates = [f for f in same_site if _is_discharge_flow(f[2])]
+
+        # Exactly one candidate, or the pairing is a guess. See the docstring.
+        if len(candidates) == 1:
+            pairs.append((run_key, candidates[0][0]))
+    return pairs
+
+
 def run_digital_checks(ts: pd.Series, values: np.ndarray,
                        profile: SensorProfile | None = None) -> list[Signal]:
-    """Every single-series digital detector. Cross-signal ones need pairing."""
+    """
+    Every SINGLE-series digital detector.
+
+    RUN_STATE_INCONSISTENT is not here: it compares a pump against its
+    flowmeter, so it needs the pairing from `find_pump_flow_pairs` and is run
+    separately by the pipeline.
+    """
     if len(values) == 0:
         return []
     signals: list[Signal] = []
     signals += detect_short_cycling(ts, values, profile)
     signals += detect_stuck_in_state(ts, values, profile)
     return signals
+
+
+def run_pump_flow_checks(sensors, series: dict) -> dict[str, list[Signal]]:
+    """
+    Every pump/flow contradiction in the fleet. Returns {run_state_key: [...]}.
+
+    Keyed on the run-state sensor, because that is the point an operator will
+    recognise -- but `detail` names the flowmeter too, since the whole finding
+    is that one of the two is wrong and the data cannot say which.
+    """
+    import pandas as pd
+
+    out: dict[str, list[Signal]] = {}
+    units = dict(zip(sensors["sensor_key"].astype(str),
+                     sensors.get("unit", pd.Series([""] * len(sensors)))))
+    for run_key, flow_key in find_pump_flow_pairs(sensors):
+        if run_key not in series or flow_key not in series:
+            continue
+        run_ts, run_values = series[run_key]
+        flow_ts, flow_values = series[flow_key]
+        signals = detect_run_state_inconsistent(
+            run_ts, run_values, flow_ts, flow_values,
+            unit=str(units.get(flow_key) or ""))
+        for signal in signals:
+            signal.detail["run_state_sensor"] = run_key
+            signal.detail["flow_sensor"] = flow_key
+        if signals:
+            out.setdefault(run_key, []).extend(signals)
+    return out

@@ -116,12 +116,40 @@ DEFINITIVE_INSTRUMENT_FAULTS: frozenset[AnomalyType] = frozenset({
     AnomalyType.DITHERING_DEAD,
 })
 
+#: Findings strong enough to alert even on an equipment class that is still
+#: marked `alertable: false`.
+#:
+#: The `alertable` flag exists to stop newly classified equipment from paging
+#: anyone before its false-positive rate has been seen -- full coverage put
+#: roughly four times as many sensors under detection, and admitting them all
+#: at once would bury the operator. It is the right default for a generic
+#: status bit.
+#:
+#: But Pump, Valve and DigitalStatus are all `alertable: false`, and they are
+#: exactly the classes the digital and cross-signal detectors were written for.
+#: Left as-is, a pump insisting it is running against a meter reading zero was
+#: detected, scored, put on the dashboard -- and silently prevented from ever
+#: reaching anyone, which makes the detector pointless.
+#:
+#: These types are exempt because their confidence does not depend on the
+#: equipment class being well understood. A contradiction between two
+#: instruments is a physical impossibility whatever they are attached to, and
+#: short cycling is a count of state changes, not a statistical inference.
+#: Everything else on those classes still waits its turn.
+ALWAYS_PAGEABLE_TYPES: frozenset["AnomalyType"] = frozenset()   # filled below
+
 #: Contradictions between two or more instruments. Physically impossible rather
 #: than statistically unusual, so they are never held for more evidence: the
 #: evidence is already conclusive, and only the culprit is unknown.
 CROSS_SIGNAL_TYPES: frozenset[AnomalyType] = frozenset({
     AnomalyType.MASS_BALANCE_VIOLATION,
     AnomalyType.RUN_STATE_INCONSISTENT,
+})
+
+ALWAYS_PAGEABLE_TYPES = CROSS_SIGNAL_TYPES | frozenset({
+    # Real, cumulative, expensive motor wear that no value-based detector can
+    # see, and which the client's own alarm feed shows happening now.
+    AnomalyType.SHORT_CYCLING,
 })
 
 

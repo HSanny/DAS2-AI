@@ -255,6 +255,21 @@ def build_fleet() -> list[SensorSpec]:
         fault="SHORT_CYCLING", fault_start_frac=0.35, fault_duration_h=3.0,
         fault_detail={"period_s": 180})
 
+    # --- a pump and the meter on its own discharge --------------------------
+    # RUN_STATE_INCONSISTENT is the second cross-signal detector, and it needs
+    # a pump paired with the flowmeter it feeds. Nothing in the feed declares
+    # that relationship, so the pairing is recovered from the descriptions --
+    # which means the fixture has to carry a pair whose names actually match,
+    # or the detector is never exercised at all.
+    add(description="TampinesPS-Pump1-Run-Status", equipment="Pump",
+        site="TampinesPS", rtu="1012", dt_s=60, base=0.0, noise=0.0, unit="",
+        rawtype=RAWTYPE_DIGITAL, fault="PUMP_RUN", fault_start_frac=0.55,
+        fault_duration_h=4.0)
+    add(description="TampinesPS-Pump1-Discharge-Flow", equipment="Flowrate",
+        site="TampinesPS", rtu="1012", dt_s=120, base=0.0, noise=0.05,
+        unit="L/s", fault="PUMP_FLOW", fault_start_frac=0.55,
+        fault_duration_h=4.0)
+
     # --- unplaceable sensor: dirty RTU, so no coordinates from the join ------
     add(description="UnknownSite-Mystery-Level", equipment="LevelSensor",
         site="UnknownSite", rtu="-1", dt_s=120, base=55.0, noise=0.8, unit="%")
@@ -363,6 +378,57 @@ def generate_series(spec: SensorSpec, start: datetime, end: datetime,
     if not clean and points:
         _inject_timestamp_defects(points, rng)
     return points
+
+
+#: The pump and the meter on its discharge, and the fault between them.
+PUMP_RUN = "TampinesPS-Pump1-Run-Status"
+PUMP_FLOW = "TampinesPS-Pump1-Discharge-Flow"
+PUMP_CYCLE_S = 4 * 3600.0          # 4 h on, 4 h off
+PUMP_RUNNING_FLOW = 24.0           # L/s when it is actually pumping
+PUMP_FAULT_START_FRAC = 0.55
+PUMP_FAULT_HOURS = 4.0
+
+
+def couple_pump(series: dict[str, list[tuple[datetime, float]]],
+                start: datetime, end: datetime, *, clean: bool = False) -> None:
+    """
+    Make the pump's run state and its discharge flow consistent, then break it.
+
+    Generated independently these two have no relationship, and the detector
+    would either see contradictions everywhere or nothing at all. Here the flow
+    follows the run state exactly -- pumping when the pump says it is running,
+    zero when it is not -- so the pair is consistent by construction.
+
+    Then, for four hours, the pump goes on reporting RUNNING while the meter
+    reads nothing. That contradiction is invisible to every single-sensor
+    detector: a pump that says it is running is unremarkable, and a flowmeter
+    reading zero is unremarkable. Only the two together are impossible.
+    """
+    if PUMP_RUN not in series or PUMP_FLOW not in series:
+        return
+
+    total_s = (end - start).total_seconds()
+    fault_start = start + timedelta(seconds=total_s * PUMP_FAULT_START_FRAC)
+    fault_end = fault_start + timedelta(hours=PUMP_FAULT_HOURS)
+
+    def running(when: datetime) -> bool:
+        elapsed = (when - start).total_seconds()
+        return (elapsed % (2 * PUMP_CYCLE_S)) < PUMP_CYCLE_S
+
+    series[PUMP_RUN] = [(t, 1.0 if running(t) else 0.0)
+                        for t, _ in series[PUMP_RUN]]
+
+    rebuilt = []
+    for t, value in series[PUMP_FLOW]:
+        noise = value - round(value)          # keep the generator's jitter
+        if not running(t):
+            rebuilt.append((t, max(0.0, abs(noise))))
+        elif not clean and fault_start <= t < fault_end:
+            # The pump insists it is running; the meter says otherwise.
+            rebuilt.append((t, max(0.0, abs(noise))))
+        else:
+            rebuilt.append((t, PUMP_RUNNING_FLOW + noise))
+    series[PUMP_FLOW] = rebuilt
 
 
 #: The tank's three signals, and the geometry that ties them together.
@@ -690,6 +756,7 @@ def main() -> None:
     series = {s.description: generate_series(s, start, end, rng, clean=args.clean)
               for s in fleet}
     couple_tank(series, start, clean=args.clean)
+    couple_pump(series, start, end, clean=args.clean)
 
     n_files = write_history(out, fleet, series, start, end)
     write_histcurr(out, fleet, end, series)

@@ -36,6 +36,7 @@ about the wiring rather than an inference about the water.
 from __future__ import annotations
 
 from das2.models import (
+    PROCESS_TYPES,
     CROSS_SIGNAL_TYPES,
     DEFINITIVE_INSTRUMENT_FAULTS,
     MAINTENANCE_TYPES,
@@ -125,7 +126,17 @@ def classify(cluster: Cluster, *,
         return IncidentClass.WEATHER_DRIVEN, why
 
     # --- 3. Area event ------------------------------------------------------ #
-    if len(members) >= REGIONAL_MIN_MEMBERS and len(sites) >= REGIONAL_MIN_SITES:
+    # An area event means the WATER moved, so it needs enough members whose
+    # anomaly is about a process rather than an instrument. Without this test,
+    # any three independent broken sensors at nearby sites whose windows happen
+    # to overlap are reported as a regional event -- and on the fixture that is
+    # exactly what happened: a quantisation collapse, a stale transmitter, a
+    # pump contradiction and a brief reverse flow, four unrelated faults with
+    # nothing in common but a shared instant, scored P2 and recommended for
+    # area investigation.
+    process_members = [m for m in members if m.dominant_type in PROCESS_TYPES]
+    if (len(members) >= REGIONAL_MIN_MEMBERS and len(sites) >= REGIONAL_MIN_SITES
+            and len(process_members) >= REGIONAL_MIN_MEMBERS):
         why.append(f"{len(members)} sensors across {len(sites)} sites "
                    f"({', '.join(sorted(sites))})")
         if len(equipment) > 1:

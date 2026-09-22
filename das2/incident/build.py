@@ -205,7 +205,14 @@ def build_incidents(clusters: list[Cluster], *, now: datetime,
     incidents = [
         build_incident(c, now=now,
                        neighbour_correlation=correlations.get(_cluster_key(c)),
-                       rainfall_mm=rainfall.get(str(c.region)))
+                       # Keyed on the CLUSTER, not the region. Region-level
+                       # rainfall is a whole-run total, and attaching it to
+                       # every incident in that region means a downpour at
+                       # 03:00 "explains" a level shift at 20:00. Measured on
+                       # the fixture: the genuine four-sensor regional event
+                       # was labelled WEATHER_DRIVEN and suppressed to P4 by
+                       # rain that fell at a different time of day.
+                       rainfall_mm=rainfall.get(_cluster_key(c)))
         for c in clusters
     ]
 
@@ -220,7 +227,7 @@ def build_incidents(clusters: list[Cluster], *, now: datetime,
         incidents.append(build_incident(
             solo, now=now,
             neighbour_correlation=correlations.get(anomaly.sensor.sensor_key),
-            rainfall_mm=rainfall.get(str(anomaly.sensor.region)),
+            rainfall_mm=rainfall.get(anomaly.sensor.sensor_key),
         ))
 
     incidents.sort(key=lambda i: -i.severity)

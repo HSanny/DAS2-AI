@@ -31,7 +31,7 @@ import pandas as pd
 
 from das2.config import Config
 from das2.detect.baseline import baseline_summary, score_window
-from das2.detect.digital import run_digital_checks
+from das2.detect.digital import run_digital_checks, run_pump_flow_checks
 from das2.detect.fusion import fuse_all, fusion_summary
 from das2.detect.health import run_health_checks
 from das2.detect.massbalance import balance_summary, find_groups, run_mass_balance
@@ -220,6 +220,19 @@ def run(config: Config, *, now: datetime | None = None,
         if signals:
             signals_by_sensor[str(key)] = (meta, signals)
 
+    # --- pump vs its own discharge flow -------------------------------------- #
+    # The other cross-signal detector. Needs pump-to-flowmeter pairing, which
+    # nothing in the feed declares, so it is recovered from the descriptions.
+    for run_key, pump_signals in run_pump_flow_checks(sensors, series).items():
+        meta = meta_by_key.get(run_key)
+        if meta is None:
+            continue
+        existing = signals_by_sensor.get(run_key)
+        if existing:
+            existing[1].extend(pump_signals)
+        else:
+            signals_by_sensor[run_key] = (meta, pump_signals)
+
     # --- mass balance: the one genuinely multivariate detector -------------- #
     # Grouped per site from level + inflow + outflow. Abstains wherever the
     # group is not actually a closed system, which the fit quality decides.
@@ -244,6 +257,7 @@ def run(config: Config, *, now: datetime | None = None,
     # --- rain context -------------------------------------------------------- #
     # Sourced from the client's own 188 rain gauges, which v1 discarded as
     # unclassified. No external API, no internet dependency.
+    provider = None
     if config.rain.enabled:
         provider = InternalRainGaugeProvider(readings, sensors)
         result.rainfall_by_region = provider.rainfall_by_region(
@@ -262,7 +276,14 @@ def run(config: Config, *, now: datetime | None = None,
     # classified equipment type accrues evidence before it is allowed to page
     # anyone -- the alternative, with coverage now ~4x wider than v1, is an
     # alert volume that gets the system switched off in a week.
-    pageable = [a for a in result.anomalies if a.sensor.alertable]
+    # An anomaly may page if its equipment class is trusted to alert, OR if the
+    # finding itself is strong enough not to need that -- see
+    # ALWAYS_PAGEABLE_TYPES. Without the second clause every digital and
+    # cross-signal detector is silenced, because Pump, Valve and DigitalStatus
+    # all start `alertable: false`.
+    from das2.models import ALWAYS_PAGEABLE_TYPES
+    pageable = [a for a in result.anomalies
+                if a.sensor.alertable or a.dominant_type in ALWAYS_PAGEABLE_TYPES]
     result.clusters = cluster_anomalies(pageable, params)
     result.loose = unclustered(pageable, result.clusters)
     result.stats["clustering"] = cluster_summary(result.clusters, result.loose)
@@ -294,9 +315,27 @@ def run(config: Config, *, now: datetime | None = None,
     log.info("correlation: %s", result.stats["correlation"])
 
     # --- incidents ------------------------------------------------------------ #
+    # Rainfall per incident, over ITS OWN window and near ITS OWN centroid.
+    # `rainfall_by_region` is a whole-run total kept for the dashboard header;
+    # using it to classify would let rain at any hour excuse an event at any
+    # other hour.
+    rainfall_by_cluster: dict[str, float] = {}
+    if config.rain.enabled and provider is not None and provider.available:
+        for cluster in result.clusters:
+            total = provider.rainfall_mm(cluster.centroid_lat, cluster.centroid_lon,
+                                         cluster.start, cluster.end)
+            if total is not None:
+                rainfall_by_cluster[",".join(sorted(cluster.sensor_keys))] = total
+        for anomaly in result.loose:
+            total = provider.rainfall_mm(anomaly.sensor.latitude,
+                                         anomaly.sensor.longitude,
+                                         anomaly.start, anomaly.end)
+            if total is not None:
+                rainfall_by_cluster[anomaly.sensor.sensor_key] = total
+
     candidates = build_incidents(result.clusters, now=now, loose=result.loose,
                                  correlations=result.correlations,
-                                 rainfall=result.rainfall_by_region)
+                                 rainfall=rainfall_by_cluster)
 
     if open_incidents:
         from das2.incident.build import reconcile

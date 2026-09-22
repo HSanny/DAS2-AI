@@ -104,9 +104,21 @@ def main():
               f"({sorted(event.cluster.equipment_types)})")
         check("it is placed in the East", str(event.cluster.region) == "East",
               f"({event.cluster.region})")
-        check("it outranks every other incident",
-              event.severity == max(i.severity for i in result.incidents),
-              f"(severity {event.severity})")
+        check("it is actionable, not suppressed", event.should_alert,
+              f"(severity {event.severity}, {event.priority.value})")
+        check("it is among the incidents actually sent",
+              any(i.incident_id == event.incident_id for i in result.alertable))
+        # Deliberately NOT asserting that it outranks everything. Once the
+        # fixture carried a pump insisting it was running against a meter
+        # reading zero, that scored higher -- and correctly so: a contradiction
+        # between two instruments is physically conclusive, whereas a
+        # 34-minute pressure dip across three sites is an inference. The
+        # earlier assertion encoded an assumption that held only while this was
+        # the only substantial finding in the fixture.
+        check("incidents are ordered by severity, worst first",
+              all(a.severity >= b.severity
+                  for a, b in zip(result.incidents, result.incidents[1:])),
+              f"({[round(i.severity, 1) for i in result.incidents]})")
         check("it tells the operator to investigate the area",
               "area" in event.recommendation.lower())
         check("it carries the evidence that justified that",
@@ -130,6 +142,15 @@ def main():
             if incident.incident_class is IncidentClass.WEATHER_DRIVEN:
                 check("weather-driven says do not dispatch",
                       "not dispatch" in incident.recommendation.lower())
+
+        print("\n  and rain is judged over the INCIDENT's window, not the run's")
+        weather = [i for i in result.incidents
+                   if i.incident_class is IncidentClass.WEATHER_DRIVEN]
+        check("the regional event is not excused by rain at another hour",
+              event.incident_class is IncidentClass.REGIONAL_EVENT
+              and event not in weather,
+              "(a whole-run rainfall total attached to every incident in the "
+              "region suppressed this genuine event to P4)")
 
         print("\nsensor faults are found and are dispatchable")
         faults = [i for i in result.incidents

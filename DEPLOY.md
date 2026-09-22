@@ -526,11 +526,29 @@ slope would be measuring which hour the window happened to start on.
   so every sensor at one site shares one point. Clustering answers "which
   *sites* went wrong together", which is the right granularity for dispatch but
   cannot resolve within a site.
+* **Pump-to-flowmeter pairing is name-based.** `RUN_STATE_INCONSISTENT` has to
+  know which meter sits on which pump's discharge, and nothing in the feed
+  declares that — it is recovered from the descriptions (`Pump1-Run-Status`
+  paired with `Pump1-Discharge-Flow`). Where a run state names its unit and no
+  meter at that site names the same one, **no pair is made**: a wrong pairing
+  would report a contradiction between instruments that were never measuring
+  the same thing. If your naming does not carry unit numbers, this detector
+  will pair less often than it could; the run log shows how many pairs were
+  found.
 * **Stuck-OFF pumps.** `STUCK_IN_STATE` only judges the active state. Within a
   72-hour window a seized-shut valve and a standby pump correctly sitting idle
   produce the identical signal, and the detector abstains rather than guessing.
   It becomes answerable once the profile job has weeks of history showing
   whether that pump normally runs.
+
+* **Severity is span-starved.** The severity blend weights "fraction of
+  instrument span" most heavily, because that is the one component comparable
+  between a 500 V bus and a 20 bar main — and the instrument spans are not in
+  the feed. Without them severity falls back to duration and coverage, so a
+  genuine three-site area event can score in the 40s and land at P3 rather than
+  P2. It is still alerted, and the ordering between incidents is still
+  meaningful; the absolute numbers are simply compressed. The commissioned
+  ranges below would fix this as well as the range checks.
 
 **The weakest input in the system** remains the per-equipment physical range
 limits. They are fleet-wide defaults — "Pressure 0–20" applied to every pressure
