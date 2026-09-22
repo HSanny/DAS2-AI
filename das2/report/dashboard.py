@@ -147,13 +147,33 @@ def build_payload(result) -> dict[str, Any]:
 
 #: OpenStreetMap's own tiles: no account, no key, no registration.
 #:
-#: The previous default was CARTO's basemap CDN, which has since started
-#: answering with tiles that read "API key required" -- so the map rendered
-#: perfectly and every tile was a notice instead of Singapore, which is a
-#: worse failure than no basemap at all because it looks like a bug in this
-#: page. OSM's tile policy is fine for an operations dashboard opened a few
-#: times an hour; a busy deployment, or an isolated network with its own tile
-#: server, should point DAS2_REPORT_MAP_TILE_URL somewhere else.
+#: Two defaults have now failed, differently, and neither failure was
+#: visible from the code:
+#:
+#:   CARTO's basemap CDN began answering with tiles that READ "API key
+#:   required", so the map drew perfectly out of error notices.
+#:
+#:   OSM answers 403 -- "not following the tile usage policy" -- to a page
+#:   opened from file://, because there is no Referer identifying the app.
+#:   Serving the output directory over HTTP is enough to satisfy it.
+#:
+#: Hence the tileerror handler below: whichever provider is configured, the
+#: page must stay readable when it refuses.
+#:
+#: Alternatives for DAS2_REPORT_MAP_TILE_URL, none of which I can reach from
+#: the machine this was written on, so all are unverified:
+#:
+#:   OneMap (Singapore Land Authority) -- the natural choice for a PUB
+#:   system: national coverage with canals, drains and reservoirs drawn
+#:   properly. Check whether it now wants a token.
+#:     https://www.onemap.gov.sg/maps/tiles/Default/{z}/{x}/{y}.png
+#:
+#:   Esri, which serves {z}/{y}/{x} -- note the order -- and has historically
+#:   allowed use without a key:
+#:     https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}
+#:
+#: On a network with no internet, an internal tile server is the only real
+#: answer; nothing public is reachable and no default can help.
 DEFAULT_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 DEFAULT_TILE_ATTRIBUTION = (
     '&copy; <a href="https://www.openstreetmap.org/copyright">'
@@ -230,6 +250,10 @@ _TEMPLATE = r"""<!DOCTYPE html>
   .kpi .l { font-size:12px; color:var(--muted); margin-top:2px; }
   .kpi.alarm .n { color:var(--accent); }
   #map { height:440px; border-radius:8px; z-index:0; }
+  /* No basemap: a plain ground so the markers read as positions on nothing,
+     rather than as a map that failed to finish drawing. */
+  #map.nobasemap { background:#eef1f5; }
+  #map.nobasemap .leaflet-tile-pane { display:none; }
   .note { font-size:12px; color:var(--muted); margin-top:10px; }
   table { border-collapse:collapse; width:100%; font-size:13px; }
   th, td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line);
@@ -390,13 +414,34 @@ if (!placed.length) {
 } else {
   try {
     const map = L.map("map").setView([1.3521, 103.8198], 11);
-    // OpenStreetMap's own tiles, which need no account and no key. This was
-    // CARTO's basemap CDN, which now answers with tiles that read "API key
-    // required" -- so the map rendered, and every tile was a notice instead
-    // of Singapore. Swappable via DAS2_REPORT_MAP_TILE_URL for an internal
-    // tile server, which is the right answer on an isolated network.
-    L.tileLayer(__TILE_URL__, {maxZoom: 19, attribution: __TILE_ATTRIBUTION__})
-      .addTo(map);
+    // The basemap, and a way out when it fails.
+    //
+    // Two providers have now failed differently: CARTO began serving tiles
+    // that read "API key required", and OpenStreetMap answers 403 to a page
+    // opened from file:// because there is no Referer to identify the app.
+    // Both produced a map made entirely of error tiles, which is worse than
+    // no basemap -- it reads as a bug in this page.
+    //
+    // So tile failures are counted, and past a handful the layer is dropped
+    // and the page says what happened. Markers, zoom, pan and popups all keep
+    // working; only the geography behind them is missing, which is exactly
+    // the state svgFallbackMap was written for. No provider's change of terms
+    // can make this page unreadable again.
+    const tiles = L.tileLayer(__TILE_URL__,
+      {maxZoom: 19, attribution: __TILE_ATTRIBUTION__});
+    let tileErrors = 0;
+    tiles.on("tileerror", () => {
+      if (++tileErrors < 5 || !map.hasLayer(tiles)) return;
+      map.removeLayer(tiles);
+      mapEl.classList.add("nobasemap");
+      document.getElementById("maphint").textContent =
+        "The tile provider refused (blocked, rate-limited or needs a key), " +
+        "so there is no basemap behind these positions — they are still " +
+        "exact. Opening this page over HTTP rather than from a file, or " +
+        "setting DAS2_REPORT_MAP_TILE_URL to an internal tile server, " +
+        "restores it.";
+    });
+    tiles.addTo(map);
 
     const group = [];
     placed.forEach(i => {

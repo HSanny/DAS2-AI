@@ -218,6 +218,15 @@ def main():
         check("an internal tile server can replace it",
               "tiles.internal" in custom.read_text(encoding="utf-8"),
               "(the right answer on a network with no internet)")
+        # Two providers have now failed differently -- CARTO wanting a key,
+        # OSM returning 403 to a file:// page with no Referer -- and each
+        # produced a map built entirely out of error tiles, which reads as a
+        # bug in this page. The page must survive the next one too.
+        check("tile failures drop the basemap rather than tiling errors",
+              "tileerror" in page and "removeLayer(tiles)" in page,
+              "(markers, zoom and popups keep working)")
+        check("and the page says what happened",
+              "no basemap behind these positions" in page)
         check("an HTML file is written", path.exists())
         html = path.read_text()
         check("it is self-contained enough to email", len(html) > 8_000,
