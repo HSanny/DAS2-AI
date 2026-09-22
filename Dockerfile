@@ -20,6 +20,31 @@ FROM python:3.11-slim
 #
 # ACCEPT_EULA=Y is required by Microsoft's package and the install hangs
 # waiting for input without it.
+#
+# libgssapi-krb5-2 IS NOT OPTIONAL AND IS NOT REDUNDANT. Read this before
+# removing it to tidy the list.
+#
+#   $ readelf -d libmsodbcsql-18.7.so.1.1 | grep NEEDED
+#     ... libodbcinst.so.2, libkrb5.so.3, libgssapi_krb5.so.2, ...
+#
+# The driver links against libgssapi_krb5.so.2, but Microsoft's package
+# declares only `libkrb5-3` in its Depends -- and libkrb5-3 does not depend on
+# libgssapi-krb5-2 (it is the other way round). So nothing in the image
+# declares a need for it. It used to arrive by accident, as a dependency of
+# libcurl4, pulled in by the `curl` above; `apt-get autoremove` after purging
+# curl then removed it again, since by then no installed package claimed it.
+#
+# The result was an image that built cleanly and could never connect, failing
+# at the first query with a message that points at the wrong file entirely:
+#
+#   Can't open lib '/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.7.so.1.1'
+#   : file not found
+#
+# That file is present. unixODBC reports "file not found" whenever dlopen()
+# fails for any reason, including an unresolved dependency of the library it
+# was asked to open, so the name in the error is the one thing that is NOT
+# missing. Naming the package explicitly makes it manually-installed and so
+# beyond autoremove's reach.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl gnupg ca-certificates tzdata \
     && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
@@ -30,6 +55,7 @@ https://packages.microsoft.com/debian/12/prod bookworm main" \
     && apt-get update \
     && ACCEPT_EULA=Y apt-get install -y --no-install-recommends \
         msodbcsql18 unixodbc-dev gcc g++ \
+        libgssapi-krb5-2 libkrb5-3 \
     && apt-get purge -y curl gnupg \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
@@ -45,6 +71,32 @@ WORKDIR /app
 # Dependencies before source, so editing code does not reinstall the world.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# --- prove the ODBC driver actually loads ----------------------------------
+# Installing the package is not evidence that the driver works. The image
+# above once built green and then failed at the first query, because the
+# driver's own dependency had been autoremoved -- a defect no amount of
+# reading the Dockerfile reveals and that only surfaces on a machine with a
+# SQL Server to point at.
+#
+# So load it here, at build time, with the same dlopen() the Driver Manager
+# uses. Two checks, because they fail for different reasons: the first that
+# odbcinst.ini registers the name the config expects (a missing entry gives
+# IM002), the second that the library and its whole dependency chain resolve
+# (a missing dependency gives "Can't open lib ... file not found").
+#
+# Neither needs a database, a password or a network. A broken image now fails
+# the build, on the machine doing the building, instead of at 3 a.m. in front
+# of whoever is deploying it.
+RUN python -c "\
+import ctypes, glob, sys, pyodbc; \
+want='ODBC Driver 18 for SQL Server'; \
+got=pyodbc.drivers(); \
+sys.exit('odbcinst.ini has no %r -- only %r' % (want, got)) if want not in got else None; \
+libs=sorted(glob.glob('/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-*.so*')); \
+sys.exit('driver library missing from /opt/microsoft/msodbcsql18/lib64') if not libs else None; \
+ctypes.CDLL(libs[-1]); \
+print('ODBC driver loads:', want, '->', libs[-1])"
 
 COPY das2/ ./das2/
 COPY migrations/ ./migrations/

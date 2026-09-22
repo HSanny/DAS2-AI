@@ -296,6 +296,7 @@ Editing `.env` needs a **restart**, not a rebuild. Editing code needs a
 | Symptom | Cause | Fix |
 |---|---|---|
 | `IM002 ... no default driver specified` | `DAS2_DATABASE_URL` has no `?driver=` | Now filled in automatically — if you still see it, rebuild the image |
+| `Can't open lib '...libmsodbcsql-18.*.so.*' : file not found` | A *dependency* of the driver is missing, not the file named | `docker compose build --no-cache` — the build now verifies the driver loads |
 | `Can't open lib 'ODBC Driver 18'` | Running outside the container | Use `docker compose run`, not bare python |
 | `cannot reach the database at ...` then exit 3 | DB settings wrong or server unreachable | `docker compose run --rm das2-check`; the run stops rather than alerting on stale state |
 | Input directory exists but empty | CIFS mount failed | `cifs-utils` on host; check credentials and share path |
