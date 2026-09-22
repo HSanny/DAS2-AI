@@ -559,6 +559,18 @@ class Config:
     #: expressed in time rather than in runs or samples.
     run_interval_minutes: int = 60
 
+    #: Minutes past the hour to run at, anchored to midnight rather than to
+    #: whenever the container started. With the default interval this means
+    #: HH:05 every hour, and a restart does not shift the schedule.
+    #:
+    #: Not cosmetic. The historian writes the hour's HISTORY file at HH:00:00
+    #: and HISTCURR at HH:00:02; a run that lands at HH:00:0x reads a file that
+    #: is still being written, which is how the first deployment died
+    #: (`EmptyDataError: No columns to parse from file`). Ingest now survives
+    #: that, but not reading a half-written file is better than recovering
+    #: from one.
+    run_at_minute: int = 5
+
     # ------------------------------------------------------------------ #
     # Loading
     # ------------------------------------------------------------------ #

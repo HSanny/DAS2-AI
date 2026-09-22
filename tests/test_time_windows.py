@@ -17,7 +17,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "docker_ready"))
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "docker_ready"))
+sys.path.insert(0, str(REPO))          # das2, for the scheduler assertions below
 import equipment_anomaly_pipeline_visual as det  # noqa: E402
 
 
@@ -105,6 +107,37 @@ def main():
               and legacy["cooldown"] == det.COOLDOWN)
     finally:
         det.USE_TIME_BASED_WINDOWS = True
+
+    print("\nthe scheduler runs on the clock, not on its own start time")
+    # The historian writes the hour's HISTORY file at HH:00:00 and HISTCURR at
+    # HH:00:02. Sleeping a fixed 60 minutes from whenever the container started
+    # drifts to an arbitrary phase, and a run landing at HH:00:0x reads a file
+    # still being written -- which is how the first deployment died, with
+    # EmptyDataError: No columns to parse from file.
+    from datetime import datetime as _dt
+    from das2.cli import next_run_at
+
+    check("an hourly run lands at 5 past, whenever it started",
+          next_run_at(_dt(2026, 9, 22, 17, 48, 51), 60, 5) == _dt(2026, 9, 22, 18, 5),
+          "(started 17:48 -> 18:05, not 18:48)")
+    check("a restart does not shift the schedule",
+          next_run_at(_dt(2026, 9, 22, 17, 3, 12), 60, 5)
+          == next_run_at(_dt(2026, 9, 22, 17, 4, 59), 60, 5) == _dt(2026, 9, 22, 17, 5))
+    check("the slot just reached is not repeated",
+          next_run_at(_dt(2026, 9, 22, 18, 5, 0), 60, 5) == _dt(2026, 9, 22, 19, 5),
+          "(landing exactly on it moves to the next, never sleeps 0)")
+    check("it rolls over midnight",
+          next_run_at(_dt(2026, 9, 22, 23, 50), 60, 5) == _dt(2026, 9, 23, 0, 5))
+    check("a sub-hourly interval keeps the offset",
+          next_run_at(_dt(2026, 9, 22, 17, 48), 15, 5) == _dt(2026, 9, 22, 17, 50),
+          "(:05 :20 :35 :50)")
+    check("offset 0 means on the hour",
+          next_run_at(_dt(2026, 9, 22, 17, 48), 30, 0) == _dt(2026, 9, 22, 18, 0))
+    check("the next slot is always in the future",
+          all(next_run_at(_dt(2026, 9, 22, 17, m, sec), 60, 5)
+              > _dt(2026, 9, 22, 17, m, sec)
+              for m in range(0, 60, 7) for sec in (0, 59)),
+          "(a non-positive sleep would spin the loop)")
 
     print("\nAll time-window tests passed.")
 

@@ -25,7 +25,8 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+import math
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from das2.config import Config, load_config
@@ -486,20 +487,55 @@ def _touch_heartbeat(config: Config) -> None:
             continue        # not fatal: a missing heartbeat must not stop a run
 
 
+def next_run_at(now: datetime, interval_min: int, offset_min: int) -> datetime:
+    """
+    The next wall-clock instant at `offset_min` past a whole `interval_min`.
+
+    Anchored to midnight, so with interval 60 and offset 5 the runs land at
+    HH:05 whatever time the container happened to start, and a restart does
+    not shift the schedule. Interval 15 with offset 5 gives :05 :20 :35 :50.
+
+    Why alignment matters here rather than merely being tidy: the historian
+    writes the hour's HISTORY file at HH:00:00 and HISTCURR at HH:00:02.
+    Sleeping a fixed 60 minutes from whenever the process started drifts to an
+    arbitrary phase, and a run that lands at HH:00:0x reads a file that is
+    still being written -- which is exactly how the first deployment died,
+    with `EmptyDataError: No columns to parse from file`. A few minutes past
+    the hour reads a file that has finished.
+    """
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes = (now - midnight).total_seconds() / 60.0
+    step = max(1, interval_min)
+    # How many whole intervals fit between the offset and now, then one more.
+    k = math.floor((minutes - offset_min) / step) + 1
+    nxt = midnight + timedelta(minutes=offset_min + k * step)
+    while nxt <= now:                       # guards a zero-length step
+        nxt += timedelta(minutes=step)
+    return nxt
+
+
 def cmd_schedule(config: Config, args) -> int:
     """
-    Run forever on an interval.
+    Run forever, on the clock.
 
     A failed run logs and waits for the next tick rather than exiting: a
     malformed CSV at 02:00 must not take the monitoring system down until
     somebody notices in the morning. The heartbeat is touched either way, since
     the process is alive and the failure is already in the log -- a healthcheck
     that restarts the container on a bad input file would just lose the log.
+
+    The first run happens immediately, so starting the container tells you
+    within minutes whether it works; every run after that is aligned.
     """
     interval = args.interval_minutes or config.run_interval_minutes
-    print(f"Scheduler started — a run every {interval} minute(s). Ctrl-C to stop.")
+    offset = getattr(args, "at_minute", None)
+    if offset is None:
+        offset = getattr(config, "run_at_minute", 5)
+    offset = int(offset) % max(1, interval)
+
+    print(f"Scheduler started — a run every {interval} minute(s), "
+          f"at {offset} minute(s) past. Ctrl-C to stop.")
     while True:
-        started = time.time()
         try:
             cmd_run(config, args)
         except KeyboardInterrupt:
@@ -508,9 +544,12 @@ def cmd_schedule(config: Config, args) -> int:
         except Exception:                                  # noqa: BLE001
             log.exception("run failed — continuing to the next interval")
         _touch_heartbeat(config)
-        elapsed = time.time() - started
-        sleep_for = max(30.0, interval * 60 - elapsed)
-        log.info("next run in %.0f minute(s)", sleep_for / 60)
+
+        now = datetime.now()
+        nxt = next_run_at(now, interval, offset)
+        sleep_for = (nxt - now).total_seconds()
+        log.info("next run at %s (in %.0f minute(s))",
+                 nxt.strftime("%H:%M"), sleep_for / 60)
         time.sleep(sleep_for)
 
 
@@ -584,6 +623,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sched = sub.add_parser("schedule", help="run on an interval, forever")
     sched.add_argument("--interval-minutes", type=int, default=None)
+    sched.add_argument("--at-minute", type=int, default=None,
+                       help="minutes past the hour to run at "
+                            "(default 5, so the hourly export has landed)")
     sched.add_argument("--dry-run", action="store_true")
     sched.add_argument("--no-alert", action="store_true")
 
