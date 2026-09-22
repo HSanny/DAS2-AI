@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -139,10 +139,29 @@ def run(config: Config, *, now: datetime | None = None,
     result = RunResult(run_id=run_id, started_at=now)
 
     # --- ingest ------------------------------------------------------------- #
+    # The window is a HARD limit on what is read, not a filter applied after.
+    #
+    # This was omitted, and `load_all` defaults to `since=None`, so every run
+    # read every HISTORY file in the directory. On the fixture that is
+    # invisible -- it holds exactly 72 hours -- but the client's share holds
+    # 10,334 hourly files, about 431 days, which is roughly 1.1 BILLION rows
+    # against the 7.9 million a 72-hour window wants: 144x more data than the
+    # analysis asks for, read into pandas on every run.
+    #
+    # DAS2_INGEST_WINDOW_HOURS was therefore documented, configurable, and
+    # completely inert -- the same defect DAS2_RUN_INTERVAL_MINUTES had.
+    #
+    # grace_minutes is subtracted as well because the share lags wall clock:
+    # the file for the current hour may not have landed, and reaching exactly
+    # `window_hours` back would silently analyse one hour less than asked.
+    since = now - timedelta(hours=config.ingest.window_hours,
+                            minutes=config.ingest.grace_minutes)
+    log.info("window: %s -> %s (%d h)", since, now, config.ingest.window_hours)
     readings, sensors, report = load_all(
         config.ingest.history_dir,
         config.ingest.inventory_path,
         config.ingest.longlat_path,
+        since=since,
     )
     result.readings, result.sensors = readings, sensors
     result.stats["ingest"] = report.as_dict() if hasattr(report, "as_dict") else vars(report)

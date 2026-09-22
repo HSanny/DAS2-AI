@@ -234,9 +234,17 @@ def read_history_dir(directory: str | Path, *, pattern: str = "*HISTORY*.csv",
         files = [f for f in files
                  if (ts := filename_timestamp(f)) is None or ts >= since]
     if not files:
-        raise FileNotFoundError(
-            f"No HISTORY files matched {os.path.join(str(directory), pattern)}"
-        )
+        where = os.path.join(str(directory), pattern)
+        if since is not None:
+            raise FileNotFoundError(
+                f"No HISTORY files at or after {since:%Y-%m-%d %H:%M} under "
+                f"{where}. Files exist but all predate the window, so the feed "
+                f"has stalled -- analysing older data as though it were current "
+                f"is worse than not running."
+                if glob.glob(where) else
+                f"No HISTORY files matched {where}"
+            )
+        raise FileNotFoundError(f"No HISTORY files matched {where}")
 
     # One unreadable file must not take the monitoring system down.
     #

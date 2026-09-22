@@ -80,6 +80,52 @@ def main():
     check("sensor keys unique", inv["sensor_key"].is_unique,
           "(no Hkey collisions -- verified on the real inventory)")
 
+    print("\nthe window is a HARD limit on what is read, not a later filter")
+    # pipeline.run called load_all without `since`, which defaults to None, so
+    # every run read EVERY file in the directory. Invisible on the fixture,
+    # which holds exactly 72 hours -- and 10,334 files on the client's share,
+    # about 431 days, roughly 1.1 billion rows against the 7.9 million a
+    # 72-hour window wants. DAS2_INGEST_WINDOW_HOURS was documented,
+    # configurable and completely inert.
+    import tempfile as _tf
+    from datetime import timedelta as _td
+    from das2.io.ingest import IngestReport, read_history_dir
+    hdr = ("ROW_ID;IPADDRESS;DESCRIPTION;TAGNAME;RTUNUMBER;RAWTYPE;"
+           "POINTTYPE;DATETIME;CURRVALUE")
+    base = datetime(2026, 9, 22, 14, 0, 0)
+    with _tf.TemporaryDirectory() as td:
+        d = Path(td)
+        for i in range(200):                      # 200 hourly files, >8 days
+            t = base - _td(hours=i)
+            stamp = t.strftime("%Y%b%d-%H%M%S")
+            row = (f"1;10;S;T1;1010;1;22;{t.month}/{t.day}/{t.year} "
+                   f"{t.strftime('%I:%M:%S %p')};4.2")
+            (d / f"hts_2026_09_HISTORY_{stamp}.csv").write_text(f"{hdr}\n{row}\n")
+
+        rep = IngestReport()
+        read_history_dir(d, report=rep)
+        check("without a window every file is read", rep.history_files == 200,
+              "(this was the bug: 144x the intended data on the real share)")
+
+        rep = IngestReport()
+        read_history_dir(d, since=base - _td(hours=72), report=rep)
+        check("a 72h window reads only that window", rep.history_files == 73,
+              f"({rep.history_files} files, not 200)")
+
+        rep = IngestReport()
+        read_history_dir(d, since=base - _td(hours=24), report=rep)
+        check("and the limit tracks the setting", rep.history_files == 25,
+              f"({rep.history_files})")
+
+        try:
+            read_history_dir(d, since=base + _td(days=5))
+            stalled = ""
+        except FileNotFoundError as e:
+            stalled = str(e)
+    check("a feed entirely older than the window fails loudly",
+          "stalled" in stalled,
+          "(analysing stale data as current is worse than not running)")
+
     print("\none unreadable HISTORY file does not take the run down")
     # The share is written hourly, so the newest file is routinely mid-write
     # and arrives as zero bytes. pandas answers that with "No columns to parse
