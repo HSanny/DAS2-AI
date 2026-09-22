@@ -45,7 +45,7 @@ falls back to a drawn-from-coordinates view when the tile CDN is unreachable.
 
 ---
 
-## 2. Get the code and lay out the data
+## 2. Get the code
 
 ```bash
 git clone <your-repo-url> das2-ai
@@ -53,33 +53,69 @@ cd das2-ai
 git checkout claude/eloquent-knuth-54nxvy
 ```
 
-The container expects the historian's export in **this shape**:
+## 2b. The historian's share
+
+`HISTORY` and `HISTCURR` are mounted straight off `\\<host>\dds_share` over
+CIFS, read-only, using the same volume definitions as the previous deployment.
+
+**The host needs `cifs-utils`** — the Docker daemon does the mounting, not the
+container:
+
+```bash
+sudo apt install cifs-utils        # Debian/Ubuntu
+```
+
+Credentials come from `.env` as `DAS_VM_USERNAME`, `DAS_VM_PASSWORD` and
+`DAS_MSSQL_HOST`, which are the names the old deployment already used, so
+existing values carry over.
+
+**`LongLat.csv` is not on the share.** It is a one-off export rather than an
+hourly one, so it comes from a local folder:
+
+```bash
+mkdir -p ./config
+cp /path/to/LongLat.csv ./config/
+```
+
+Without it the system runs and still finds faults, but there is no map, no
+geo-clustering and no "by region" view — which is most of what it was built
+for. `das2-check` reports its absence as a FAIL rather than letting it pass
+quietly.
+
+**`HISTALMEVT` is deliberately not mounted.** SCADA alarms are out of scope by
+your own decision and nothing in `das2/` reads them; mounting a share the code
+never opens is one more thing to break at 3 a.m. The volume definition is in
+`docker-compose.yml`, commented, if that changes.
+
+### Two CIFS specifics worth knowing
+
+**The password is visible in the volume definition.** `docker volume inspect
+hist_history` prints it. That is how compose CIFS volumes work. If it matters,
+switch to a credentials file — `o: "credentials=/etc/das2-cifs.cred,vers=3.0,ro,..."`
+with the file readable only by root on the host.
+
+**This image runs as a non-root user (uid 10001)**, which the previous one may
+not have. `noperm` plus the 0777 modes should make that a non-issue, but if
+reads fail with "Permission denied", add `uid=10001,gid=10001` to the mount
+options. That is the fix — not chmod on the share.
+
+### The failure mode to expect
+
+A CIFS mount with wrong credentials or a wrong path **still appears as a
+directory**. It is simply empty, and a run against it finds no readings and
+looks exactly like a quiet network. `das2-check` calls this out specifically:
 
 ```
-<your data folder>/
-├── HISTORY/
-│   ├── hts_2026_09_HISTORY_2026Sep20-210000.csv
-│   ├── hts_2026_09_HISTORY_2026Sep20-220000.csv
-│   └── ...                                   one file per hour
-├── HISTCURR/
-│   └── histcurr_fujitsu.csv                  the sensor inventory
-└── LongLat.csv                               RTU coordinates
+  [FAIL] history directory is not empty  — the directory exists but contains
+         NOTHING. On a CIFS mount that usually means wrong credentials, a wrong
+         share path, or cifs-utils missing on the host -- not a missing folder.
 ```
 
-Three notes, each of which has already caused a failure:
+To look for yourself:
 
-* **`LongLat.csv` is not optional.** It is the only source of coordinates. With­
-  out it there is no map, no geo-clustering and no "by region" view — the
-  system still runs and still finds faults, but the thing you actually asked
-  for is missing.
-* **`HISTCURR` must be the live format** — semicolon-separated with nine
-  columns (`ROW_ID;IPADDRESS;DESCRIPTION;TAGNAME;RTUNUMBER;RAWTYPE;POINTTYPE;DATETIME;CURRVALUE`)
-  and US 12-hour timestamps like `9/20/2026 9:00:00 PM`. The older
-  comma-separated six-column file will be rejected with a message saying so.
-* If your export is laid out differently, do not move the files — point the
-  paths at it in `.env` instead (step 3).
-
----
+```bash
+docker compose run --rm das2 ls -la /data/input/HISTORY
+```
 
 ## 3. Configure
 

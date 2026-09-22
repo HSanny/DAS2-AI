@@ -70,15 +70,45 @@ def cmd_check(config: Config, args) -> int:
 
     print("\nInput data")
     history = Path(config.ingest.history_dir)
-    files = sorted(history.glob("*HISTORY*.csv")) if history.is_dir() else []
     report("history directory exists", history.is_dir(), str(history))
-    report("history CSVs present", bool(files),
-           f"{len(files)} file(s)" if files else "no *HISTORY*.csv found")
+
+    # A CIFS mount that failed authentication or pointed at the wrong path
+    # still APPEARS as a directory -- it is simply empty. That is the single
+    # most common way this goes wrong, and "directory exists" alone would pass
+    # it straight through to a run that finds no readings and looks like a
+    # quiet network. So an existing-but-empty directory is called out as its
+    # own failure, with the likely cause.
+    if history.is_dir():
+        entries = list(history.iterdir())
+        files = sorted(history.glob("*HISTORY*.csv"))
+        if not entries:
+            report("history directory is not empty", False,
+                   "the directory exists but contains NOTHING. On a CIFS mount "
+                   "that usually means wrong credentials, a wrong share path, "
+                   "or cifs-utils missing on the host -- not a missing folder. "
+                   "Check: docker compose run --rm das2 ls -la "
+                   f"{history}")
+        else:
+            report("history directory is not empty", True,
+                   f"{len(entries)} entr(ies)")
+            report("history CSVs present", bool(files),
+                   f"{len(files)} file(s)" if files
+                   else f"{len(entries)} entries but no *HISTORY*.csv — "
+                        f"wrong folder?")
+            if files:
+                newest = max(files, key=lambda f: f.stat().st_mtime)
+                age_h = (time.time() - newest.stat().st_mtime) / 3600.0
+                report("the feed is current", age_h < 6,
+                       f"newest file is {age_h:.1f} h old ({newest.name})")
+    else:
+        report("history CSVs present", False, "directory not mounted")
+
     inventory = Path(config.ingest.inventory_path)
     report("inventory file exists", inventory.exists(), str(inventory))
     longlat = Path(config.ingest.longlat_path) if config.ingest.longlat_path else None
     report("LongLat.csv exists", bool(longlat and longlat.exists()),
-           str(longlat) if longlat else "not configured — the map will be empty")
+           str(longlat) if longlat
+           else "not configured — no map, no geo-clustering, no by-region view")
 
     print("\nDatabase")
     try:

@@ -25,20 +25,28 @@ x-common: &common
   env_file: [.env]
   restart: unless-stopped
   volumes:
-    # The historian's export, READ ONLY. This system has no business writing
-    # to the share it reads from, and :ro makes that structural rather than a
-    # promise.
-    - ${DAS2_DATA_DIR:-./data}:/data/input:ro
+    # The historian's export, mounted straight off the CIFS share and READ
+    # ONLY -- `ro` in the mount options AND `:ro` here. This system has no
+    # business writing to the share it reads from, and saying so twice makes it
+    # structural rather than a promise.
+    - hist_history:/data/input/HISTORY:ro
+    - hist_histcurr:/data/input/HISTCURR:ro
+    # LongLat.csv is NOT on the share -- it is a one-off export, not an hourly
+    # one -- so it comes from a local folder. Without it there is no map, no
+    # geo-clustering and no "by region" view, which is most of what this system
+    # was built for, so it is mounted explicitly rather than hidden inside the
+    # data directory.
+    - ${DAS2_CONFIG_DIR:-./config}:/data/config:ro
     # Dashboards and PNGs. Mounted out so they survive a container rebuild and
     # can be served by whatever already serves files on your network.
     - ${DAS2_OUTPUT_DIR:-./output}:/data/output
     - ${DAS2_LOG_DIR:-./logs}:/data/logs
   environment:
-    # Paths INSIDE the container. These point at the read-only mount above;
-    # change the left-hand side of the volume mapping, not these.
+    # Paths INSIDE the container. These point at the read-only mounts above;
+    # change the volume definitions at the bottom of this file, not these.
     DAS2_INGEST_HISTORY_DIR: /data/input/HISTORY
     DAS2_INGEST_HISTCURR_PATH: /data/input/HISTCURR/histcurr_fujitsu.csv
-    DAS2_INGEST_LONGLAT_PATH: /data/input/LongLat.csv
+    DAS2_INGEST_LONGLAT_PATH: /data/config/LongLat.csv
     DAS2_REPORT_OUTPUT_DIR: /data/output
   logging:
     # Without this, a container running for months fills the disk with logs and
@@ -110,3 +118,58 @@ services:
     restart: "no"
     command: ["python", "-m", "das2.cli", "run", "--dry-run"]
     profiles: ["tools"]
+
+
+# ===========================================================================
+# CIFS volumes: the historian's export on \\<host>\dds_share
+# ===========================================================================
+# Mounted by the Docker daemon, not by the container, so the host needs
+# `cifs-utils` installed but the container needs nothing.
+#
+# Credentials come from .env as DAS_VM_USERNAME / DAS_VM_PASSWORD and the host
+# from DAS_MSSQL_HOST -- the same names the previous deployment used, so the
+# existing .env values carry over unchanged.
+#
+# TWO THINGS WORTH KNOWING
+#
+# 1. The password ends up in the volume definition, which means
+#    `docker volume inspect hist_history` prints it. That is how CIFS volumes
+#    work in compose; if it matters, use a credentials file instead:
+#        o: "credentials=/etc/das2-cifs.cred,vers=3.0,ro,..."
+#    with the file readable only by root on the host.
+#
+# 2. This image runs as a NON-ROOT user (uid 10001), which the previous one may
+#    not have. `noperm` plus 0777 modes should make that a non-issue, but if
+#    reads fail with "Permission denied", add `uid=10001,gid=10001` to the
+#    options below -- that is the fix, not chmod on the share.
+#
+# HISTALMEVT is deliberately NOT mounted. The SCADA alarm feed is out of scope
+# by your own decision ("old scada alarm events are useless and no value in
+# this new detection"), and nothing in das2/ reads it. Mounting a share the
+# code never opens would only be one more thing to break at 3 a.m. Uncomment
+# the block at the end if that decision changes.
+volumes:
+  hist_history:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${DAS_VM_USERNAME},password=${DAS_VM_PASSWORD},vers=3.0,ro,noperm,file_mode=0777,dir_mode=0777"
+      device: "//${DAS_MSSQL_HOST}/dds_share/HISTORY"
+
+  hist_histcurr:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${DAS_VM_USERNAME},password=${DAS_VM_PASSWORD},vers=3.0,ro,noperm,file_mode=0777,dir_mode=0777"
+      device: "//${DAS_MSSQL_HOST}/dds_share/HISTCURR"
+
+  # Only needed if SCADA alarms come back into scope. Add
+  #     - hist_histalmevt:/data/input/HISTALMEVT:ro
+  # to the volumes list above as well if you enable it.
+  #
+  # hist_histalmevt:
+  #   driver: local
+  #   driver_opts:
+  #     type: cifs
+  #     o: "username=${DAS_VM_USERNAME},password=${DAS_VM_PASSWORD},vers=3.0,ro,noperm,file_mode=0777,dir_mode=0777"
+  #     device: "//${DAS_MSSQL_HOST}/dds_share/HISTALMEVT"
