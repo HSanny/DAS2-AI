@@ -118,7 +118,12 @@ def main() -> int:
 
     def _spy(url, **kw):
         seen["connect_args"] = kw.get("connect_args")
-        return object() if str(url).startswith("mssql") else real_create(url, **kw)
+        if str(url).startswith("mssql"):
+            # A real engine, not a sentinel: make_engine attaches the bulk-insert
+            # listener (see test_reading_persistence.py) and an `object()` has no
+            # events to attach it to.
+            return real_create("sqlite:///:memory:")
+        return real_create(url, **kw)
 
     _store.create_engine = _spy
     try:

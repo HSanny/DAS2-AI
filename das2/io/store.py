@@ -103,8 +103,26 @@ def make_engine(url: str, *, echo: bool = False,
     kwargs: dict = {}
     if url.startswith("mssql+pyodbc:") and login_timeout_s:
         kwargs["connect_args"] = {"timeout": int(login_timeout_s)}
-    return create_engine(url, echo=echo, pool_pre_ping=True, future=True,
-                         **kwargs)
+    engine = create_engine(url, echo=echo, pool_pre_ping=True, future=True,
+                           **kwargs)
+
+    # Bulk inserts, or das2_reading takes all night.
+    #
+    # Without this, pyodbc sends an executemany as one round trip PER ROW. The
+    # client's first scheduled run wrote 5,627,250 readings at 165 rows a
+    # second and took NINE AND A HALF HOURS -- so the 19:05 through 04:05 runs
+    # never happened, and the system managed two runs in a day instead of
+    # twenty-four. fast_executemany packs the parameters into arrays and sends
+    # them in blocks.
+    if url.startswith("mssql+pyodbc:"):
+        from sqlalchemy import event
+
+        @event.listens_for(engine, "before_cursor_execute")
+        def _bulk(conn, cursor, statement, parameters, context, executemany):
+            if executemany:
+                cursor.fast_executemany = True
+
+    return engine
 
 
 def _split_statements(sql: str) -> list[str]:
@@ -791,6 +809,36 @@ def _float_or_none(value) -> float | None:
 # --------------------------------------------------------------------------- #
 # Time-of-day baselines, written by the daily profile job
 # --------------------------------------------------------------------------- #
+def _as_datetime(value):
+    """
+    A datetime from whatever the driver returned for MAX(ts).
+
+    SQL Server hands back a real datetime; SQLite stores timestamps as TEXT
+    and hands back a string. Subtracting a timedelta from that string raises,
+    and the caller's except swallowed it -- so the incremental filter silently
+    did nothing on SQLite and the whole window was re-sent, which is exactly
+    the behaviour it was written to remove. A test now proves the reduction
+    rather than the intent.
+    """
+    if value is None or isinstance(value, datetime):
+        return value
+    try:
+        import pandas as pd
+        parsed = pd.to_datetime(value, errors="coerce")
+        return None if parsed is None or parsed is pd.NaT else parsed.to_pydatetime()
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+#: How far back before the newest stored reading to re-offer rows.
+#:
+#: 12% of sensors in this feed carry out-of-order timestamps, so a reading for
+#: 14:03 can arrive after one for 14:07. Filtering strictly on MAX(ts) would
+#: drop those permanently. An hour of overlap catches them, and the duplicate
+#: guard makes re-sending the rest harmless.
+LATE_ARRIVAL_GRACE_HOURS = 1
+
+
 def save_readings(engine: Engine, readings, *, chunk: int = 5000) -> int:
     """
     Persist this run's readings, so the daily job has history to work from.
@@ -808,6 +856,39 @@ def save_readings(engine: Engine, readings, *, chunk: int = 5000) -> int:
     """
     if readings is None or len(readings) == 0:
         return 0
+
+    # Only the tail. This is the difference between a run and an overnight job.
+    #
+    # Each run re-reads the whole 72-hour window, so consecutive runs overlap
+    # by 71 of 72 hours and ~98.6% of what arrives here is already stored.
+    # Sending all of it and letting NOT EXISTS discard the duplicates makes the
+    # database do 5.6 million index lookups an hour to keep 78,000 rows. On the
+    # client's first scheduled run that took nine and a half hours, and the
+    # next nine hourly runs simply never happened.
+    #
+    # The overlap below is deliberate: filtering strictly on MAX(ts) would drop
+    # any reading that arrives late for an hour already written, and this feed
+    # has out-of-order timestamps in 12% of sensors. An hour of slack lets
+    # those through, and NOT EXISTS still makes re-sending them harmless.
+    try:
+        with engine.connect() as conn:
+            last = conn.execute(
+                text("SELECT MAX(ts) FROM das2_reading")).scalar()
+        last = _as_datetime(last)
+        if last is not None:
+            cutoff = last - timedelta(hours=LATE_ARRIVAL_GRACE_HOURS)
+            before = len(readings)
+            readings = readings[readings["ts"] > cutoff]
+            log.info("readings to persist: %d of %d (the rest predate %s "
+                     "and are already stored)",
+                     len(readings), before, cutoff)
+            if len(readings) == 0:
+                return 0
+    except Exception as exc:                              # noqa: BLE001
+        # A first run has no table content to compare against, and a failed
+        # probe must not stop the write -- it only costs the old behaviour.
+        log.debug("could not read the last stored reading (%s); "
+                  "persisting the whole window", str(exc)[:120])
 
     rows = [
         {"sensor_key": str(r["sensor_key"]),
