@@ -381,10 +381,30 @@ def _load_offset() -> int:
 
 
 def _save_offset(offset: int) -> None:
+    """
+    Persist the getUpdates offset, atomically.
+
+    The obvious `write_text` is not atomic: it truncates the file and then
+    writes, so for a moment the offset file exists and is EMPTY. That window
+    is small but it recurs, because this is called after every poll cycle --
+    once a second against a responsive server, for as long as the bot runs.
+
+    Two things fall into it. A reader that happens to look in that moment gets
+    "", which is what made the feedback test fail about one run in eight with
+    the correct value already on disk. Worse, a container killed in that
+    window leaves an empty file behind, `_load_offset` reads 0, and the bot
+    replays every acknowledgement Telegram still holds -- re-answering
+    callbacks operators dealt with days ago.
+
+    Writing to a sibling and renaming makes the replacement atomic on POSIX,
+    so the file is only ever the old value or the new one.
+    """
     try:
         p = Path(FEEDBACK_OFFSET_FILE)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(str(int(offset)))
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(str(int(offset)))
+        os.replace(tmp, p)
     except Exception as e:
         logger.warning(f"Could not persist getUpdates offset: {e}")
 

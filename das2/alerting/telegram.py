@@ -219,14 +219,36 @@ class TelegramClient:
 
     def send_photo(self, photo_path: str | Path, caption: str = "", *,
                    reply_markup=None, chat_id: str | None = None) -> dict[str, Any]:
-        """
-        Upload a PNG as multipart/form-data.
+        return self._upload("sendPhoto", "photo", "image/png", photo_path,
+                            caption=caption, reply_markup=reply_markup,
+                            chat_id=chat_id)
 
-        Built by hand rather than pulling in `requests`, so the alert path has
-        no dependency that could fail to install in the container.
+    def send_document(self, doc_path: str | Path, caption: str = "", *,
+                      reply_markup=None,
+                      chat_id: str | None = None) -> dict[str, Any]:
+        """
+        Upload a file Telegram will show as an attachment rather than inline.
+
+        This is how the run report arrives: one notification carrying the whole
+        picture, which can be opened, kept and forwarded to whoever actually
+        drives out -- none of which a stream of chat messages allows.
+        """
+        return self._upload("sendDocument", "document", "application/pdf",
+                            doc_path, caption=caption,
+                            reply_markup=reply_markup, chat_id=chat_id)
+
+    def _upload(self, method: str, field: str, mime: str,
+                file_path: str | Path, *, caption: str = "",
+                reply_markup=None, chat_id: str | None = None) -> dict[str, Any]:
+        """
+        multipart/form-data, built by hand.
+
+        Deliberately not `requests`: the alert path has no dependency that
+        could fail to install in the container, so a message can still go out
+        when the rest of the stack is unhappy.
         """
         boundary = f"----das2{int(time.time()*1000)}"
-        path = Path(photo_path)
+        path = Path(file_path)
         fields = {
             "chat_id": chat_id or self.config.chat_id,
             "caption": caption[:CAPTION_MAX],
@@ -241,17 +263,19 @@ class TelegramClient:
                      f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
                      f"{value}\r\n").encode()
         body += (f"--{boundary}\r\n"
-                 f'Content-Disposition: form-data; name="photo"; '
+                 f'Content-Disposition: form-data; name="{field}"; '
                  f'filename="{path.name}"\r\n'
-                 f"Content-Type: image/png\r\n\r\n").encode()
+                 f"Content-Type: {mime}\r\n\r\n").encode()
         body += path.read_bytes() + b"\r\n"
         body += f"--{boundary}--\r\n".encode()
 
         req = request.Request(
-            API.format(token=self.config.token, method="sendPhoto"),
+            API.format(token=self.config.token, method=method),
             data=bytes(body),
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-        with request.urlopen(req, timeout=self.config.timeout_s) as resp:
+        # A PDF is far larger than a PNG and the upload is the slow part, so
+        # the socket gets longer than an ordinary call would need.
+        with request.urlopen(req, timeout=self.config.timeout_s * 3) as resp:
             return json.loads(resp.read().decode())
 
     def answer_callback(self, callback_id: str, text: str = "") -> dict[str, Any]:
@@ -289,12 +313,116 @@ class TelegramClient:
 # --------------------------------------------------------------------------- #
 # Sending a run
 # --------------------------------------------------------------------------- #
+def send_report(result, config: TelegramConfig, *, report_pdf: Path,
+                p1_detail_messages: bool = False,
+                dashboard_url: str | None = None) -> SendReport:
+    """
+    One document per run, and nothing else.
+
+    The mode the client asked for after a week of the alternative: *"the alert
+    messages are way too many, can we just give one summary report pdf each
+    time?"*. At their volume the old shape was a header, two photos, ten
+    incident messages and a digest -- fourteen notifications an hour, none of
+    which could be read as one picture.
+
+    The caption carries enough to act on without opening anything: how many
+    need a decision, where, and how many were deliberately held back. The
+    document carries the rest.
+
+    `p1_detail_messages` adds one button-carrying message per P1 on top. It is
+    off by default and exists because a document cannot carry an inline
+    keyboard per incident, and those buttons are the only source of labels this
+    system has for learning what a false alarm looks like. Five extra messages
+    on the client's run, not a hundred and ninety-eight.
+    """
+    report = SendReport()
+    if not config.enabled:
+        log.info("telegram disabled by config")
+        report.skipped = [i.incident_id for i in result.incidents]
+        return report
+    if not config.configured:
+        log.warning("telegram token/chat_id missing -- nothing sent")
+        report.skipped = [i.incident_id for i in result.incidents]
+        return report
+
+    client = TelegramClient(config)
+    alertable = sorted(result.alertable, key=lambda i: -i.severity)
+    detail = [i for i in alertable if i.priority.value == "P1"] \
+        if p1_detail_messages else []
+    report.skipped = [i.incident_id for i in result.incidents
+                      if i not in alertable]
+
+    try:
+        client.send_document(report_pdf, _report_caption(result, alertable))
+        # The document IS the delivery. Every alertable incident was in it, so
+        # marking only the P1s as sent would misreport the run and would make
+        # the next run re-announce everything it had already reported.
+        report.sent = [i.incident_id for i in alertable]
+    except (error.URLError, error.HTTPError, OSError) as exc:
+        log.error("telegram report upload failed: %s", exc)
+        report.failed.append(("<report>", str(exc)))
+        return report
+
+    for incident in detail:
+        try:
+            client.send_message(compose(incident, dashboard_url=dashboard_url),
+                                reply_markup=ack_keyboard(incident.incident_id))
+        except (error.URLError, error.HTTPError, OSError) as exc:
+            log.error("telegram P1 detail failed for %s: %s",
+                      incident.incident_id, exc)
+            report.failed.append((incident.incident_id, str(exc)))
+    return report
+
+
+def _report_caption(result, alertable: list) -> str:
+    """
+    What the notification says before anyone opens the attachment.
+
+    Written so a reader on a locked phone can decide whether to open it at all.
+    The two numbers that matter are how many need a decision and how many were
+    held back; the second is there because a count with no denominator invites
+    the question "and what did it not tell me?".
+    """
+    counts: dict[str, int] = {}
+    for incident in alertable:
+        counts[incident.priority.value] = counts.get(incident.priority.value, 0) + 1
+    urgent = counts.get("P1", 0) + counts.get("P2", 0)
+
+    regions: dict[str, int] = {}
+    for incident in alertable:
+        if incident.priority.value in ("P1", "P2") and incident.cluster.region:
+            name = str(getattr(incident.cluster.region, "value",
+                               incident.cluster.region))
+            regions[name] = regions.get(name, 0) + 1
+    where = ", ".join(f"{r} {n}" for r, n in
+                      sorted(regions.items(), key=lambda kv: -kv[1])[:4])
+
+    held = result.stats.get("selection", {}).get("held", 0)
+    lines = [f"<b>Run {result.run_id}</b>"]
+    if urgent:
+        lines.append(f"{PRIORITY_ICON['P1']} <b>{urgent}</b> need a decision "
+                     f"now ({where})" if where else
+                     f"{PRIORITY_ICON['P1']} <b>{urgent}</b> need a decision now")
+    else:
+        lines.append("No P1 or P2 this run.")
+    lines.append(f"{len(result.incidents)} open incident(s) · "
+                 f"{held} held back, with reasons inside")
+    lines.append("")
+    lines.append("Full report attached: where, what, what to act on, "
+                 "and what was deliberately not sent.")
+    return "\n".join(lines)[:CAPTION_MAX]
+
+
 def send_run(result, config: TelegramConfig, *,
              charts: dict[str, Path] | None = None,
              dashboard_url: str | None = None,
              max_incidents: int = 10) -> SendReport:
     """
-    Alert one run's incidents.
+    Alert one run's incidents, one message each.
+
+    The original mode, kept because the per-incident acknowledge buttons ride
+    on these messages and they are the only label source the system has. See
+    `send_report` for the document mode, which is now the default.
 
     Suppressed classes are never sent -- that is the entire point of computing
     them -- and the count of what was suppressed rides along in the summary, so
@@ -524,7 +652,18 @@ def run_ack_worker(config: TelegramConfig, on_ack, *,
                     pass
 
         if offset is not None:
+            # Written atomically. `write_text` truncates and then writes, so
+            # the file is momentarily EMPTY -- and this runs after every poll
+            # cycle, so that window recurs for as long as the worker lives. A
+            # container killed inside it leaves an empty file, the next start
+            # reads no offset, and every acknowledgement Telegram still holds
+            # is replayed. The same race made the feedback test fail about one
+            # run in eight with the right value already on disk.
             try:
-                offset_path.write_text(json.dumps({"offset": offset}))
+                import os
+
+                tmp = offset_path.with_name(offset_path.name + ".tmp")
+                tmp.write_text(json.dumps({"offset": offset}))
+                os.replace(tmp, offset_path)
             except OSError:
                 log.warning("could not persist telegram offset")

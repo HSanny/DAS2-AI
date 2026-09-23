@@ -70,6 +70,11 @@ NEIGHBOUR_EDGE = "#c8cdd2"
 COAST_EDGE = "#5f6b76"
 
 
+def _hex_rgb(value: str) -> tuple[float, float, float]:
+    value = value.lstrip("#")
+    return tuple(int(value[i:i + 2], 16) / 255 for i in (0, 2, 4))  # type: ignore[return-value]
+
+
 @lru_cache(maxsize=1)
 def coastline() -> dict:
     """The vendored shoreline, as {main, islands, neighbours, box}."""
@@ -147,7 +152,8 @@ def draw_island(ax, *, sea: bool = True) -> None:
 
 
 def region_anchors(avoid: list[tuple[float, float]] | None = None,
-                   ) -> dict[Region, tuple[float, float]]:
+                   *, candidates: int = 1,
+                   ) -> dict[Region, list[tuple[float, float]]] | dict[Region, tuple[float, float]]:
     """
     Somewhere inside each region to write its name.
 
@@ -162,6 +168,14 @@ def region_anchors(avoid: list[tuple[float, float]] | None = None,
     interior of its largest body, and pick the point in that interior that is
     furthest from any marker. Deep enough to read as belonging to the region,
     clear enough not to sit under an incident.
+
+    `candidates > 1` returns a ranked shortlist per region instead of one
+    point, spaced apart so the entries are real alternatives rather than
+    neighbouring cells. The caller needs that because "furthest from anything"
+    is not the same as "clear of everything": on a busy run every interior cell
+    of Central is near something, and the best available point can still
+    overlap a site label. Given a shortlist the caller can test each against
+    the boxes it has actually drawn and take the first that fits.
     """
     owner, regions = _region_grid()
     lon0, lon1, lat0, lat1 = bounds()
@@ -201,28 +215,46 @@ def region_anchors(avoid: list[tuple[float, float]] | None = None,
             layer = shrunk
         interior = mask & (depth >= max(1, int(depth.max() * 0.45)))
         scored = np.where(interior, clearance, -np.inf)
-        y, x = np.unravel_index(int(np.argmax(scored)), scored.shape)
-        anchors[region] = (float(mesh_lon[y, x]), float(mesh_lat[y, x]))
+        if candidates <= 1:
+            y, x = np.unravel_index(int(np.argmax(scored)), scored.shape)
+            anchors[region] = (float(mesh_lon[y, x]), float(mesh_lat[y, x]))
+            continue
+
+        # Take the best cell, blank out its neighbourhood, take the next.
+        # Without the blanking the shortlist is the same point five times over
+        # at 330 m spacing, which is no alternative at all.
+        picked: list[tuple[float, float]] = []
+        scored = scored.copy()
+        spacing = max(2, grid.shape[1] // 22)
+        for _ in range(candidates):
+            y, x = np.unravel_index(int(np.argmax(scored)), scored.shape)
+            if not np.isfinite(scored[y, x]):
+                break
+            picked.append((float(mesh_lon[y, x]), float(mesh_lat[y, x])))
+            scored[max(0, y - spacing):y + spacing + 1,
+                   max(0, x - spacing):x + spacing + 1] = -np.inf
+        anchors[region] = picked                       # type: ignore[assignment]
     return anchors
 
 
-def shade_regions(ax, weight: dict[Region, float], *,
-                  ramp: tuple[tuple[float, float, float], ...] = (
-                      (0.949, 0.961, 0.969),      # #f2f5f7  nothing here
-                      (0.839, 0.882, 0.910),      # #d6e1e8
-                      (0.702, 0.792, 0.847),      # #b3cad8
-                      (0.541, 0.682, 0.769),      # #8aaec4
-                      (0.396, 0.573, 0.694),      # #6592b1
-                  )) -> None:
+def shade_regions(ax, weight: dict[Region, float], *, ramp=None) -> None:
     """
     Paint each region by `weight`.
 
     A choropleth rather than five fixed colours: the client asked to *see*
     which part of the island is in trouble, and a fixed palette says only
-    where the regions are. The ramp is deliberately desaturated blue-grey so
-    that the priority colours on the markers -- which are the urgent thing --
-    are the only saturated ink on the figure.
+    where the regions are.
+
+    The ramp stops well short of the dark end of the sequential scale on
+    purpose. This layer is CONTEXT -- it sits under thirty-odd saturated
+    priority markers, and a full-range choropleth beneath them leaves the
+    red P1 dot on a dark blue field with nothing between them. The markers
+    are the thing to be read; the shading only has to rank five areas.
     """
+    from das2.report import theme
+
+    if ramp is None:
+        ramp = tuple(_hex_rgb(h) for h in theme.CHOROPLETH)
     owner, regions = _region_grid()
     h, w = owner.shape
     rgba = np.zeros((h, w, 4), dtype=float)

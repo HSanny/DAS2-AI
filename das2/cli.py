@@ -283,6 +283,22 @@ def cmd_run(config: Config, args) -> int:
     except Exception as exc:                               # noqa: BLE001
         log.error("chart generation failed (alerting continues): %s", exc)
 
+    # The run report. This is what gets sent, so its failure is not cosmetic:
+    # if it cannot be written there is nothing to deliver, and the run falls
+    # back to the per-incident messages rather than going silent.
+    report_pdf = None
+    try:
+        from das2 import build_stamp
+        from das2.report import pdf as pdf_report
+        report_pdf = pdf_report.write(
+            result,
+            out_dir / (f"report_{result.run_id}.pdf" if not per_run
+                       else "report.pdf"),
+            stamp=f"das2 source {build_stamp()}")
+        print(f"Report: {report_pdf}")
+    except Exception as exc:                               # noqa: BLE001
+        log.error("report generation failed (falling back to messages): %s", exc)
+
     _print_summary(result)
 
     # Persistence comes in two halves, and the order between them matters.
@@ -304,16 +320,23 @@ def cmd_run(config: Config, args) -> int:
         _persist_readings(engine, config, result)
         return 0
 
-    from das2.alerting.telegram import TelegramConfig, send_run
-    report = send_run(
-        result,
-        TelegramConfig(token=config.alert.telegram_token,
-                       chat_id=config.alert.telegram_chat_id,
-                       enabled=config.alert.enabled),
-        charts=chart_paths,
-        dashboard_url=config.report.public_url or None,
-        max_incidents=config.alert.max_incidents_per_run,
-    )
+    from das2.alerting.telegram import TelegramConfig, send_report, send_run
+    telegram = TelegramConfig(token=config.alert.telegram_token,
+                              chat_id=config.alert.telegram_chat_id,
+                              enabled=config.alert.enabled)
+    if getattr(config.alert, "mode", "report") == "report" and report_pdf:
+        report = send_report(
+            result, telegram, report_pdf=report_pdf,
+            p1_detail_messages=config.alert.p1_detail_messages,
+            dashboard_url=config.report.public_url or None,
+        )
+    else:
+        report = send_run(
+            result, telegram,
+            charts=chart_paths,
+            dashboard_url=config.report.public_url or None,
+            max_incidents=config.alert.max_incidents_per_run,
+        )
     print(f"Telegram: {report.as_dict()}")
 
     if engine is not None:

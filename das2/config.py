@@ -296,6 +296,21 @@ class AlertConfig:
     """Incident-level alerting."""
 
     enabled: bool = True
+
+    #: "report" sends ONE PDF per run. "messages" sends the old stream: a run
+    #: header, two photos, up to `max_incidents_per_run` incident messages and
+    #: a digest -- fourteen notifications an hour at the client's volume, which
+    #: is what they asked to be rid of.
+    #:
+    #: The cost of "report" is per-incident acknowledge buttons: Telegram
+    #: attaches an inline keyboard to a MESSAGE, and one keyboard cannot
+    #: acknowledge 198 incidents separately. Those buttons are the only source
+    #: of labels the system has for learning what a false alarm looks like, so
+    #: `p1_detail_messages` brings them back for the P1s alone -- five extra
+    #: messages on the run that prompted this, not a hundred and ninety-eight.
+    mode: str = "report"
+    p1_detail_messages: bool = False
+
     #: Per-region budget per run, replacing the old global top-10 rank cut.
     #: That cut emitted ten sensors whether the network was healthy or on fire,
     #: and would silently drop a genuine ten-site regional event.
