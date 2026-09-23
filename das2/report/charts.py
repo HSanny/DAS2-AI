@@ -18,9 +18,9 @@ Design constraints that are not negotiable here
   squinting. A chart that needs pinch-zoom has failed.
 * **Colour is never the only channel.** Priority is encoded as colour *and*
   marker size *and* text, so the image survives greyscale and colour blindness.
-* **No basemap.** Tile fetching would put a network dependency inside the alert
-  path, so the map is drawn from the incident coordinates alone with the
-  island's bounding box for context. Less pretty, always works.
+* **No tiles.** The map is a real outline of Singapore, but it is drawn from a
+  shoreline that ships inside the package -- see `das2.report.basemap` for why
+  tile servers are not an option here. No internet, no API key, no 403.
 """
 
 from __future__ import annotations
@@ -29,17 +29,20 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")                      # no display in a container
+import matplotlib.patheffects as pe        # noqa: E402
 import matplotlib.pyplot as plt            # noqa: E402
 import numpy as np                         # noqa: E402
 
 from das2.models import Incident            # noqa: E402
+from das2.report import basemap             # noqa: E402
 
 PRIORITY_COLOR = {"P1": "#b2182b", "P2": "#ef8a62",
-                  "P3": "#e8c56a", "P4": "#8da9bd"}
+                  "P3": "#e8c56a", "P4": "#5c7183"}
 
 #: Singapore's bounding box, so a single incident does not render on a map
-#: zoomed so far in that the location is meaningless.
-SG_BOUNDS = (103.60, 104.10, 1.20, 1.48)   # lon_min, lon_max, lat_min, lat_max
+#: zoomed so far in that the location is meaningless. Taken from the vendored
+#: shoreline so the outline and the axes cannot disagree.
+SG_BOUNDS = basemap.bounds()   # lon_min, lon_max, lat_min, lat_max
 
 PHONE_FIGSIZE = (7.2, 5.4)
 DPI = 150
@@ -64,7 +67,12 @@ def _style(ax, title: str, subtitle: str = "") -> None:
 def region_map_png(incidents: list[Incident], out_path: str | Path, *,
                    title: str = "Abnormal sensor clusters") -> Path:
     """
-    Where the incidents are, on Singapore's extent.
+    Where the incidents are, on the island.
+
+    Three layers, in the order an operator reads them: the island itself, so
+    the location means something at a glance; the region shading, so the part
+    of Singapore carrying the run's load is visible before any marker is read;
+    then the incidents themselves.
 
     Marker area scales with member count rather than radius, so a ten-sensor
     incident reads as bigger than a one-sensor incident without reading as a
@@ -76,19 +84,49 @@ def region_map_png(incidents: list[Incident], out_path: str | Path, *,
               and i.cluster.centroid_lon is not None]
 
     fig, ax = plt.subplots(figsize=PHONE_FIGSIZE, dpi=DPI)
-    lon0, lon1, lat0, lat1 = SG_BOUNDS
-    ax.set_xlim(lon0, lon1)
-    ax.set_ylim(lat0, lat1)
     # Latitude/longitude are not interchangeable units; at 1.35 degrees north
     # one degree of longitude is very nearly one degree of latitude in metres,
     # so an equal aspect is honest here and shapes are not distorted.
     ax.set_aspect("equal", adjustable="box")
-    ax.set_facecolor("#f4f6f8")
+
+    # Shade by severity rather than by count: five P4 telemetry faults in one
+    # region must not outweigh a single P1 somewhere else, which is exactly
+    # what a headcount would do.
+    load: dict = {}
+    count: dict = {}
+    for incident in incidents:
+        region = incident.cluster.region
+        if region is not None:
+            load[region] = load.get(region, 0.0) + incident.severity
+            count[region] = count.get(region, 0) + 1
+    basemap.shade_regions(ax, load)
+    basemap.draw_island(ax)
+
+    # Region names have to dodge the site labels, not just the dots. A site
+    # label is a white box roughly 0.045 deg wide sitting above its marker, so
+    # avoiding the marker's own coordinate alone still lets "WEST" land under
+    # "Pandan1PS". Spanning the box's footprint costs nothing and settles it.
+    avoid = []
+    for i in placed:
+        lon, lat = i.cluster.centroid_lon, i.cluster.centroid_lat
+        avoid.append((lon, lat))
+        avoid += [(lon + dx, lat + 0.006) for dx in (-.022, -.011, 0, .011, .022)]
+    anchors = basemap.region_anchors(avoid)
+    for region, (alon, alat) in anchors.items():
+        n = count.get(region, 0)
+        label = str(region.value).upper()
+        if n:
+            label += f"\n{n} incident" + ("s" if n > 1 else "")
+        ax.text(alon, alat, label, ha="center", va="center",
+                fontsize=8, color="#44525f", fontweight="600",
+                linespacing=1.4, alpha=.9, zorder=3,
+                path_effects=[pe.withStroke(linewidth=2.6, foreground="white")])
 
     if not placed:
-        ax.text(0.5, 0.5, "No placed incidents this run",
+        ax.text(0.5, 0.06, "No placed incidents this run",
                 transform=ax.transAxes, ha="center", va="center",
-                fontsize=13, color="#667080")
+                fontsize=12, color="#44525f", zorder=6,
+                bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="#dfe3e8"))
     else:
         for priority in ("P4", "P3", "P2", "P1"):      # severe drawn last, on top
             group = [i for i in placed if i.priority.value == priority]
@@ -99,7 +137,7 @@ def region_map_png(incidents: list[Incident], out_path: str | Path, *,
                 [i.cluster.centroid_lat for i in group],
                 s=[70 + 55 * np.sqrt(len(i.cluster.members)) for i in group],
                 c=PRIORITY_COLOR[priority], edgecolors="white", linewidths=1.4,
-                alpha=.92, zorder=3, label=f"{priority} ({len(group)})",
+                alpha=.95, zorder=5, label=f"{priority} ({len(group)})",
             )
         # Label only the ones worth driving to; labelling everything would
         # produce an unreadable pile at phone size.
@@ -108,18 +146,22 @@ def region_map_png(incidents: list[Incident], out_path: str | Path, *,
             ax.annotate(label,
                         (i.cluster.centroid_lon, i.cluster.centroid_lat),
                         textcoords="offset points", xytext=(0, 13),
-                        ha="center", fontsize=8.5, color="#14181d",
+                        ha="center", fontsize=8.5, color="#14181d", zorder=6,
                         bbox=dict(boxstyle="round,pad=0.22", fc="white",
-                                  ec="#dfe3e8", alpha=.88))
-        ax.legend(loc="lower left", frameon=False, fontsize=9,
-                  handletextpad=.3, borderpad=.2)
+                                  ec="#dfe3e8", alpha=.9))
+        ax.legend(loc="lower left", frameon=True, facecolor="white",
+                  edgecolor="#dfe3e8", framealpha=.9, fontsize=9,
+                  handletextpad=.3, borderpad=.4).set_zorder(6)
 
     _style(ax, title,
-           f"{len(placed)} placed incident(s) · positions are site-level (per RTU)")
-    ax.set_xlabel("Longitude", fontsize=9, color="#667080")
-    ax.set_ylabel("Latitude", fontsize=9, color="#667080")
-    ax.grid(True, color="#e3e7ec", linewidth=.7)
-    ax.set_axisbelow(True)
+           f"{len(placed)} placed incident(s) · shading is severity by region · "
+           "positions are site-level (per RTU)")
+    # No lat/lon axes. On a recognisable outline they are decoration, and the
+    # figure is read on a phone where every line of furniture costs map.
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for side in ("left", "bottom"):
+        ax.spines[side].set_visible(False)
 
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight", facecolor="white")
