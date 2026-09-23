@@ -215,7 +215,15 @@ def main():
     # only cost is in the failing case. The poller backs off on any transport
     # hiccup (1s, then 2s, then 4s), and against a 10s budget two of those
     # were enough to time out and report a defect that was not there.
-    deadline = time.time() + 30.0
+    #
+    # 30s was not enough either, and the arithmetic says why: one long-poll
+    # cycle is 25s and the three backoffs are another 7s, so a slow start
+    # alone can reach 32s with nothing wrong. That left roughly one full-suite
+    # run in twelve failing here. An intermittent failure is worse than a
+    # consistent one -- it teaches everyone to re-run instead of look -- so
+    # the budget is now well clear of the worst legitimate case rather than
+    # just above the typical one.
+    deadline = time.time() + 90.0
     while time.time() < deadline:
         if len(recorded) >= 2 and offset() == "502":
             break

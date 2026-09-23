@@ -285,24 +285,23 @@ def cmd_run(config: Config, args) -> int:
 
     _print_summary(result)
 
+    # Persistence comes in two halves, and the order between them matters.
+    #
+    # This half is what the NEXT run needs to recognise today's incidents as
+    # the same ones -- without it every run reopens everything and one fault
+    # pages the duty operator once an hour. It is a few hundred rows.
     if engine is not None:
-        from das2.io.store import (prune_readings, save_readings, save_run,
-                                   upsert_sensors)
+        from das2.io.store import save_run, upsert_sensors
         try:
             upsert_sensors(engine, result.sensors)
             save_run(engine, result)
-            if config.database.store_readings:
-                # Feeds the daily profile job. Without it DRIFT, NOISE_BURST
-                # and the L2 baselines have no source of history.
-                save_readings(engine, result.readings)
-                # ...and bound it, or the table grows without limit.
-                prune_readings(engine, config.database.reading_retention_days)
             print("Persisted to the database.")
         except Exception as exc:                           # noqa: BLE001
             log.error("persistence failed: %s", exc)
 
     if args.dry_run or args.no_alert:
         print("\nAlerting skipped (dry run).")
+        _persist_readings(engine, config, result)
         return 0
 
     from das2.alerting.telegram import TelegramConfig, send_run
@@ -328,7 +327,39 @@ def cmd_run(config: Config, args) -> int:
                                 reason="" if sent else incident.incident_class.value)
             except Exception:                              # noqa: BLE001
                 pass
+
+    # ...and only now the reading history, which nothing in THIS run needs.
+    _persist_readings(engine, config, result)
     return 0
+
+
+def _persist_readings(engine, config: Config, result) -> None:
+    """
+    The reading history, written after the alert has gone out.
+
+    It feeds the daily profile job -- DRIFT, NOISE_BURST and the time-of-day
+    baselines have no other source -- and nothing in the current run depends
+    on it. It is also by far the largest write the system makes: tens of
+    thousands of rows on a good day, and on the first run after a gap, or on
+    any run where the incremental filter cannot narrow the window, millions.
+
+    It used to run BEFORE the Telegram send, which meant the alert queued
+    behind it. On 22 September that write took nine and a half hours and the
+    alerts for that run never went out at all -- the run had found a P1 and
+    said nothing, because it was busy filling a table that a job running
+    tomorrow was going to read. Alerting is the point of the run; history is
+    bookkeeping. Bookkeeping goes last.
+    """
+    if engine is None or not config.database.store_readings:
+        return
+    from das2.io.store import prune_readings, save_readings
+    try:
+        save_readings(engine, result.readings)
+        # ...and bound it, or the table grows without limit.
+        prune_readings(engine, config.database.reading_retention_days)
+    except Exception as exc:                               # noqa: BLE001
+        log.error("persisting reading history failed (the alert already "
+                  "went out): %s", exc)
 
 
 def cmd_demo(config: Config, args) -> int:

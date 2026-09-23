@@ -183,6 +183,40 @@ def main() -> int:
                   columns=["sensor_key", "ts", "value"])) == 0
               and counter.take() == 0)
 
+    print("\nthe alert never queues behind the reading history")
+    # On 22 September the run found a P1 and said nothing for nine and a half
+    # hours, because save_readings ran BEFORE the Telegram send and the whole
+    # window was going into the table one row at a time. Both halves of that
+    # are fixed, but the ordering is the one that matters on a bad day: a slow
+    # or failing history write must never be able to hold up an alert.
+    #
+    # Checked structurally, because cmd_run needs a share, a database and a
+    # bot to run, and none of those exist here.
+    import ast
+
+    tree = ast.parse((Path(__file__).resolve().parent.parent
+                      / "das2" / "cli.py").read_text())
+    cmd_run = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "cmd_run")
+
+    def calls(node) -> set[str]:
+        return {c.func.id for c in ast.walk(node)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+
+    check("cmd_run does not write readings itself",
+          "save_readings" not in calls(cmd_run),
+          "it delegates, so there is one place the ordering lives")
+
+    top = list(enumerate(cmd_run.body))
+    send_at = next(i for i, s in top if "send_run" in calls(s))
+    # The dry-run branch returns before any alerting, so its call is not late.
+    late = [i for i, s in top
+            if "_persist_readings" in calls(s)
+            and not any(isinstance(n, ast.Return) for n in ast.walk(s))]
+    check("the history write is reached only after the send",
+          bool(late) and min(late) > send_at,
+          f"send at statement {send_at}, history at {late}")
+
     print("\npyodbc is told to batch, and only pyodbc")
     # Without fast_executemany the driver sends one round trip per row. That
     # is the 165 rows/second, and it is the other half of the nine hours.

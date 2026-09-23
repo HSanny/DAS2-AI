@@ -240,14 +240,67 @@ def build_fleet() -> list[SensorSpec]:
 
     # --- rain gauges ---------------------------------------------------------
     # 188 of these exist in the real feed and are currently discarded as
-    # unclassified. One rains during the regional event, which is what lets
-    # triage separate WEATHER_DRIVEN from a genuine fault.
+    # unclassified. This one rains EARLIER in the window than the regional
+    # event, and that separation is the point of it.
+    #
+    # It used to rain at frac 0.70 -- the regional event's own window, at the
+    # regional event's own site -- with a comment claiming that was what let
+    # triage tell WEATHER_DRIVEN from a genuine fault. It is the opposite. The
+    # event's members are all LEVEL_SHIFT, which is rain-explicable, so a
+    # downpour on top of them is *correctly* read as weather and the headline
+    # incident disappears. Whether it disappeared came down to whether the
+    # integrated total landed above or below RAIN_EXPLAINS_MM, which moved
+    # with the hour the fixture was generated at: the end-to-end test passed
+    # for a window ending 22:00-05:00 and failed for one ending 06:00 or
+    # 07:00. A test that depends on what time of day it is run is worse than
+    # no test, because it is trusted between the hours where it lies.
+    #
+    # Rain at another hour is also what the assertion in test_end_to_end
+    # actually says it is checking: that rainfall is integrated over the
+    # INCIDENT's window and not the run's. With the rain here, an implementation
+    # that attaches the run's total to every incident in the region turns the
+    # regional event into WEATHER_DRIVEN and the test catches it -- which is
+    # the regression it was written for.
     add(description="BedokPS-Rainfall", equipment="Rainfall", site="BedokPS",
         rtu="1010", dt_s=300, base=0.0, noise=0.01, unit="mm",
-        fault="RAINFALL", fault_start_frac=0.70, fault_duration_h=2.5,
+        fault="RAINFALL", fault_start_frac=0.30, fault_duration_h=2.5,
         fault_detail={"peak_mm_per_interval": 1.8})
+    # --- WEATHER-DRIVEN: the trip that must NOT be made ----------------------
+    # The mirror image of the regional event above, and the reason this system
+    # exists: two West sites, canal level and flow both stepping UP together,
+    # which looks exactly like a regional event until you notice it is raining
+    # on top of them. Triage must reach WEATHER_DRIVEN and recommend against
+    # dispatch.
+    #
+    # It is deliberately a separate scenario rather than rain laid over the
+    # regional event. Overlaying them makes one case test both verdicts at
+    # once, and the fixture then has no answer to "which one is correct?" --
+    # only a threshold deciding, and a threshold that moved with the hour.
+    #
+    # KNOWN, and the reason no test asserts on this scenario yet: the verdict
+    # here is currently phase-dependent, WEATHER_DRIVEN at 6 window-end hours
+    # in 24 and PROCESS_EVENT at the rest. It is not the fixture. Rainfall is
+    # integrated over the INCIDENT's window, and a LEVEL_SHIFT's window is the
+    # few minutes around the step -- so whether a 60 mm/h storm is credited
+    # with 4 mm or 1 mm comes down to whether a single five-minute gauge
+    # interval lands inside it. Water responds to rain with a catchment lag;
+    # the rule as written asks whether it was raining at the exact instant the
+    # level moved. Fixing that means integrating over the incident window
+    # extended backwards by a lead time, which changes real dispatch
+    # decisions and needs its own evidence before it ships. This scenario is
+    # the reproduction for it.
     add(description="Pandan1PS-Rainfall", equipment="Rainfall", site="Pandan1PS",
-        rtu="1031", dt_s=300, base=0.0, noise=0.01, unit="mm")
+        rtu="1031", dt_s=300, base=0.0, noise=0.01, unit="mm",
+        fault="RAINFALL", fault_start_frac=0.58, fault_duration_h=2.0,
+        fault_detail={"peak_mm_per_interval": 5.0})
+    for desc, site, rtu, equip, base, noise, unit in [
+        ("Pandan1PS-Canal-Level", "Pandan1PS", "1031", "LevelSensor", 1.80, 0.01, "m"),
+        ("PandanTG-Canal-Outlet-Flow", "PandanTG", "1030", "Flowrate", 12.0, 0.4, "L/s"),
+    ]:
+        add(description=desc, equipment=equip, site=site, rtu=rtu, dt_s=120,
+            base=base, noise=noise, unit=unit, diurnal_amp=base * 0.04,
+            fault="WEATHER_DRIVEN", fault_start_frac=0.58, fault_duration_h=2.0,
+            fault_detail={"relative_step": 0.40})
 
     # --- digital pump: ~1,567 of these run through the analog stack today ----
     add(description="BedokPS-Pump3-Run-Status", equipment="Pump", site="BedokPS",
@@ -340,7 +393,7 @@ def generate_series(spec: SensorSpec, start: datetime, end: datetime,
                 progress = min(1.0, (t - fault_start).total_seconds() /
                                max(1.0, (fault_end - fault_start).total_seconds()))
                 value += detail.get("total_change", 5.0) * progress
-            if fault in ("REGIONAL_EVENT", "TELEMETRY_FANOUT") and in_fault:
+            if fault in ("REGIONAL_EVENT", "WEATHER_DRIVEN", "TELEMETRY_FANOUT") and in_fault:
                 value += spec.base * detail.get("relative_step", -0.3)
             if fault == "RAINFALL" and in_fault:
                 # Rain arrives in bursts, not at a constant rate.
