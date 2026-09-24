@@ -412,6 +412,8 @@ def _short_action(incident) -> str:
              "not one sensor.", "Investigate the area"),
             ("Instrument fault with no corroboration from neighbours - "
              "dispatch a technician.", "Dispatch a technician"),
+            ("The machine, not the instrument - mechanical callout.",
+             "Mechanical callout"),
     ):
         if text.startswith(long[:40]):
             return short
@@ -499,6 +501,21 @@ def _anatomy_block(fig, incident, top: float, *, budget: float = 0.42) -> float:
     top = _signature_lines(fig, incident, top)
     top = _conventional_line(fig, incident, top)
 
+    channels = _asset_channels(incident)
+    if channels:
+        # A machine's anatomy is its channels, not a parameter breakdown.
+        # Grouped by equipment class this incident reads "Digital Status 1, no
+        # direction, —", which names the least interesting of the three
+        # channels involved and gives an operator nothing to act on. What they
+        # need is the contradiction: 41 A became 12 A while 24 L/s became zero.
+        height = min(0.30, max(0.06, budget - (started - top) - 0.055),
+                     0.045 + 0.028 * len(channels))
+        _table(fig, (L, top - height, R - L, height),
+               [("channel", 0.22, "left"), ("normal", 0.16, "right"),
+                ("observed", 0.16, "right"), ("what it says", 0.46, "left")],
+               channels)
+        return top - height - 0.055
+
     rows = [(g.display, g.count, len(g.sites), g.direction_text(),
              g.move_text() or "—",
              ", ".join(t.value.replace("_", " ").title()
@@ -524,6 +541,64 @@ def _anatomy_block(fig, incident, top: float, *, budget: float = 0.42) -> float:
             ("behaviour", 0.26, "left"), ("qartod", 0.10, "left")],
            rows)
     return top - height - 0.055
+
+
+def _fmt(value: Any, unit: str) -> str:
+    try:
+        number = f"{float(value):,.4g}"
+    except (TypeError, ValueError):
+        return "—"
+    return f"{number} {unit}".strip()
+
+
+def _asset_channels(incident) -> list[tuple[str, str, str, str]]:
+    """
+    A failed machine's channels, and what each one is saying.
+
+    Empty for every other class, which is how the caller decides whether to
+    draw this table or the parameter breakdown.
+    """
+    from das2.models import ASSET_TYPES
+
+    rows: list[tuple[str, str, str, str]] = []
+    for member in incident.cluster.members:
+        # `getattr`, because a member arriving without its signals must cost
+        # this one table and not the whole report. The report is the delivery;
+        # an AttributeError here loses the run to save a detail of it.
+        for signal in getattr(member, "signals", ()) or ():
+            if signal.type not in ASSET_TYPES or not signal.detail:
+                continue
+            d = signal.detail
+            duty_unit = str(d.get("duty_unit") or "")
+            if "observed_output" in d:
+                rows.append((
+                    f"{d.get('output_kind', 'output')}",
+                    _fmt(d.get("normal_output"), str(d.get("output_unit") or "")),
+                    _fmt(d.get("observed_output"), str(d.get("output_unit") or "")),
+                    "gone while the machine was running"))
+            if "observed_duty" in d:
+                running = d.get("running_duty")
+                observed = d.get("observed_duty")
+                says = "unchanged"
+                try:
+                    if float(observed) < float(running):
+                        says = "below its own running normal"
+                    elif float(observed) > float(running):
+                        says = "above its own running normal"
+                except (TypeError, ValueError):
+                    pass
+                if signal.type.value == "ASSET_ENERGISED_WHEN_OFF":
+                    says = "drawn while the control says off"
+                elif signal.type.value == "ASSET_NOT_ENERGISED_WHEN_ON":
+                    says = "at its OFF level while the control says running"
+                rows.append((f"motor {d.get('duty_kind', 'duty')}",
+                             _fmt(running, duty_unit),
+                             _fmt(observed, duty_unit), says))
+            rows.append(("run status",
+                         "running" if signal.type.value != "ASSET_ENERGISED_WHEN_OFF"
+                         else "off",
+                         "unchanged", "reported correctly throughout"))
+    return rows[:6]
 
 
 def _conventional_line(fig, incident, top: float) -> float:

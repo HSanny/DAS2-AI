@@ -115,6 +115,9 @@ def evidence(result) -> str:
                               "calibration job rather than a callout"),
         "INSTRUMENT_CONFLICT": ("readings that cannot all be true at once — "
                                 "level, inflow and outflow disagree"),
+        "ASSET_FAILURE": ("a machine whose own channels contradict each "
+                          "other while every instrument on it reports "
+                          "normally — the plant, not the telemetry"),
         "WATCH": ("evidence too weak or too mixed to act on yet"),
     }
     top = sorted(counts.items(), key=lambda kv: -kv[1])[:3]

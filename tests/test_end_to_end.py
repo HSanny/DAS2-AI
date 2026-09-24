@@ -167,6 +167,44 @@ def main():
         check("the injected flatline is found", "FLATLINE" in types)
         check("the injected stale sensor is found", "STALE" in types)
 
+        # --- the machine, not the instrument --------------------------------- #
+        # Three pumps are injected. Two have failed in different ways and one
+        # has a failed FLOWMETER, and the last is the one that matters: a
+        # detector that simply fired whenever a discharge meter read zero would
+        # find all three and send a fitter to a healthy pump.
+        print("\nthe machine, not the instrument")
+        assets = [i for i in result.incidents
+                  if i.incident_class is IncidentClass.ASSET_FAILURE]
+        by_type = {m.dominant_type.value
+                   for i in assets for m in i.cluster.members}
+        check("the failed pump is reported as a machine failure",
+              "ASSET_NOT_DELIVERING" in by_type, f"({sorted(by_type)})")
+        check("so is the one energised while switched off",
+              "ASSET_ENERGISED_WHEN_OFF" in by_type)
+        check("each failed machine is its own incident",
+              all(len(i.cluster.sites) == 1 for i in assets),
+              "clustered geographically, the failed pump was swallowed by a "
+              "regional event 400 m away and reported as 'investigate the "
+              "area'")
+        check("and none of them is filed as record-only",
+              all(i.priority.value in ("P1", "P2") for i in assets),
+              f"({[i.priority.value for i in assets]})")
+        check("it sends a fitter, not a calibrator",
+              all("mechanical callout" in i.recommendation for i in assets))
+
+        suspect = [a for a in result.anomalies
+                   if "Pump4" in (a.sensor.description or "")]
+        check("THE PUMP WITH A FAILED METER IS NOT CALLED A MACHINE FAILURE",
+              suspect and all(a.dominant_type.value != "ASSET_NOT_DELIVERING"
+                              for a in suspect),
+              "its motor draws normal current throughout, so the meter is the "
+              "odd one out; claiming the machine failed picks the expensive "
+              "explanation over the cheap one on no evidence")
+        check("but it is still reported, as the contradiction it is",
+              any(a.dominant_type.value == "RUN_STATE_INCONSISTENT"
+                  for a in suspect),
+              f"({sorted({a.dominant_type.value for a in suspect})})")
+
         print("\n  and volume is sane -- the first gate that matters")
         check("anomalies are far fewer than sensors analysed",
               len(result.anomalies) < len(result.sensors),

@@ -446,6 +446,53 @@ def cluster_anomalies(anomalies: list[SensorAnomaly],
     return clusters
 
 
+def cluster_by_asset(
+        anomalies: list[SensorAnomaly]) -> tuple[list[Cluster], list[SensorAnomaly]]:
+    """
+    One cluster per MACHINE, for findings that already know their own grouping.
+
+    Returns `(clusters, the anomalies consumed)`.
+
+    Everything else here groups by location and time, because that is the only
+    evidence available about what belongs with what. An asset finding is the
+    exception: it was raised by comparing a named unit's own channels against
+    each other, so the group is not a guess to be recovered from coordinates --
+    it is `Pump 2 at Kranji`, and the detector already wrote it down.
+
+    Clustering these geographically actively destroys the finding. On the
+    fixture, a pump that had stopped delivering sat 400 m from an unrelated
+    four-site regional event, was swept into it, and the incident came out as
+    "investigate the area" -- with the failed machine reduced to one row of a
+    five-sensor table. The area was not the problem; the pump was, and nobody
+    reading that alert would have taken a fitter.
+    """
+    from das2.models import ASSET_TYPES
+
+    groups: dict[str, list[SensorAnomaly]] = {}
+    consumed: list[SensorAnomaly] = []
+    for anomaly in anomalies:
+        if anomaly.dominant_type not in ASSET_TYPES:
+            continue
+        name = next((str(s.detail.get("asset")) for s in anomaly.signals
+                     if s.type in ASSET_TYPES and s.detail.get("asset")), "")
+        groups.setdefault(name or anomaly.sensor.sensor_key, []).append(anomaly)
+        consumed.append(anomaly)
+
+    clusters: list[Cluster] = []
+    for members in groups.values():
+        first = members[0].sensor
+        clusters.append(Cluster(
+            members=members,
+            region=first.region,
+            centroid_lat=first.latitude,
+            centroid_lon=first.longitude,
+            # A machine has no radius. Reporting one would put a circle on the
+            # map implying an affected area that does not exist.
+            radius_m=0.0,
+        ))
+    return clusters, consumed
+
+
 def unclustered(anomalies: list[SensorAnomaly],
                 clusters: list[Cluster]) -> list[SensorAnomaly]:
     """

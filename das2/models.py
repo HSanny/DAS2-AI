@@ -89,6 +89,29 @@ class AnomalyType(str, Enum):
     STUCK_IN_STATE = "STUCK_IN_STATE"
     RUN_STATE_INCONSISTENT = "RUN_STATE_INCONSISTENT"  # running but no flow
 
+    # --- L2: the ASSET, not the instrument and not the water ---
+    #
+    # Every type above says something about a reading. These three say the
+    # readings are all correct and the MACHINE has failed, which is the
+    # client's own distinction: *"maybe there's a complete breakdown of the
+    # equipment instead of just operational failure, but there's still value
+    # being read by the sensor"*.
+    #
+    # Each is a contradiction between channels that cannot disagree while the
+    # plant is healthy, so none of them rests on a statistical threshold. What
+    # the third channel buys is ATTRIBUTION: `RUN_STATE_INCONSISTENT` can only
+    # say "the pump or the flowmeter is wrong", while a motor drawing current
+    # unlike its own normal says which.
+    #: Energised and turning, and its output has gone, with the electrical
+    #: channel agreeing the machine's operating point moved.
+    ASSET_NOT_DELIVERING = "ASSET_NOT_DELIVERING"
+    #: Control says off; the motor is drawing current. A welded contactor, a
+    #: manual override left in, or a run-status bit that has failed.
+    ASSET_ENERGISED_WHEN_OFF = "ASSET_ENERGISED_WHEN_OFF"
+    #: Control says running; no current is being drawn. A tripped breaker, a
+    #: blown fuse, a failed starter -- or a run-status bit that has failed.
+    ASSET_NOT_ENERGISED_WHEN_ON = "ASSET_NOT_ENERGISED_WHEN_ON"
+
     # --- Daily job (needs history longer than one analysis window) ---
     DRIFT = "DRIFT"                                # slow calibration drift
     NOISE_BURST = "NOISE_BURST"                    # spread grew vs baseline
@@ -141,6 +164,15 @@ QARTOD_TEST: dict["AnomalyType", tuple[int, str] | None] = {
     AnomalyType.STUCK_IN_STATE: None,
     AnomalyType.DRIFT: None,
     AnomalyType.NOISE_BURST: None,
+    # Mapped to None deliberately, and it is not an oversight. The MECHANISM is
+    # Test 9's -- compare a channel against another channel -- but the
+    # CONCLUSION is not a data-quality verdict at all: these say the readings
+    # are right and the plant is broken. QARTOD has no flag for that, and
+    # borrowing its number would dress a maintenance finding as a quality
+    # control test.
+    AnomalyType.ASSET_NOT_DELIVERING: None,
+    AnomalyType.ASSET_ENERGISED_WHEN_OFF: None,
+    AnomalyType.ASSET_NOT_ENERGISED_WHEN_ON: None,
 }
 
 
@@ -205,6 +237,15 @@ TYPE_FLAG: dict["AnomalyType", QartodFlag] = {
     AnomalyType.ATTENUATED_SIGNAL: QartodFlag.FAIL,
     AnomalyType.RUN_STATE_INCONSISTENT: QartodFlag.FAIL,
     AnomalyType.MASS_BALANCE_VIOLATION: QartodFlag.FAIL,
+    # GOOD, and that is the finding rather than a lapse in it. QARTOD flags the
+    # DATA, and on an asset failure every instrument involved is working
+    # perfectly -- the pump is running, the ammeter reports the current it is
+    # drawing, the flowmeter reports the flow that is not there. A quality
+    # system looking only at these channels sees nothing wrong, which is
+    # precisely why the plant failure needs a finding of its own.
+    AnomalyType.ASSET_NOT_DELIVERING: QartodFlag.GOOD,
+    AnomalyType.ASSET_ENERGISED_WHEN_OFF: QartodFlag.GOOD,
+    AnomalyType.ASSET_NOT_ENERGISED_WHEN_ON: QartodFlag.GOOD,
 }
 
 
@@ -239,6 +280,19 @@ PROCESS_TYPES: frozenset[AnomalyType] = frozenset({
     AnomalyType.SPIKE,
     AnomalyType.REVERSE_FLOW,
     AnomalyType.MASS_BALANCE_VIOLATION,
+})
+
+#: Types that mean the MACHINE has failed -- not the instrument, not the water.
+#:
+#: Deliberately in none of the other three sets. They are not sensor health,
+#: because the instruments are working; not process, because the water is not
+#: what moved; and not maintenance-scheduling, because a pump that has stopped
+#: delivering is today's problem rather than next month's calibration round.
+#: The response is a mechanical callout with this unit's maintenance history.
+ASSET_TYPES: frozenset[AnomalyType] = frozenset({
+    AnomalyType.ASSET_NOT_DELIVERING,
+    AnomalyType.ASSET_ENERGISED_WHEN_OFF,
+    AnomalyType.ASSET_NOT_ENERGISED_WHEN_ON,
 })
 
 #: Maintenance-scheduling rather than urgent-response.
@@ -304,11 +358,18 @@ CROSS_SIGNAL_TYPES: frozenset[AnomalyType] = frozenset({
     AnomalyType.RUN_STATE_INCONSISTENT,
 })
 
-ALWAYS_PAGEABLE_TYPES = CROSS_SIGNAL_TYPES | frozenset({
+ALWAYS_PAGEABLE_TYPES = CROSS_SIGNAL_TYPES | ASSET_TYPES | frozenset({
     # Real, cumulative, expensive motor wear that no value-based detector can
     # see, and which the client's own alarm feed shows happening now.
     AnomalyType.SHORT_CYCLING,
 })
+# ASSET_TYPES belongs here for the same reason CROSS_SIGNAL_TYPES does, and
+# leaving it out is not a quiet degradation: every asset finding is raised on a
+# RUN-STATE sensor, whose equipment class is Pump, Valve or DigitalStatus --
+# all of which start `alertable: false`. Without this line the detector runs,
+# finds the failed pump, logs it in the type counts, and the finding is
+# discarded before it can reach an incident. It did exactly that on the first
+# run of this fixture.
 
 
 class Priority(str, Enum):
@@ -574,6 +635,11 @@ class IncidentClass(str, Enum):
     # dispatch rather than a WATCH -- what is unknown is which one to believe,
     # not whether something is wrong.
     INSTRUMENT_CONFLICT = "INSTRUMENT_CONFLICT"
+    # The plant, not the instrument. Two channels that cannot disagree while
+    # the machine is healthy do disagree, and the electrical channel says the
+    # machine is what changed. A mechanical callout, not a technician with a
+    # calibrator, and not a trip to look at the water.
+    ASSET_FAILURE = "ASSET_FAILURE"
     WATCH = "WATCH"                              # weak/conflicting -> re-evaluate
 
 
@@ -612,6 +678,9 @@ RECOMMENDATION: dict[IncidentClass, str] = {
         "Evidence is weak or conflicting - re-evaluate on the next run.",
     IncidentClass.INSTRUMENT_CONFLICT:
         "Instruments contradict each other - check all of them; one is wrong.",
+    IncidentClass.ASSET_FAILURE:
+        "The machine, not the instrument - mechanical callout. Bring this "
+        "unit's maintenance history.",
 }
 
 
@@ -669,6 +738,10 @@ class Incident:
         return self.incident_class in (
             IncidentClass.SENSOR_FAULT,
             IncidentClass.REGIONAL_EVENT,
+            # A machine that has stopped delivering is the one dispatch here
+            # that does not need a second opinion: two independent channels
+            # already agree, so there is nothing a further run will add.
+            IncidentClass.ASSET_FAILURE,
         )
 
     @property

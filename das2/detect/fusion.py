@@ -73,6 +73,14 @@ TYPE_PRECEDENCE: tuple[AnomalyType, ...] = (
     AnomalyType.REVERSE_FLOW,             # physically meaningful, and specific
     AnomalyType.QUANTISATION_COLLAPSE,    # resolution has degraded
     AnomalyType.ATTENUATED_SIGNAL,
+    # The asset findings sit above RUN_STATE_INCONSISTENT because they are the
+    # same contradiction with a third channel attached. Where both fit, the
+    # asset type is strictly the more informative claim: RUN_STATE_INCONSISTENT
+    # can only say "the pump or the meter is wrong", and these say which, with
+    # the evidence that decided it.
+    AnomalyType.ASSET_NOT_DELIVERING,
+    AnomalyType.ASSET_NOT_ENERGISED_WHEN_ON,
+    AnomalyType.ASSET_ENERGISED_WHEN_OFF,
     AnomalyType.SHORT_CYCLING,
     AnomalyType.RUN_STATE_INCONSISTENT,
     AnomalyType.STUCK_IN_STATE,

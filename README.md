@@ -66,6 +66,38 @@ The second case is invisible to name-based grouping, which is what the previous
 system used: four different sensors at three different sites share no name, so
 nothing linked them.
 
+### The machine, not the instrument
+
+Every other layer here watches values. One watches the *relationship* between a
+machine's channels, because a pump that is running, energised, drawing an
+ordinary motor current and moving no water has not produced a single abnormal
+reading anywhere — and a threshold, a baseline and a cluster all see nothing.
+
+Three contradictions, each between channels that cannot disagree while the
+plant is healthy:
+
+| | |
+|---|---|
+| **Running and not delivering** | the output has gone *and* the motor current has left this unit's own normal — two independent channels agreeing the machine changed |
+| **Energised while the control says off** | a held-in contactor, a manual override, or a run-status bit that has failed |
+| **Commanded on and drawing nothing** | a tripped breaker, a blown fuse, a failed starter, or again the status bit |
+
+What the third channel buys is **attribution**. Two channels can only say "the
+pump or the flowmeter is wrong". When the output vanishes and the motor goes on
+drawing its *normal* current, this layer stays deliberately silent: the motor
+doing its usual work is evidence that water is moving, so the meter is the odd
+one out and claiming a machine failure would send a fitter to a healthy pump.
+
+The direction of the current change is never used. "Power drops at shutoff" is
+true of a radial-flow pump and backwards for an axial-flow one; PUB runs both
+and the feed does not say which is which, so the test is *departure* from the
+unit's own normal, either way.
+
+Measured against your inventory: 82 of 192 units carry a run state plus current
+or power, 22 also carry an output channel and can be attributed, and 92 have a
+run state with nothing to check it against — those this layer is silent on, and
+that is a data request rather than a gap in the code.
+
 ### Checking it against the statistics you already run
 
 Every incident carries what a median-and-σ check would have concluded about
@@ -105,7 +137,7 @@ does not otherwise have.
 ## Development
 
 ```bash
-bash tests/run_all.sh              # 1079 assertions, no network needed
+bash tests/run_all.sh              # 1126 assertions, no network needed
 python3 -m das2.cli demo           # synthetic data with known faults
 python3 tools/make_fixtures.py --out /tmp/fx
 ```
@@ -123,5 +155,5 @@ Two things to know before judging the output. The **daily profile job**
 (`das2 profile`) must be scheduled: `DRIFT`, `NOISE_BURST` and the whole
 baseline layer depend on it, and until it has run those produce nothing. And
 there is **no shadow-mode harness yet**, so there is no measured precision or
-recall against real data — the evidence is 1079 assertions and a fixture
+recall against real data — the evidence is 1126 assertions and a fixture
 carrying 19 known faults, which is real but is not the same claim.

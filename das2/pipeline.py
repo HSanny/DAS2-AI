@@ -31,6 +31,7 @@ import pandas as pd
 
 from das2.config import Config
 from das2.detect import conventional
+from das2.detect.asset import asset_summary, run_asset_checks
 from das2.detect.baseline import baseline_summary, score_window
 from das2.detect.digital import run_digital_checks, run_pump_flow_checks
 from das2.detect.fusion import fuse_all, fusion_summary
@@ -45,6 +46,7 @@ from das2.models import Cluster, Incident, SensorAnomaly, SensorMeta
 from das2.profile.build import TimeOfDayBaseline
 from das2.spatial.correlation import cluster_correlation, correlation_summary
 from das2.spatial.cluster import (
+    cluster_by_asset,
     ClusterParams,
     cluster_anomalies,
     cluster_summary,
@@ -265,6 +267,22 @@ def run(config: Config, *, now: datetime | None = None,
         else:
             signals_by_sensor[run_key] = (meta, pump_signals)
 
+    # --- the machine, not the instrument and not the water ------------------ #
+    # Cross-channel contradictions at one unit: running and not delivering,
+    # energised while off, commanded on and drawing nothing. Emitted on the
+    # run-state sensor, which is the point an operator recognises.
+    for run_key, asset_signals in run_asset_checks(sensors, series).items():
+        meta = meta_by_key.get(run_key)
+        if meta is None:
+            continue
+        existing = signals_by_sensor.get(run_key)
+        if existing:
+            existing[1].extend(asset_signals)
+        else:
+            signals_by_sensor[run_key] = (meta, asset_signals)
+    result.stats["assets"] = asset_summary(sensors)
+    log.info("assets: %s", result.stats["assets"])
+
     # --- mass balance: the one genuinely multivariate detector -------------- #
     # Grouped per site from level + inflow + outflow. Abstains wherever the
     # group is not actually a closed system, which the fit quality decides.
@@ -331,8 +349,17 @@ def run(config: Config, *, now: datetime | None = None,
     from das2.models import ALWAYS_PAGEABLE_TYPES
     pageable = [a for a in result.anomalies
                 if a.sensor.alertable or a.dominant_type in ALWAYS_PAGEABLE_TYPES]
-    result.clusters = cluster_anomalies(pageable, params)
-    result.loose = unclustered(pageable, result.clusters)
+    # Machines first, and taken OUT of the spatial pass. An asset finding knows
+    # which unit it belongs to, so grouping it by coordinates can only lose
+    # that -- and does: on the fixture a failed pump was swallowed by an
+    # unrelated regional event 400 m away and reported as "investigate the
+    # area".
+    asset_clusters, consumed = cluster_by_asset(pageable)
+    consumed_keys = {a.sensor.sensor_key for a in consumed}
+    spatial = [a for a in pageable if a.sensor.sensor_key not in consumed_keys]
+
+    result.clusters = cluster_anomalies(spatial, params) + asset_clusters
+    result.loose = unclustered(spatial, result.clusters)
     result.stats["clustering"] = cluster_summary(result.clusters, result.loose)
     log.info("clustering: %s", result.stats["clustering"])
 

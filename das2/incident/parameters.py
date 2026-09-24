@@ -197,6 +197,36 @@ def breakdown(incident) -> list[ParameterGroup]:
     )
 
 
+#: How an asset finding reads in one column.
+ASSET_PHRASE = {
+    "ASSET_NOT_DELIVERING": "not delivering",
+    "ASSET_ENERGISED_WHEN_OFF": "energised while off",
+    "ASSET_NOT_ENERGISED_WHEN_ON": "drawing nothing",
+}
+
+
+def asset_summary(incident) -> str:
+    """
+    `'TampinesPS unit 1 — not delivering'`, or `''` when it is not one.
+
+    A machine failure has no useful parameter breakdown. Grouped by equipment
+    class it reads "Digital Status 1", because the finding is raised on the
+    run-state bit -- which names the least interesting of the three channels
+    involved and tells an operator nothing. The unit and what it is doing is
+    the answer to "which parameter is triggering this", for this class.
+    """
+    from das2.models import ASSET_TYPES
+
+    for member in incident.cluster.members:
+        if member.dominant_type not in ASSET_TYPES:
+            continue
+        name = next((str(s.detail.get("asset")) for s in member.signals
+                     if s.detail.get("asset")), "")
+        phrase = ASSET_PHRASE.get(member.dominant_type.value, "faulted")
+        return f"{name or member.sensor.site} — {phrase}"
+    return ""
+
+
 def inline_summary(incident, limit: int = 3) -> str:
     """
     `'Canal level 7▲, Flowrate 3▲, Pressure 2▼'`.
@@ -204,6 +234,9 @@ def inline_summary(incident, limit: int = 3) -> str:
     For the column in an incident table, where the full breakdown will not
     fit but "which parameter" still has to be answerable without a page turn.
     """
+    asset = asset_summary(incident)
+    if asset:
+        return asset
     groups = breakdown(incident)
     shown = ", ".join(g.summary() for g in groups[:limit])
     if len(groups) > limit:

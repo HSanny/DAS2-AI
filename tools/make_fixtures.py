@@ -323,6 +323,40 @@ def build_fleet() -> list[SensorSpec]:
         site="TampinesPS", rtu="1012", dt_s=120, base=0.0, noise=0.05,
         unit="L/s", fault="PUMP_FLOW", fault_start_frac=0.55,
         fault_duration_h=4.0)
+    # The third channel, and the reason the asset layer can say more than
+    # "one of these two is wrong". Driven by `couple_assets`.
+    add(description="TampinesPS-Pump1-Motor-Current", equipment="Current",
+        site="TampinesPS", rtu="1012", dt_s=120, base=0.0, noise=0.4,
+        unit="A", fault="PUMP_CURRENT", fault_start_frac=0.55,
+        fault_duration_h=4.0)
+
+    # --- the negative control, and the most important sensor in this fixture -
+    # Same contradiction as above -- pump running, discharge meter reading zero
+    # -- but the motor goes on drawing its normal current throughout. A motor
+    # doing its usual work is evidence that water IS moving, so the meter is
+    # the odd one out and the asset layer must stay silent. Without this pair,
+    # a detector that simply fired whenever flow vanished would pass every
+    # other test in the suite.
+    add(description="BedokPS-Pump4-Run-Status", equipment="Pump",
+        site="BedokPS", rtu="1010", dt_s=60, base=0.0, noise=0.0, unit="",
+        rawtype=RAWTYPE_DIGITAL, fault="PUMP_RUN")
+    add(description="BedokPS-Pump4-Discharge-Flow", equipment="Flowrate",
+        site="BedokPS", rtu="1010", dt_s=120, base=0.0, noise=0.05,
+        unit="L/s", fault="PUMP_FLOW")
+    add(description="BedokPS-Pump4-Motor-Current", equipment="Current",
+        site="BedokPS", rtu="1010", dt_s=120, base=0.0, noise=0.4,
+        unit="A", fault="PUMP_CURRENT")
+
+    # --- energised while the control says off -------------------------------
+    # A held-in contactor: the run bit reads OFF and the motor goes on drawing
+    # current. 82 of the real inventory's 192 units carry the two channels this
+    # needs, which makes it the widest-coverage asset check available.
+    add(description="Kranji1PS-Pump2-Run-Status", equipment="Pump",
+        site="Kranji1PS", rtu="1002", dt_s=60, base=0.0, noise=0.0, unit="",
+        rawtype=RAWTYPE_DIGITAL, fault="PUMP_RUN")
+    add(description="Kranji1PS-Pump2-Motor-Current", equipment="Current",
+        site="Kranji1PS", rtu="1002", dt_s=120, base=0.0, noise=0.4,
+        unit="A", fault="PUMP_CURRENT")
 
     # --- unplaceable sensor: dirty RTU, so no coordinates from the join ------
     add(description="UnknownSite-Mystery-Level", equipment="LevelSensor",
@@ -510,6 +544,111 @@ def couple_pump(series: dict[str, list[tuple[datetime, float]]],
         else:
             rebuilt.append((t, PUMP_RUNNING_FLOW + noise))
     series[PUMP_FLOW] = rebuilt
+
+
+#: The three asset scenarios, and the machines they happen to.
+#:
+#: Each is a contradiction between channels that cannot disagree while the
+#: plant is healthy, and none of them is visible in any single series: every
+#: individual reading in all three is an ordinary value the instrument reports
+#: every day.
+ASSET_RUNNING_CURRENT = 41.0       # A, drawn while the motor does its job
+ASSET_IDLE_CURRENT = 0.6           # A, standing losses with the motor off
+#: What the motor draws once the pump has lost its prime: it is still turning,
+#: so it is plainly energised, but it is no longer doing work on water. The
+#: DIRECTION of this change is not what the detector keys on -- an axial-flow
+#: pump moves the other way at shutoff -- only that it departs from the unit's
+#: own normal.
+ASSET_UNLOADED_CURRENT = 12.0
+
+#: Pump 1 at Tampines: lost prime. Flow goes, and the current goes with it.
+ASSET_FAILED = ("TampinesPS-Pump1-Run-Status",
+                "TampinesPS-Pump1-Discharge-Flow",
+                "TampinesPS-Pump1-Motor-Current")
+#: Pump 4 at Bedok: the NEGATIVE control. Flow goes and the current does not,
+#: so the motor is still doing its usual work and the meter is the odd one out.
+ASSET_METER_SUSPECT = ("BedokPS-Pump4-Run-Status",
+                       "BedokPS-Pump4-Discharge-Flow",
+                       "BedokPS-Pump4-Motor-Current")
+#: Pump 2 at Kranji: a held-in contactor. Off per the control, drawing current.
+ASSET_ENERGISED = ("Kranji1PS-Pump2-Run-Status",
+                   "Kranji1PS-Pump2-Motor-Current")
+ASSET_FAULT_START_FRAC = 0.62
+ASSET_FAULT_HOURS = 5.0
+
+
+def couple_assets(series: dict[str, list[tuple[datetime, float]]],
+                  start: datetime, end: datetime, *,
+                  clean: bool = False) -> None:
+    """
+    Build three machines whose channels agree, then break each differently.
+
+    The point of the set is the SECOND one. A detector that fired whenever a
+    discharge meter went to zero while its pump said RUNNING would find the
+    first and the third and would also report Bedok Pump 4, where the motor is
+    drawing its normal current throughout and the honest reading is that the
+    flowmeter has failed. Calling that an asset failure sends a fitter to a
+    healthy pump, so the fixture carries it deliberately.
+    """
+    total_s = (end - start).total_seconds()
+    fault_start = start + timedelta(seconds=total_s * ASSET_FAULT_START_FRAC)
+    fault_end = fault_start + timedelta(hours=ASSET_FAULT_HOURS)
+
+    def running(when: datetime) -> bool:
+        elapsed = (when - start).total_seconds()
+        return (elapsed % (2 * PUMP_CYCLE_S)) < PUMP_CYCLE_S
+
+    def in_fault(when: datetime) -> bool:
+        return not clean and fault_start <= when < fault_end
+
+    def drive_run(key: str) -> None:
+        if key in series:
+            series[key] = [(t, 1.0 if running(t) else 0.0)
+                           for t, _ in series[key]]
+
+    def jitter(value: float) -> float:
+        return value - round(value)
+
+    # --- Tampines Pump 1: the pump itself has failed ------------------------
+    # Its run/flow pair is already driven by `couple_pump`; only the current
+    # channel is added here, and it drops away with the flow.
+    run_key, flow_key, current_key = ASSET_FAILED
+    pump_fault_start = start + timedelta(seconds=total_s * PUMP_FAULT_START_FRAC)
+    pump_fault_end = pump_fault_start + timedelta(hours=PUMP_FAULT_HOURS)
+    if current_key in series:
+        rebuilt = []
+        for t, value in series[current_key]:
+            if not running(t):
+                rebuilt.append((t, ASSET_IDLE_CURRENT + abs(jitter(value))))
+            elif not clean and pump_fault_start <= t < pump_fault_end:
+                rebuilt.append((t, ASSET_UNLOADED_CURRENT + jitter(value)))
+            else:
+                rebuilt.append((t, ASSET_RUNNING_CURRENT + jitter(value)))
+        series[current_key] = rebuilt
+
+    # --- Bedok Pump 4: the meter is the suspect, not the machine ------------
+    run_key, flow_key, current_key = ASSET_METER_SUSPECT
+    drive_run(run_key)
+    if flow_key in series:
+        series[flow_key] = [
+            (t, max(0.0, abs(jitter(v))) if (not running(t) or in_fault(t))
+             else PUMP_RUNNING_FLOW + jitter(v))
+            for t, v in series[flow_key]]
+    if current_key in series:
+        # Unchanged through the fault. That is the whole point of this pair.
+        series[current_key] = [
+            (t, (ASSET_RUNNING_CURRENT if running(t) else ASSET_IDLE_CURRENT)
+             + jitter(v))
+            for t, v in series[current_key]]
+
+    # --- Kranji Pump 2: energised while the control says off ----------------
+    run_key, current_key = ASSET_ENERGISED
+    drive_run(run_key)
+    if current_key in series:
+        series[current_key] = [
+            (t, (ASSET_RUNNING_CURRENT if (running(t) or in_fault(t))
+                 else ASSET_IDLE_CURRENT) + jitter(v))
+            for t, v in series[current_key]]
 
 
 #: The tank's three signals, and the geometry that ties them together.
@@ -918,6 +1057,7 @@ def main() -> None:
     couple_rainfall(series, clean=args.clean)
     couple_tank(series, start, clean=args.clean)
     couple_pump(series, start, end, clean=args.clean)
+    couple_assets(series, start, end, clean=args.clean)
 
     n_files = write_history(out, fleet, series, start, end)
     write_histcurr(out, fleet, end, series)

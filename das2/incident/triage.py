@@ -36,6 +36,7 @@ about the wiring rather than an inference about the water.
 from __future__ import annotations
 
 from das2.models import (
+    ASSET_TYPES,
     PROCESS_TYPES,
     CROSS_SIGNAL_TYPES,
     DEFINITIVE_INSTRUMENT_FAULTS,
@@ -114,6 +115,34 @@ def classify(cluster: Cluster, *,
     sites = cluster.sites
     equipment = cluster.equipment_types
     why: list[str] = []
+
+    # --- 0. The machine itself ---------------------------------------------- #
+    # Ahead of fan-out, and the ordering is load-bearing. An asset contradiction
+    # is BY CONSTRUCTION several sensors at one site disagreeing, which is
+    # exactly the shape the fan-out rule below suppresses -- so placed after it,
+    # every pump failure this system can detect would be thrown away as a
+    # panel fault and never reach anyone.
+    #
+    # The two are not hard to tell apart. Fan-out is many instruments going
+    # quiet together, one shared cause in the telemetry. This is two channels
+    # that are still reporting perfectly and cannot both be right, with a third
+    # saying which. That is a named cause, not an unexplained coincidence, so
+    # it is decided first.
+    #
+    # Confined to a single site on purpose. A machine is one place; an asset
+    # finding riding along inside a four-site cluster is an incidental member
+    # of something larger, and relabelling the whole incident after it would
+    # hide the regional event underneath.
+    asset_members = [m for m in members if m.dominant_type in ASSET_TYPES]
+    if asset_members and is_single_site(cluster):
+        for member in asset_members[:3]:
+            detail = next((s.detail for s in member.signals
+                           if s.type in ASSET_TYPES and s.detail), {})
+            why.append(str(detail.get("verdict")
+                           or member.dominant_type.value))
+        why.append("every instrument involved is reporting normally; it is "
+                   "the machine that has changed")
+        return IncidentClass.ASSET_FAILURE, why
 
     # --- 1. Fan-out: structural, so it is decided first --------------------- #
     # Several sensors at one place, failing together, is one cause. Whether
@@ -295,6 +324,26 @@ CLASS_WEIGHT: dict[IncidentClass, float] = {
     IncidentClass.WEATHER_DRIVEN: 0.30,
     IncidentClass.WATCH: 0.35,
     IncidentClass.TELEMETRY_FANOUT: 0.15,
+    # As certain as INSTRUMENT_CONFLICT, and it also says which of the two
+    # readings to believe, so there is nothing left to discount at all.
+    IncidentClass.ASSET_FAILURE: 0.95,
+}
+
+#: A floor under the score for classes whose evidence does not come from scale.
+#:
+#: Three of the four things `severity` measures -- how many sites, how many
+#: parameters, how many sensors -- are proxies for "how much of the network is
+#: involved", and they are the right proxies for an area event. A failed pump
+#: is one machine at one site raising one finding, so it scores near zero on
+#: all three and lands at P4, "record only", however conclusive it is. That is
+#: the severity model answering a question this class never asked.
+#:
+#: 55 is P2, "act this shift". Not P1: this system cannot tell whether a failed
+#: drainage pump matters this hour or next week, because it has no forecast and
+#: no duty schedule. The floor only stops a certainty from being filed as
+#: noise; a high member severity still lifts it above.
+CLASS_FLOOR: dict[IncidentClass, float] = {
+    IncidentClass.ASSET_FAILURE: 55.0,
 }
 
 
@@ -325,7 +374,8 @@ def severity(cluster: Cluster, incident_class: IncidentClass) -> float:
            + W_TYPE_DIVERSITY * type_component
            + W_SIZE * size_component)
 
-    return round(100.0 * raw * CLASS_WEIGHT.get(incident_class, 0.5), 1)
+    scored = 100.0 * raw * CLASS_WEIGHT.get(incident_class, 0.5)
+    return round(max(scored, CLASS_FLOOR.get(incident_class, 0.0)), 1)
 
 
 def narrate(incident: Incident, why: list[str]) -> str:
