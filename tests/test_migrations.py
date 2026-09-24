@@ -23,6 +23,7 @@ So the assertions below check the *translated* SQL, which is the only thing a
 SQL Server deployment ever sees.
 """
 
+import json
 import re
 import sys
 import tempfile
@@ -161,6 +162,56 @@ def main() -> int:
                          "WHERE type='table' AND name=:t"), {"t": table}
                 ).scalar()
                 check(f"{table} exists", got == table)
+
+    print("\nthe audit columns hold JSON that can be read back")
+    # Both audit columns were written as `json.dumps(...)[:N]`, which does not
+    # truncate the payload -- it destroys it, ending mid-key so nothing parses
+    # the row afterwards. Neither overflowed while incidents were small. Both
+    # did the moment they started carrying the verification panel: the run
+    # summary at 2,925 characters into a 1,000-character column, and the
+    # largest incident at 2,790 into a 2,000-character slice. It was the
+    # biggest incidents whose record was lost, and nothing raised.
+    from das2.io.store import DETAIL_LIMIT, NOTES_LIMIT, fit_json
+
+    small = {"detection": {"anomalies": 12}, "incidents": {"open": 3}}
+    check("a payload that fits is passed through whole",
+          json.loads(fit_json(small, NOTES_LIMIT)) == small)
+
+    bulky = {"detection": {"anomalies": 3368}, "incidents": {"open": 198},
+             "selection": {"held": 274},
+             "coverage": {"note": "x" * 800},
+             "profiles": {"note": "y" * 800}}
+    fitted = fit_json(bulky, NOTES_LIMIT,
+                      keep=("detection", "incidents", "selection"))
+    parsed = json.loads(fitted)
+    check("an oversized one still parses", isinstance(parsed, dict),
+          f"{len(fitted)} of {NOTES_LIMIT} chars")
+    check("it fits the column", len(fitted) <= NOTES_LIMIT)
+    check("the numbers an operator asks about are the ones kept",
+          parsed.get("detection", {}).get("anomalies") == 3368
+          and parsed.get("incidents", {}).get("open") == 198)
+    check("and the row says it is partial rather than looking complete",
+          parsed.get("_omitted") == ["coverage"],
+          "silently dropping evidence from an audit trail is worse than "
+          "having none")
+    check("it drops only as much as it has to",
+          "profiles" in parsed,
+          "losing the biggest entry was enough to fit; taking the next one "
+          "as well would throw away a record for nothing")
+
+    monstrous = {"evidence": ["e"] * 40,
+                 "conventional": {"sensors": [{"why": "w" * 300}
+                                              for _ in range(500)]}}
+    fitted = fit_json(monstrous, DETAIL_LIMIT, keep=("evidence",))
+    check("even a payload orders of magnitude over the budget parses",
+          len(json.loads(fitted)["evidence"]) == 40,
+          f"{len(fitted)} of {DETAIL_LIMIT} chars")
+    check("nothing the store writes is ever unparseable",
+          all(json.loads(fit_json(p, n)) is not None
+              for p, n in ((monstrous, 50), (bulky, 30), ({}, 10),
+                           ("not a dict", 200), ({"a": "b" * 5000}, 20))),
+          "including the degenerate budgets, where the answer is a count of "
+          "what was dropped rather than a broken string")
 
     print(f"\n{passed} passed, {failed} failed.")
     return 1 if failed else 0

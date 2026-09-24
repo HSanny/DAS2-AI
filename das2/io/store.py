@@ -46,6 +46,60 @@ from das2.models import (
     SensorMeta,
 )
 
+#: How much of the audit trail each column can hold.
+#:
+#: `das2_detection_run.notes` is VARCHAR(1000) and cannot be widened without a
+#: migration. `das2_incident_event.detail` is TEXT, so its budget is a choice
+#: rather than a limit -- bounded only so one pathological incident cannot
+#: write megabytes into a row nobody will read.
+NOTES_LIMIT = 1000
+DETAIL_LIMIT = 8000
+
+
+def fit_json(payload: Any, limit: int, *, keep: Iterable[str] = ()) -> str:
+    """
+    JSON that fits `limit` characters and can still be read back.
+
+    Slicing the string does not truncate the data, it destroys it:
+    `json.dumps(...)[:1000]` ends in the middle of a key and nothing can parse
+    the row afterwards. Both audit columns in this schema were written that
+    way, and both overflowed the moment incidents started carrying the
+    verification panel -- the run summary at 2,925 characters into a
+    1,000-character column, and the largest incident's detail at 2,790 into a
+    2,000-character slice. It was the biggest, most important incidents whose
+    record was destroyed, and nothing raised.
+
+    So the payload is shrunk STRUCTURALLY: drop whole top-level entries,
+    largest first, until what remains fits, and record what went in `_omitted`
+    so a reader knows the row is partial rather than wondering. `keep` names
+    the entries to sacrifice last.
+
+    The result always parses. That is the whole contract.
+    """
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+
+    protected = set(keep)
+    working = dict(payload)
+    omitted: list[str] = []
+
+    while True:
+        candidate: dict[str, Any] = dict(working)
+        if omitted:
+            candidate["_omitted"] = omitted
+        rendered = json.dumps(candidate, default=str)
+        if len(rendered) <= limit:
+            return rendered
+        if not working:
+            # Nothing left to drop and the bookkeeping alone is too big. A
+            # count always fits, and still says the row is partial.
+            return json.dumps({"_omitted_all": len(omitted)})
+        droppable = [k for k in working if k not in protected] or list(working)
+        victim = max(droppable,
+                     key=lambda k: len(json.dumps(working[k], default=str)))
+        working.pop(victim)
+        omitted.append(victim)
+
 log = logging.getLogger("das2.io.store")
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent.parent / "migrations"
@@ -411,7 +465,11 @@ def save_run(engine: Engine, result, *, detector_version: str = "das2") -> None:
             "incidents_open": len(result.incidents),
             "detector_version": detector_version,
             "status": "OK",
-            "notes": json.dumps(result.stats, default=str)[:1000],
+            # The four an operator asks about first: what was found, what was
+            # sent, what was held, and what the run could see at all.
+            "notes": fit_json(result.stats, NOTES_LIMIT,
+                              keep=("detection", "incidents", "selection",
+                                    "ingest")),
         })
 
         anomaly_ids: dict[str, str] = {}
@@ -482,7 +540,9 @@ def save_run(engine: Engine, result, *, detector_version: str = "das2") -> None:
                 "incident_id": incident.incident_id,
                 "ts": datetime.now(),
                 "event_type": incident.status.value.lower(),
-                "detail": json.dumps(incident.detail, default=str)[:2000],
+                "detail": fit_json(incident.detail, DETAIL_LIMIT,
+                                   keep=("evidence", "signature",
+                                         "rain_evidence")),
             })
 
     log.info("run %s persisted: %d anomalies, %d incidents",
