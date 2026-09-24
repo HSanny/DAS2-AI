@@ -39,23 +39,50 @@ taking whichever interpretation the data supports.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Protocol
 
 import numpy as np
 import pandas as pd
 
 from das2.spatial.regions import haversine_m
+from das2.weather.lag import RainLag
 
 log = logging.getLogger("das2.weather")
 
 #: Equipment class the classifier assigns to rain gauges.
 RAINFALL_EQUIPMENT = "Rainfall"
 
-#: A gauge further than this from an incident says nothing useful about it.
-#: Singapore convective rain cells are commonly 2-5 km across, so a gauge 10 km
-#: away being wet is not evidence that it rained on the sensor in question.
-DEFAULT_GAUGE_RADIUS_M = 5000.0
+#: How far out to look for gauges at all.
+#:
+#: Widened from 5 km once the estimate became distance-WEIGHTED. A hard radius
+#: was previously doing two jobs -- finding gauges and discounting distant ones
+#: -- and doing the second badly, because a gauge at 4.9 km counted fully and
+#: one at 5.1 km not at all. The weighting below now handles attenuation, so
+#: the radius only has to be wide enough not to miss the cell.
+DEFAULT_GAUGE_RADIUS_M = 10000.0
+
+#: Distance at which a gauge's evidence falls to 1/e.
+#:
+#: Measured for Singapore, not assumed. Mandapaka & Qin (2013), *Journal of
+#: Applied Meteorology and Climatology* 52, using a 49-gauge network over
+#: ~710 km2, report an e-folding decorrelation distance of about 10 km at
+#: HOURLY aggregation, rising to ~33 km daily -- and, critically, that
+#: correlation drops markedly for heavy rainfall. Intense convective cells,
+#: which are exactly the events that matter here, are the LEAST spatially
+#: coherent.
+#:
+#: An incident window is sub-hourly, so the true figure is shorter than 10 km.
+#: 6 km is chosen as a deliberately conservative reading of that, and it is the
+#: number to revisit first if rain attribution looks wrong.
+GAUGE_DECORRELATION_M = 6000.0
+
+#: Rain at or above this over the (lagged) window makes the context WET.
+#: Below it, and with at least one gauge reporting, DRY. With no gauge at all,
+#: UNKNOWN -- which is not the same as dry and must never be treated as it.
+WET_CONTEXT_MM = 2.0
 
 #: Above this, a single reading is a running total rather than an increment --
 #: no tipping bucket reports 50 mm in one 5-minute scan.
@@ -92,6 +119,65 @@ ZERO_SHARE_INCREMENTS = 0.5
 #: across 2,160 scans is 21.6 mm of rain invented out of noise, which is the
 #: 26-metre defect again at a size small enough to be believed.
 GAUGE_NOISE_FLOOR_MM = 0.05
+
+
+@dataclass(frozen=True)
+class RainObservation:
+    """
+    What fell, over which window, on whose evidence.
+
+    A bare millimetre figure cannot be checked. This carries the provenance
+    with it -- how many gauges, how far the nearest was, which window was
+    actually integrated, and whether a lag was applied -- so a reader who
+    disagrees with a WEATHER_DRIVEN verdict can see exactly what produced it.
+    """
+
+    mm: float | None = None
+    max_mm: float | None = None
+    gauges: int = 0
+    nearest_m: float | None = None
+    gauge_keys: tuple[str, ...] | list[str] = ()
+    window: tuple[datetime, datetime] | None = None
+    lag: "RainLag | None" = None
+
+    @property
+    def known(self) -> bool:
+        return self.mm is not None
+
+    @property
+    def context(self) -> str:
+        """
+        `'wet'`, `'dry'` or `'unknown'` -- the context classification that
+        everything downstream should be conditioned on.
+
+        Branisavljevic, Kapelan & Prodanovic (2011), *Journal of
+        Hydroinformatics* 13(3), is the published basis: classify the context
+        first, then apply a detector tuned to that context, rather than one
+        detector blind to whether it was raining.
+
+        `unknown` is a third state on purpose. No gauge within range is not
+        the same statement as no rain, and Mandapaka & Qin's decorrelation
+        figures say a dry nearest gauge is weak evidence at sub-hourly scales
+        during exactly the convective cells that matter. Treating unknown as
+        dry is how a genuine storm response gets reported as a fault.
+        """
+        if self.mm is None:
+            return "unknown"
+        return "wet" if self.mm >= WET_CONTEXT_MM else "dry"
+
+    def describe(self) -> str:
+        if self.mm is None:
+            return "no gauge within range; rainfall unknown"
+        parts = [f"{self.mm:.1f} mm over {self.gauges} gauge(s)"]
+        if self.nearest_m is not None:
+            parts.append(f"nearest {self.nearest_m / 1000:.1f} km")
+        if self.max_mm is not None and self.max_mm > self.mm:
+            parts.append(f"wettest {self.max_mm:.1f} mm")
+        if self.lag and self.lag.confident:
+            parts.append(f"window shifted back {self.lag.minutes:.0f} min")
+        else:
+            parts.append("no lag measurable; window not shifted")
+        return ", ".join(parts)
 
 
 class WeatherProvider(Protocol):
@@ -212,31 +298,126 @@ class InternalRainGaugeProvider:
             return None
         return max(0.0, total)
 
-    def rainfall_mm(self, lat: float | None, lon: float | None,
-                    start: datetime, end: datetime) -> float | None:
+    def gauge_increments(self, key: str, start: datetime, end: datetime):
         """
-        Rainfall near one point, as the maximum over gauges within radius.
+        `(timestamps, mm_per_reading)` for one gauge, or `(None, None)`.
 
-        Maximum rather than mean: the question triage asks is "did rain fall on
-        this thing?", and one wet gauge 2 km away answers yes. Averaging it
-        against three dry gauges further out would answer no to a question
-        nobody asked.
+        The same convention detection as `_gauge_total`, but returning the
+        series rather than its sum -- which is what cross-correlating a lag
+        needs, because a lag is about WHEN the rain fell, not how much.
+
+        Factored out after the lag learner got this wrong in the obvious way:
+        it took `diff()` of the raw values. For a running-total gauge that is
+        right; for a tipping bucket, whose readings ARE the increments, it
+        computes the change in the increment -- a derivative of a derivative,
+        which turns a steady 2 mm per scan into a flat zero and makes a real
+        storm invisible to the correlation.
         """
+        rows = self.readings[self.readings["sensor_key"].astype(str) == str(key)]
+        rows = rows[(rows["ts"] >= start) & (rows["ts"] <= end)].sort_values("ts")
+        if len(rows) < 2:
+            return None, None
+        values = rows["value"].to_numpy(dtype=float)
+        if not np.all(np.isfinite(values)):
+            rows = rows[np.isfinite(values)]
+            values = rows["value"].to_numpy(dtype=float)
+            if values.size < 2:
+                return None, None
+
+        diffs = np.diff(values)
+        if np.allclose(diffs, 0.0):
+            return rows["ts"], np.zeros(values.size)
+        if float(np.mean(diffs >= -1e-9)) >= MONOTONIC_SHARE:
+            # Running total: the increment is the rise, resets clipped away.
+            return rows["ts"], np.clip(np.diff(values, prepend=values[0]), 0.0, None)
+        if float(np.mean(np.abs(values) <= GAUGE_NOISE_FLOOR_MM)) >= ZERO_SHARE_INCREMENTS:
+            # Tipping bucket: the readings already ARE the increments.
+            return rows["ts"], np.where(values > GAUGE_NOISE_FLOOR_MM, values, 0.0)
+        return None, None                 # neither convention; no information
+
+    def nearby_gauges(self, lat: float | None, lon: float | None
+                      ) -> list[tuple[str, float]]:
+        """`[(sensor_key, distance_m)]` within radius, nearest first."""
         if lat is None or lon is None or not self.available:
-            return None
-
-        totals = []
+            return []
+        out: list[tuple[str, float]] = []
         for _, gauge in self.gauges.iterrows():
             glat, glon = gauge.get("latitude"), gauge.get("longitude")
             if glat is None or glon is None or pd.isna(glat) or pd.isna(glon):
                 continue
-            if haversine_m(lat, lon, float(glat), float(glon)) > self.radius_m:
-                continue
-            total = self._gauge_total(str(gauge["sensor_key"]), start, end)
-            if total is not None:
-                totals.append(total)
+            distance = haversine_m(lat, lon, float(glat), float(glon))
+            if distance <= self.radius_m:
+                out.append((str(gauge["sensor_key"]), distance))
+        return sorted(out, key=lambda pair: pair[1])
 
-        return round(max(totals), 2) if totals else None
+    def observe(self, lat: float | None, lon: float | None,
+                start: datetime, end: datetime, *,
+                lag: "RainLag | None" = None,
+                spread_s: float = 0.0) -> "RainObservation":
+        """
+        What fell on this place, over the window the water actually came from.
+
+        Two things distinguish this from the old `rainfall_mm`.
+
+        **The window is shifted back by the lag.** Rain that raises a level at
+        14:30 fell before 14:30. Integrating over the incident's own window --
+        minutes, for a level shift -- asked whether it was raining at the
+        instant the level moved, which is not how a catchment behaves. With a
+        learned lag the window becomes `[start - lag - spread, end - lag]`.
+
+        **Gauges are distance-weighted, not maxed.** The maximum over a hard
+        5 km radius over-attributed in one direction (a wet gauge at 4.9 km
+        counted fully) and under-attributed in the other (nothing at 5.1 km
+        counted at all). Weights decay exponentially with distance on the
+        scale Mandapaka & Qin measured for Singapore.
+
+        The `max_mm` is kept alongside, because the two answer different
+        questions: the weighted figure estimates what fell HERE, the maximum
+        answers whether it rained ANYWHERE near enough to matter. Triage wants
+        the first; a reader checking the verdict wants to see both.
+        """
+        lag_s = lag.seconds if (lag and lag.confident) else 0.0
+        shifted_start = start - timedelta(seconds=lag_s + max(0.0, spread_s))
+        shifted_end = end - timedelta(seconds=lag_s)
+        if shifted_end <= shifted_start:
+            shifted_end = shifted_start + (end - start)
+
+        weighted_sum = weight_sum = 0.0
+        totals: list[float] = []
+        used: list[str] = []
+        nearest = None
+
+        for key, distance in self.nearby_gauges(lat, lon):
+            total = self._gauge_total(key, shifted_start, shifted_end)
+            if total is None:
+                continue                  # unreadable gauge: no information
+            weight = math.exp(-distance / GAUGE_DECORRELATION_M)
+            weighted_sum += total * weight
+            weight_sum += weight
+            totals.append(total)
+            used.append(key)
+            nearest = distance if nearest is None else min(nearest, distance)
+
+        if not totals:
+            return RainObservation(window=(shifted_start, shifted_end), lag=lag)
+
+        return RainObservation(
+            mm=round(weighted_sum / weight_sum, 2),
+            max_mm=round(max(totals), 2),
+            gauges=len(totals),
+            nearest_m=nearest,
+            gauge_keys=used,
+            window=(shifted_start, shifted_end),
+            lag=lag,
+        )
+
+    def rainfall_mm(self, lat: float | None, lon: float | None,
+                    start: datetime, end: datetime, *,
+                    lag: "RainLag | None" = None,
+                    spread_s: float = 0.0) -> float | None:
+        """The weighted figure alone, for callers that want one number."""
+        return self.observe(lat, lon, start, end,
+                            lag=lag, spread_s=spread_s).mm
 
     def rainfall_by_region(self, start: datetime, end: datetime) -> dict[str, float]:
         """

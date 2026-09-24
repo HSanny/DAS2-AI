@@ -167,6 +167,19 @@ OFFSET_LEVEL_TOLERANCE = 0.25
 #: step towards the old level.
 OFFSET_RETURN_FRACTION = 0.5
 
+#: How far either side of the detected edge to look for the transition's real
+#: ends. Half an hour: longer than any recalibration and comfortably longer
+#: than an urban catchment's 5-30 minute time of concentration.
+OFFSET_SEARCH_S = 1800.0
+
+
+def _median_dt(seconds: np.ndarray) -> float:
+    """Typical sampling interval, for turning a duration into a sample count."""
+    gaps = np.diff(seconds)
+    gaps = gaps[gaps > 0]
+    return float(np.median(gaps)) if gaps.size else 120.0
+
+
 #: Do not call it an offset without at least this much data after the step. A
 #: shift near the end of the window has not had the chance to recede, and
 #: "never came back" over eleven minutes is not evidence of anything.
@@ -193,14 +206,32 @@ def _is_instrument_offset(values: np.ndarray, seconds: np.ndarray,
     post = pre + magnitude
     tol = OFFSET_LEVEL_TOLERANCE * step
 
-    # 1. Is there a ramp? Count samples around the edge that sit at neither
-    #    level. A window rather than a single sample because the change-point
-    #    statistic's chosen edge is approximate.
-    lo = max(0, peak - 3)
-    hi = min(n, peak + 4)
-    segment = values[lo:hi]
-    between = int(np.count_nonzero(
-        (np.abs(segment - pre) > tol) & (np.abs(segment - post) > tol)))
+    # 1. Is there a ramp? Measure the transition from where the value LAST sat
+    #    at the old level to where it FIRST sits at the new one.
+    #
+    #    Counting "between" samples in a fixed window around the edge was not
+    #    enough, and failed in the direction that matters. The change-point
+    #    statistic anchors on the sharpest part of a move, which for a ramp is
+    #    its end -- so a fifteen-minute rise had its edge placed where the
+    #    value had already arrived, a +/-3 sample window saw only settled
+    #    readings, and a genuine regional event was reported as a
+    #    recalibration. Bracketing the transition finds its real length
+    #    wherever the edge was placed inside it.
+    search = max(4, int(OFFSET_SEARCH_S / max(1.0, _median_dt(seconds))))
+    lo = max(0, peak - search)
+    hi = min(n, peak + search + 1)
+    window = values[lo:hi]
+    at_pre = np.flatnonzero(np.abs(window - pre) <= tol)
+    at_post = np.flatnonzero(np.abs(window - post) <= tol)
+    if at_pre.size == 0 or at_post.size == 0:
+        return None                      # never clearly at one level or other
+
+    last_pre = int(at_pre[at_pre <= (peak - lo)].max()) if np.any(
+        at_pre <= (peak - lo)) else int(at_pre.min())
+    after = at_post[at_post > last_pre]
+    if after.size == 0:
+        return None
+    between = int(after.min()) - last_pre - 1
     if between > OFFSET_MAX_TRANSITION_SAMPLES:
         return None                      # it ramped: water, not a constant
 

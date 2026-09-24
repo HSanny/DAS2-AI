@@ -297,10 +297,11 @@ def build_fleet() -> list[SensorSpec]:
         ("Pandan1PS-Canal-Level", "Pandan1PS", "1031", "LevelSensor", 1.80, 0.01, "m"),
         ("PandanTG-Canal-Outlet-Flow", "PandanTG", "1030", "Flowrate", 12.0, 0.4, "L/s"),
     ]:
+        # No injected step: `couple_rainfall` drives these from the gauge,
+        # with a lag, after all the series are generated. A step here as well
+        # would be two mechanisms fighting over one series.
         add(description=desc, equipment=equip, site=site, rtu=rtu, dt_s=120,
-            base=base, noise=noise, unit=unit, diurnal_amp=base * 0.04,
-            fault="WEATHER_DRIVEN", fault_start_frac=0.58, fault_duration_h=2.0,
-            fault_detail={"relative_step": 0.40})
+            base=base, noise=noise, unit=unit, diurnal_amp=base * 0.04)
 
     # --- digital pump: ~1,567 of these run through the analog stack today ----
     add(description="BedokPS-Pump3-Run-Status", equipment="Pump", site="BedokPS",
@@ -394,7 +395,34 @@ def generate_series(spec: SensorSpec, start: datetime, end: datetime,
                                max(1.0, (fault_end - fault_start).total_seconds()))
                 value += detail.get("total_change", 5.0) * progress
             if fault in ("REGIONAL_EVENT", "WEATHER_DRIVEN", "TELEMETRY_FANOUT") and in_fault:
-                value += spec.base * detail.get("relative_step", -0.3)
+                step = spec.base * detail.get("relative_step", -0.3)
+                # Ramp in over a few minutes rather than stepping between two
+                # samples. Water has mass: a canal, a wet well or a trunk main
+                # takes time to change level, and the INSTRUMENT_OFFSET
+                # detector uses exactly that to tell a real move from an
+                # engineer entering a calibration constant. An instantaneous
+                # fixture step is therefore indistinguishable from a
+                # recalibration -- and was being correctly reported as one, so
+                # the fixture's headline regional event was arriving as an
+                # instrument fault.
+                #
+                # TELEMETRY_FANOUT keeps its instantaneous step on purpose:
+                # sensors on one RTU jumping in the same scan is precisely
+                # what a telemetry path failing looks like, and nothing
+                # physical connects them.
+                ramp_s = detail.get("ramp_s", 0.0 if fault == "TELEMETRY_FANOUT"
+                                    else 900.0)
+                if ramp_s > 0:
+                    # A trapezoid: rise, hold, recede. Ramping only the START
+                    # left the END an instantaneous step back to baseline, and
+                    # a recovery is a level shift too -- so the fixture's
+                    # regional event was still being reported as an instrument
+                    # offset, just at its other edge. An event that ends as
+                    # abruptly as a calibration is indistinguishable from one.
+                    into = (t - fault_start).total_seconds()
+                    out_of = (fault_end - t).total_seconds()
+                    step *= max(0.0, min(1.0, into / ramp_s, out_of / ramp_s))
+                value += step
             if fault == "RAINFALL" and in_fault:
                 # Rain arrives in bursts, not at a constant rate.
                 value += detail.get("peak_mm_per_interval", 1.5) * rng.uniform(0.2, 1.0)
@@ -485,6 +513,22 @@ def couple_pump(series: dict[str, list[tuple[datetime, float]]],
 
 
 #: The tank's three signals, and the geometry that ties them together.
+#: The rainfall-response scenario. A gauge, a canal level that answers it, and
+#: a flow downstream that answers it later.
+RAIN_GAUGE = "Pandan1PS-Rainfall"
+RAIN_LEVEL = "Pandan1PS-Canal-Level"
+RAIN_FLOW = "PandanTG-Canal-Outlet-Flow"
+
+#: Ground truth for the lag learner, in minutes. Inside PUB's Code of Practice
+#: range of 5-30 minutes for urban time of concentration, with the flow meter
+#: further down the system answering later than the level beside the gauge.
+RAIN_LAG_MIN = {RAIN_LEVEL: 25, RAIN_FLOW: 40}
+
+#: Leaky-integrator constants. `k` converts a millimetre of rain in one scan
+#: into a rise; `leak` drains it back towards baseline.
+RAIN_GAIN = {RAIN_LEVEL: 0.055, RAIN_FLOW: 3.2}
+RAIN_LEAK = 0.02
+
 TANK_LEVEL = "Kranji1PS-Service-Reservoir-Level"
 TANK_INLET = "Kranji1PS-Reservoir-Inlet-Flow"
 TANK_OUTLET = "Kranji1PS-Reservoir-Outlet-Flow"
@@ -492,6 +536,68 @@ TANK_AREA_M2 = 500.0
 TANK_UNDER_READ = 0.7
 TANK_FAULT_START_FRAC = 0.30
 TANK_FAULT_HOURS = 6.0
+
+
+def couple_rainfall(series: dict[str, list[tuple[datetime, float]]],
+                    *, clean: bool = False) -> None:
+    """
+    Drive the West canal level and flow from the rain gauge, with a real lag.
+
+    Why this is coupled rather than injected. The first version gave the two
+    West sensors an independent STEP at the same instant the gauge rained --
+    which is not what rainfall does to a catchment, and is not something a lag
+    can be learned from. Rain falls over hours; a canal integrates it, rises
+    while it is raining, and recedes afterwards. Cross-correlating a two-hour
+    rain block against a one-sample step finds r = 0.09 and correctly refuses
+    to report a lag, so the whole L2 layer went untested against the fixture
+    that was supposed to test it.
+
+    A leaky integrator is the simplest thing that is physically honest:
+
+        level[t] = level[t-1] + k * rain[t - lag] - leak * (level[t-1] - base)
+
+    The level beside the gauge answers in 25 minutes and the flow meter
+    downstream in 40, both inside the 5-30 minute time of concentration PUB's
+    Code of Practice gives for urban catchments -- the flow later because it is
+    further down the system. Those two numbers are the ground truth the lag
+    learner is scored against, and they are recorded in the manifest.
+    """
+    gauge = series.get(RAIN_GAUGE)
+    if clean or not gauge:
+        return
+
+    stamps = [t for t, _ in gauge]
+    rain = [max(0.0, v) for _, v in gauge]
+
+    for name in (RAIN_LEVEL, RAIN_FLOW):
+        target = series.get(name)
+        if not target:
+            continue
+        lag = timedelta(minutes=RAIN_LAG_MIN[name])
+        gain = RAIN_GAIN[name]
+        base = target[0][1]
+
+        # The target and the gauge report at different rates, so the rain that
+        # applies at each of the target's own timestamps is looked up rather
+        # than assumed to be aligned.
+        driven: list[tuple[datetime, float]] = []
+        level = base
+        cursor = 0
+        previous = target[0][0]
+        for stamp, value in target:
+            when = stamp - lag
+            while cursor + 1 < len(stamps) and stamps[cursor + 1] <= when:
+                cursor += 1
+            fell = rain[cursor] if stamps[cursor] <= when else 0.0
+            # Scale by elapsed time so a slow-reporting sensor is not driven
+            # less than a fast one by the same storm.
+            elapsed = max(1.0, (stamp - previous).total_seconds()) / 300.0
+            level += gain * fell * elapsed - RAIN_LEAK * (level - base) * elapsed
+            previous = stamp
+            # The sensor's own noise is kept: this replaces the baseline, not
+            # the instrument.
+            driven.append((stamp, level + (value - base)))
+        series[name] = driven
 
 
 def couple_tank(series: dict[str, list[tuple[datetime, float]]],
@@ -768,6 +874,7 @@ def build_manifest(fleet: list[SensorSpec],
         })
 
     return {
+        "rain_lag_minutes": dict(RAIN_LAG_MIN),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "seed": seed,
         "clean": clean,
@@ -808,6 +915,7 @@ def main() -> None:
     fleet = build_fleet()
     series = {s.description: generate_series(s, start, end, rng, clean=args.clean)
               for s in fleet}
+    couple_rainfall(series, clean=args.clean)
     couple_tank(series, start, clean=args.clean)
     couple_pump(series, start, end, clean=args.clean)
 

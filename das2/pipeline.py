@@ -70,6 +70,10 @@ class RunResult:
     loose: list[SensorAnomaly] = field(default_factory=list)
     incidents: list[Incident] = field(default_factory=list)
     rainfall_by_region: dict[str, float] = field(default_factory=dict)
+    #: Per-cluster rain evidence: how much, over which window, on whose
+    #: gauges, and whether a lag was measurable. Keyed the same way as
+    #: `rainfall_by_cluster` so an incident can find its own.
+    rain_context: dict = field(default_factory=dict)
     correlations: dict[str, float] = field(default_factory=dict)
     neighbour_results: list = field(default_factory=list)
     selected: list[Incident] = field(default_factory=list)
@@ -343,23 +347,55 @@ def run(config: Config, *, now: datetime | None = None,
     # `rainfall_by_region` is a whole-run total kept for the dashboard header;
     # using it to classify would let rain at any hour excuse an event at any
     # other hour.
+    # The window is shifted back by a LEARNED lag, not the incident's own.
+    #
+    # Rain that raises a level at 14:30 fell before 14:30. Integrating over the
+    # incident's window -- minutes, for a level shift -- asked whether it was
+    # raining at the instant the level moved, which is not how a catchment
+    # behaves. `das2.weather.context` measures the lag per cluster by
+    # cross-correlating rainfall against the members' rate of change, and
+    # declines to answer when the window was dry or the sensors still.
     rainfall_by_cluster: dict[str, float] = {}
+    rain_context: dict[str, "RainObservation"] = {}
     if config.rain.enabled and provider is not None and provider.available:
+        from das2.weather.context import observe_cluster, summarise
+
         for cluster in result.clusters:
-            total = provider.rainfall_mm(cluster.centroid_lat, cluster.centroid_lon,
-                                         cluster.start, cluster.end)
-            if total is not None:
-                rainfall_by_cluster[",".join(sorted(cluster.sensor_keys))] = total
+            key = ",".join(sorted(cluster.sensor_keys))
+            observed = observe_cluster(provider, cluster, readings, since, now)
+            rain_context[key] = observed
+            if observed.mm is not None:
+                rainfall_by_cluster[key] = observed.mm
         for anomaly in result.loose:
-            total = provider.rainfall_mm(anomaly.sensor.latitude,
-                                         anomaly.sensor.longitude,
-                                         anomaly.start, anomaly.end)
-            if total is not None:
-                rainfall_by_cluster[anomaly.sensor.sensor_key] = total
+            # A single sensor has no catchment to learn a lag from, so it gets
+            # the unshifted window and says so through its own observation.
+            observed = provider.observe(anomaly.sensor.latitude,
+                                        anomaly.sensor.longitude,
+                                        anomaly.start, anomaly.end)
+            rain_context[anomaly.sensor.sensor_key] = observed
+            if observed.mm is not None:
+                rainfall_by_cluster[anomaly.sensor.sensor_key] = observed.mm
+
+        result.rain_context = rain_context
+        result.stats["rain_context"] = summarise(rain_context)
+        log.info("rain context: %s", result.stats["rain_context"])
 
     candidates = build_incidents(result.clusters, now=now, loose=result.loose,
                                  correlations=result.correlations,
                                  rainfall=rainfall_by_cluster)
+
+    # Attach the rain PROVENANCE, not just the number. A millimetre figure on
+    # its own cannot be checked: a reader disagreeing with a WEATHER_DRIVEN
+    # verdict needs to see how many gauges, how far away, over which window,
+    # and whether a lag was measurable at all.
+    for candidate in candidates:
+        key = (",".join(sorted(candidate.cluster.sensor_keys))
+               if len(candidate.cluster.members) > 1
+               else next(iter(candidate.cluster.sensor_keys), ""))
+        observed = rain_context.get(key)
+        if observed is not None and observed.known:
+            candidate.detail["rain_evidence"] = observed.describe()
+            candidate.detail["rain_context"] = observed.context
 
     if open_incidents:
         from das2.incident.build import reconcile

@@ -447,6 +447,9 @@ def _anatomy_block(fig, incident, top: float) -> float:
                f"severity {incident.severity:.0f}"]
     if incident.rainfall_mm is not None:
         context.append(f"rain {incident.rainfall_mm:.1f} mm")
+    evidence = (incident.detail or {}).get("rain_evidence")
+    if evidence:
+        context.append(evidence)
     if incident.neighbour_correlation is not None:
         context.append(f"neighbours r={incident.neighbour_correlation:.2f}")
     fig.text(L, top, when + "   ·   ".join(context),
