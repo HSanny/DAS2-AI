@@ -47,7 +47,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt                        # noqa: E402
 from matplotlib.backends.backend_pdf import PdfPages   # noqa: E402
 
-from das2.incident import parameters                   # noqa: E402
+from das2.incident import parameters, signature        # noqa: E402
 from das2.report import charts, narrative, theme       # noqa: E402
 
 log = logging.getLogger("das2.report.pdf")
@@ -64,6 +64,12 @@ L, R = 0.045, 0.955
 TOP, BOTTOM = 0.93, 0.06
 
 MAX_TABLE_ROWS = 18          # per page, at SIZE_BODY with comfortable leading
+
+#: Characters that fit the text column at each size. Matplotlib clips silently
+#: at the figure edge, so anything drawn as a single `fig.text` has to be
+#: wrapped to a measured width or it loses its tail without an error.
+FOOTER_WRAP = 185            # SIZE_TINY
+CONTEXT_WRAP = 155           # SIZE_SMALL
 
 
 # --------------------------------------------------------------------------- #
@@ -87,8 +93,15 @@ def _page(pdf: PdfPages, title: str, subtitle: str = "", *,
                  color=theme.INK_MUTED, va="center", wrap=True)
         y -= 0.030
     if footer:
-        fig.text(L, 0.025, footer, fontsize=theme.SIZE_TINY,
-                 color=theme.INK_MUTED, va="center")
+        # Wrapped, and stacked UPWARDS from the bottom margin. Drawn as one
+        # `fig.text` it simply ran off the right edge of the paper: matplotlib
+        # clips at the figure boundary without complaining, so a footnote that
+        # grew by a sentence lost its last clause silently -- which on this
+        # page is the sentence saying a reading never decided anything.
+        lines = textwrap.wrap(footer, FOOTER_WRAP)
+        for i, line in enumerate(reversed(lines)):
+            fig.text(L, 0.025 + i * 0.016, line, fontsize=theme.SIZE_TINY,
+                     color=theme.INK_MUTED, va="center")
     return fig, y
 
 
@@ -420,17 +433,27 @@ def _anatomy_pages(pdf: PdfPages, result, *, limit: int = 6) -> None:
             + (f" · page {page_no} of {pages}" if pages > 1 else ""),
             footer="Direction comes from the signed deviation of each sensor's "
                    "dominant finding. A parameter whose sensors disagree is "
-                   "reported as mixed rather than resolved by majority.")
+                   "reported as mixed rather than resolved by majority. A "
+                   "reading describes the incident; it never changed how it "
+                   "was classified or what was recommended.")
 
         top = y - 0.03
-        for incident in chunk:
-            top = _anatomy_block(fig, incident, top)
+        # Share the page rather than letting the first block take what it
+        # likes. A twelve-parameter incident on top of a four-parameter one used
+        # to run the second block off the bottom of the page, which is a silent
+        # loss of exactly the detail this page exists to show. The last block
+        # gets everything still unspent, so a short one above it donates its
+        # slack instead of leaving a third of the paper blank.
+        for n, incident in enumerate(chunk):
+            top = _anatomy_block(fig, incident, top,
+                                 budget=(top - BOTTOM) / (len(chunk) - n))
         _close(pdf, fig)
 
 
-def _anatomy_block(fig, incident, top: float) -> float:
+def _anatomy_block(fig, incident, top: float, *, budget: float = 0.42) -> float:
     """One incident's parameter table. Returns the y to continue from."""
     groups = parameters.breakdown(incident)
+    started = top
 
     fig.text(L, top, f"{incident.priority.value}  {incident.incident_class.value}"
                      f"   ·   {_region_of(incident)}   ·   {_sites_of(incident)}",
@@ -452,9 +475,14 @@ def _anatomy_block(fig, incident, top: float) -> float:
         context.append(evidence)
     if incident.neighbour_correlation is not None:
         context.append(f"neighbours r={incident.neighbour_correlation:.2f}")
-    fig.text(L, top, when + "   ·   ".join(context),
-             fontsize=theme.SIZE_SMALL, color=theme.INK_MUTED, va="center")
-    top -= 0.034
+    wrapped = textwrap.wrap(when + "   ·   ".join(context), CONTEXT_WRAP)
+    for i, line in enumerate(wrapped[:2]):
+        fig.text(L, top, line + ("…" if i == 1 and len(wrapped) > 2 else ""),
+                 fontsize=theme.SIZE_SMALL, color=theme.INK_MUTED, va="center")
+        top -= 0.022
+    top -= 0.012
+
+    top = _signature_lines(fig, incident, top)
 
     rows = [(g.display, g.count, len(g.sites), g.direction_text(),
              g.move_text() or "—",
@@ -462,7 +490,18 @@ def _anatomy_block(fig, incident, top: float) -> float:
                        for t in g.behaviours[:2]),
              g.flag.name)
             for g in groups]
-    height = min(0.30, 0.045 + 0.028 * len(rows))
+
+    # What is left of this block's share of the page, once the heading, the
+    # context line and any reading have taken theirs.
+    room = max(0.06, budget - (started - top) - 0.055)
+    height = min(0.30, room, 0.045 + 0.028 * len(rows))
+    if 0.045 + 0.028 * len(rows) > height:
+        keep = max(1, int((height - 0.045) / 0.028))
+        hidden = len(rows) - keep
+        rows = rows[:keep]
+        height = 0.045 + 0.028 * len(rows)
+        rows.append((f"+{hidden} more parameter(s)", "", "", "see the region "
+                     "page for the full breakdown", "", "", ""))
     _table(fig, (L, top - height, R - L, height),
            [("parameter", 0.18, "left"), ("sensors", 0.07, "right"),
             ("sites", 0.06, "right"), ("direction", 0.20, "left"),
@@ -470,6 +509,54 @@ def _anatomy_block(fig, incident, top: float) -> float:
             ("behaviour", 0.26, "left"), ("qartod", 0.10, "left")],
            rows)
     return top - height - 0.055
+
+
+def _signature_lines(fig, incident, top: float) -> float:
+    """
+    What the moving parameters usually mean, if anything is known to mean it.
+
+    Printed under the evidence and above the numbers, never in place of the
+    recommendation: an operator reading "reads as stormwater response" must
+    still see the class and the action that were computed WITHOUT it. The
+    falsifier rides on the same block for the same reason -- a hedged sentence
+    with nothing to check it against is a horoscope, and the line below it is
+    how a PUB engineer corrects the rule.
+
+    The signature's own `action` is deliberately NOT rendered. Several read
+    like instructions -- STORMWATER_RESPONSE's is *"Log it. This is the trip
+    not worth making"* -- and printing that beside a computed "investigate the
+    area" lets an unvalidated rule countermand a decision in the reader's head,
+    which is the exact failure the layer was built to avoid. It is carried in
+    the detail and on the dashboard for whoever is reviewing the rules; it
+    reaches an operator's alert when a rule reaches `confirmed`, and not
+    before.
+    """
+    sig = signature.attached(incident)
+    if not sig:
+        return top
+
+    headline = sig.get("headline") or ""
+    caveat = sig.get("caveat") or ""
+    fig.text(L, top, headline, fontsize=theme.SIZE_BODY,
+             fontweight=theme.WEIGHT_BOLD, color=theme.INK_SECONDARY,
+             va="center")
+    if caveat:
+        fig.text(R, top, caveat, fontsize=theme.SIZE_TINY,
+                 color=theme.INK_MUTED, va="center", ha="right")
+    top -= 0.026
+
+    for line in textwrap.wrap(sig.get("reads_as") or "", 140)[:2]:
+        fig.text(L, top, line, fontsize=theme.SIZE_SMALL,
+                 color=theme.INK_SECONDARY, va="center")
+        top -= 0.021
+
+    changes = sig.get("would_change_it") or ""
+    if changes:
+        wrapped = textwrap.wrap(f"Would change this reading: {changes}", 150)
+        fig.text(L, top, wrapped[0] + ("…" if len(wrapped) > 1 else ""),
+                 fontsize=theme.SIZE_TINY, color=theme.INK_MUTED, va="center")
+        top -= 0.024
+    return top
 
 
 def _map_page(pdf: PdfPages, result) -> None:

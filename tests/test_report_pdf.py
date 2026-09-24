@@ -31,7 +31,7 @@ from types import SimpleNamespace as NS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from das2.incident import parameters        # noqa: E402
+from das2.incident import parameters, signature  # noqa: E402
 from das2.models import AnomalyType, PhysicalSeverity  # noqa: E402
 from das2.report import charts, pdf, theme  # noqa: E402
 from das2.spatial.regions import Region     # noqa: E402
@@ -91,7 +91,7 @@ def incident(idx: int, site_idx: int, severity: float, cls: str) -> NS:
     name, lat, lon, region = SITES[site_idx % len(SITES)]
     priority = ("P1" if severity >= 80 else "P2" if severity >= 60
                 else "P3" if severity >= 35 else "P4")
-    return NS(
+    built = NS(
         incident_id=f"INC{idx:04d}",
         cluster=NS(centroid_lat=lat, centroid_lon=lon, region=region,
                    members=[member(name, k, str(region.value))
@@ -105,6 +105,13 @@ def incident(idx: int, site_idx: int, severity: float, cls: str) -> NS:
         recommendation="Multiple sites affected together - investigate the "
                        "area, not one sensor.",
     )
+    # The reading the pipeline attaches, through the same code path the
+    # pipeline uses. Built here rather than hand-written so a rule edited in
+    # `event_signatures.yaml` cannot drift away from what this pins.
+    found = signature.match(built, rain_context="dry")
+    if found is not None:
+        built.detail[signature.DETAIL_KEY] = signature.as_detail(found)
+    return built
 
 
 def busy_run(n: int = 198) -> NS:
@@ -153,6 +160,83 @@ def busy_run(n: int = 198) -> NS:
             "baselines": {"sensors": 0, "usable": 0},
         },
     )
+
+
+WIDE = ["CanalLevel", "Level", "Flowrate", "Pressure", "Pump", "Valve",
+        "Vibration", "Current", "Voltage", "Temperature", "Rainfall",
+        "Conductivity"]
+
+
+def crowded_run() -> NS:
+    """Two incidents, each carrying every parameter class we classify."""
+    run = busy_run(n=6)
+    for idx, inc in enumerate(run.incidents[:2]):
+        inc.severity = 90.0 - idx
+        inc.priority = NS(value="P1")
+        inc.cluster.members = [
+            NS(sensor=NS(description=f"Site{idx}-{name}", sensor_key=f"W{k}",
+                         equipment=name, site=f"Site {idx}", unit="m",
+                         region="East"),
+               dominant_type=AnomalyType.LEVEL_SHIFT, score=40.0,
+               severity=PhysicalSeverity(deviation=0.5, signed_deviation=-0.5,
+                                         unit="m", duration_s=10800))
+            for k, name in enumerate(WIDE)]
+        found = signature.match(inc, rain_context="dry")
+        if found is not None:
+            inc.detail[signature.DETAIL_KEY] = signature.as_detail(found)
+    run.alertable = run.incidents[:2]
+    return run
+
+
+def _check_crowded_page() -> None:
+    try:
+        import pymupdf
+    except ImportError:
+        print("    (pymupdf absent -- page-bounds assertions skipped)")
+        return
+
+    run = crowded_run()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = pdf.write(run, Path(tmp) / "crowded.pdf", stamp="test")
+        doc = pymupdf.open(out)
+        page = next((p for p in doc if "made of" in p.get_text()), None)
+        if page is None:
+            check("the crowded incidents reach an anatomy page", False)
+            doc.close()
+            return
+
+        text = page.get_text()
+        height = page.rect.height
+        footer = ("Direction comes from the signed deviation of each sensor's "
+                  "dominant finding. A parameter whose sensors disagree is "
+                  "reported as mixed rather than resolved by majority. A "
+                  "reading describes the incident; it never changed how it "
+                  "was classified or what was recommended.")
+        stray = [line for line, rect in _lines(page)
+                 if rect.y1 > height * 0.955 and line.strip() not in footer]
+        check("the only thing in the bottom margin is the footnote",
+              not stray, "; ".join(stray[:2]) or "clean")
+        check("both incidents still get their heading",
+              text.count("P1  ") >= 2, f"{text.count('P1  ')} heading(s)")
+        check("a table too tall for its share says what it dropped",
+              "more parameter(s)" in text,
+              "twelve parameters in half a page cannot all be shown; "
+              "cutting them off without saying so is the silent loss")
+        check("and the reading survives the squeeze",
+              "Would change this reading" in text)
+        check("the rule's own ACTION is not printed beside the real one",
+              "Log it." not in text,
+              "'log it, this is the trip not worth making' next to a computed "
+              "'investigate the area' lets an unchecked rule countermand a "
+              "decision in the reader's head")
+        doc.close()
+
+
+def _lines(page):
+    for block in page.get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+            text = "".join(span["text"] for span in line["spans"])
+            yield text, __import__("pymupdf").Rect(line["bbox"])
 
 
 def main() -> int:
@@ -263,10 +347,31 @@ def main() -> int:
                   "kind of problem it is")
             check("the breakdown reaches the incident pages",
                   "Canal Level" in text and "typical move" in text.lower())
+            check("the reading is offered, hedged",
+                  "Looks like:" in text,
+                  "an unvalidated rule asserted flatly is how the system "
+                  "loses the argument the first time it is wrong")
+            check("and never without what would falsify it",
+                  "Would change this reading" in text,
+                  "a hedged sentence with nothing to check it against is a "
+                  "horoscope; this line is how PUB corrects the rule")
+            check("the reading does not displace the decision",
+                  text.index("Investigate the area")
+                  < text.index("Looks like:"),
+                  "the class and the action were computed without it and "
+                  "must be read first")
             check("the explanation is continued, never truncated",
                   "never alerted on" in text,
                   "the caveats sit last, so an overflowing page drops the "
                   "limits and keeps the counts they invalidate")
+
+    print("\nnothing is drawn off the bottom of the paper")
+    # Matplotlib clips at the figure edge in silence, so a page that grew by a
+    # sentence loses its last line with no error anywhere. Two twelve-parameter
+    # incidents to a page is the case that overruns: without a height budget
+    # the first block takes what it likes and the second is drawn into the
+    # margin, which is a silent loss of exactly what this page exists to show.
+    _check_crowded_page()
 
     print("\nthe explanation says what happened, in sentences")
     from das2.report import narrative
@@ -352,6 +457,12 @@ def main() -> int:
                   "need a decision" in caption)
             check("the caption says how many were held back",
                   "held back" in caption)
+            check("the caption offers the worst incident's reading, hedged",
+                  "Looks like:" in caption and "unvalidated" in caption,
+                  "read on a lock screen, so it carries the headline and "
+                  "the hedge and nothing else")
+            check("but the decision count is still read first",
+                  caption.index("need a decision") < caption.index("Looks like"))
             check("the caption fits Telegram's limit",
                   len(caption) <= tg.CAPTION_MAX,
                   f"{len(caption)} of {tg.CAPTION_MAX}")

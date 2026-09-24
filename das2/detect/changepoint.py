@@ -98,6 +98,12 @@ MIN_SHIFT_MAD = 6.0
 #: spikes, and `detect_spike` owns those.
 MIN_SUSTAIN_S = 1800.0
 
+#: How far past `min_sustain_s` the "is it still displaced?" window extends.
+#: Two, so the check looks at roughly the half-hour to hour after the step --
+#: long enough that a spike has already returned, short enough that an event
+#: which recovers two hours later is still counted as having happened.
+SUSTAIN_TAIL_FACTOR = 2.0
+
 #: A sensor producing more than this many level shifts in one window is
 #: DUTY-CYCLING, not faulting, and the detector abstains on it entirely.
 #:
@@ -353,10 +359,25 @@ def detect_level_shift(ts: pd.Series, values: np.ndarray,
 
         # Sustained? Compare the level well after the change against the level
         # before it. A step that has already reverted is a spike.
+        # Sustained means "still displaced a while later", NOT "displaced for
+        # the rest of the window".
+        #
+        # The tail used to run to the end of the series, and that silently
+        # discarded every event that recovers. On the fixture's regional event
+        # -- four sites dropping together for 2.5 hours and then coming back --
+        # the median of everything after the drop is the baseline the sensor
+        # returned to, so the drop measured as "not sustained" and was thrown
+        # away. Only the RECOVERY survived, which is how a pressure loss came
+        # to be reported as a pressure rise. Most real water events are
+        # transient; a test that only accepts permanent ones is not a
+        # level-shift detector.
         tail_start = np.searchsorted(seconds, seconds[peak] + min_sustain_s)
+        tail_end = np.searchsorted(seconds,
+                                   seconds[peak] + min_sustain_s * SUSTAIN_TAIL_FACTOR)
         if tail_start >= n:
             tail_start = n - max(4, half // 2)
-        tail = values[tail_start:]
+            tail_end = n
+        tail = values[tail_start:max(tail_end, tail_start + 4)]
         if tail.size < 4:
             continue
         pre = float(np.median(values[max(0, peak - half):peak]))
@@ -389,4 +410,81 @@ def detect_level_shift(ts: pd.Series, values: np.ndarray,
                 **extra,
             },
         ))
-    return signals
+    return _collapse_excursions(signals)
+
+
+#: A return within this share of the departure counts as coming back.
+EXCURSION_RETURN_TOLERANCE = 0.35
+
+#: And it has to be of comparable size -- a small drift back is not a recovery.
+EXCURSION_COMPARABLE = 0.5
+
+
+def _collapse_excursions(signals: list[Signal]) -> list[Signal]:
+    """
+    An event and its own recovery are ONE finding, not two.
+
+    Once the sustain test stopped discarding events that recover -- which it
+    used to, silently, by taking the median of everything after the step --
+    the fixture's regional event started arriving twice: once for the drop,
+    once for the return. Two incidents at the same four sites, two hours
+    apart, for one thing that happened. That is worse for an operator than
+    missing the onset, because now they have to work out that the second
+    message is the first one ending.
+
+    A departure followed by a return to roughly where it started is collapsed
+    into one signal spanning both, carrying the DEPARTURE's sign and
+    magnitude. The recovery is not lost -- it becomes `recovered_after_h`,
+    which is the more useful fact anyway: an excursion that has already ended
+    needs a different response from one still running.
+    """
+    if len(signals) < 2:
+        return signals
+
+    ordered = sorted(signals, key=lambda s: s.start)
+    used: set[int] = set()
+    out: list[Signal] = []
+
+    for i, first in enumerate(ordered):
+        if i in used:
+            continue
+        partner = None
+        for j in range(i + 1, len(ordered)):
+            if j in used:
+                continue
+            second = ordered[j]
+            if first.magnitude * second.magnitude >= 0:
+                continue                      # same direction: not a return
+            if abs(second.magnitude) < EXCURSION_COMPARABLE * abs(first.magnitude):
+                continue                      # too small to be the recovery
+            before = (first.detail or {}).get("before")
+            after = (second.detail or {}).get("after")
+            if before is None or after is None:
+                continue
+            if abs(after - before) > EXCURSION_RETURN_TOLERANCE * abs(first.magnitude):
+                continue                      # did not come back to where it was
+            partner = (j, second)
+            break
+
+        if partner is None:
+            out.append(first)
+            continue
+
+        j, second = partner
+        used.add(j)
+        held_h = max(0.0, (second.start - first.end).total_seconds() / 3600.0)
+        detail = dict(first.detail or {})
+        detail["recovered_after_h"] = round(
+            (second.end - first.start).total_seconds() / 3600.0, 2)
+        detail["held_h"] = round(held_h, 2)
+        out.append(Signal(
+            type=first.type,
+            start=first.start,
+            end=second.end,
+            detector=first.detector,
+            magnitude=first.magnitude,        # the DEPARTURE is the event
+            unit=first.unit,
+            n_points=(first.n_points or 0) + (second.n_points or 0),
+            detail=detail,
+        ))
+    return sorted(out, key=lambda s: s.start)

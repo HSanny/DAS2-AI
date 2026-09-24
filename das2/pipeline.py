@@ -384,6 +384,9 @@ def run(config: Config, *, now: datetime | None = None,
                                  correlations=result.correlations,
                                  rainfall=rainfall_by_cluster)
 
+    from das2.incident import signature
+    signature_matches: list = []
+
     # Attach the rain PROVENANCE, not just the number. A millimetre figure on
     # its own cannot be checked: a reader disagreeing with a WEATHER_DRIVEN
     # verdict needs to see how many gauges, how far away, over which window,
@@ -393,9 +396,23 @@ def run(config: Config, *, now: datetime | None = None,
                if len(candidate.cluster.members) > 1
                else next(iter(candidate.cluster.sensor_keys), ""))
         observed = rain_context.get(key)
+        context = "unknown"
         if observed is not None and observed.known:
             candidate.detail["rain_evidence"] = observed.describe()
             candidate.detail["rain_context"] = observed.context
+            context = observed.context
+
+        # What the moving parameters usually mean. DESCRIPTIVE: it is attached
+        # to the incident and never consulted when deciding its class,
+        # priority or recommendation. A wrong evidence class costs a wasted
+        # trip; a wrong signature able to stop a dispatch costs a flood.
+        found = signature.match(candidate, rain_context=context)
+        if found is not None:
+            candidate.detail[signature.DETAIL_KEY] = signature.as_detail(found)
+        signature_matches.append(found)
+
+    result.stats["signatures"] = signature.summary(signature_matches)
+    log.info("signatures: %s", result.stats["signatures"])
 
     if open_incidents:
         from das2.incident.build import reconcile

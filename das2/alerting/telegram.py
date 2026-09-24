@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
 
+from das2.incident import signature
 from das2.models import AckState, Incident, IncidentClass
 
 log = logging.getLogger("das2.alerting.telegram")
@@ -143,6 +144,22 @@ def compose(incident: Incident, *, dashboard_url: str | None = None) -> str:
         lines.append(f"<b>Rain nearby:</b> {incident.rainfall_mm:.1f} mm")
     if incident.neighbour_correlation is not None:
         lines.append(f"<b>Neighbours:</b> r={incident.neighbour_correlation:.2f}")
+
+    # The reading goes BELOW the recommendation, never above it. The class and
+    # the action on lines one and two were computed without any of this; a
+    # sentence about what the parameters usually mean must not be the first
+    # thing read, because "looks like stormwater" is exactly the phrase someone
+    # would stop reading after.
+    sig = signature.attached(incident)
+    if sig:
+        lines += ["", f"<b>{_esc(sig.get('headline', ''))}</b>"]
+        if sig.get("reads_as"):
+            lines.append(_esc(sig["reads_as"]))
+        if sig.get("would_change_it"):
+            lines.append(f"<i>Would change this reading: "
+                         f"{_esc(sig['would_change_it'])}</i>")
+        if sig.get("caveat"):
+            lines.append(f"<i>({_esc(sig['caveat'])})</i>")
 
     evidence = incident.detail.get("evidence") or []
     if evidence:
@@ -437,6 +454,22 @@ def _report_caption(result, alertable: list) -> str:
                      f"{PRIORITY_ICON['P1']} <b>{urgent}</b> need a decision now")
     else:
         lines.append("No P1 or P2 this run.")
+
+    # One reading, for the most severe incident that HAS one, named so nobody
+    # reads it as a verdict on the whole run. A caption is read on a lock
+    # screen, so it carries the headline and the hedge and nothing else; the
+    # sentence behind it, and what would falsify it, are in the report.
+    for incident in sorted(alertable, key=lambda i: -i.severity):
+        reading = signature.attached(incident)
+        if not reading:
+            continue
+        where = str(getattr(incident.cluster.region, "value",
+                            incident.cluster.region) or "unplaced")
+        lines.append(f"{_esc(where)} {incident.priority.value} — "
+                     f"{_esc(reading.get('headline', ''))}"
+                     + (f" ({_esc(reading['caveat'])})"
+                        if reading.get("caveat") else ""))
+        break
     lines.append(f"{len(result.incidents)} open incident(s) · "
                  f"{held} held back, with reasons inside")
     lines.append("")

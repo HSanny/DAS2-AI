@@ -149,8 +149,19 @@ def main() -> int:
     event[500:508] += ramp
     event[508:640] += 0.35
     event[640:660] += np.linspace(0.35, 0, 20)
+    # The departure and its recovery are collapsed into one finding by
+    # `_collapse_excursions`, so this is one signal spanning both, carrying
+    # the departure's sign.
+    ramped = detect_level_shift(TS, event, unit="m")
     check("one that ramps in and recedes is the water",
-          types_of(event) == [AnomalyType.LEVEL_SHIFT])
+          [s.type for s in ramped] == [AnomalyType.LEVEL_SHIFT],
+          f"{len(ramped)} finding(s)")
+    check("and the recovery is folded into it, not reported separately",
+          ramped and "recovered_after_h" in ramped[0].detail,
+          "two messages for one event is worse than missing its onset")
+    check("the finding keeps the DEPARTURE's sign",
+          ramped and ramped[0].magnitude > 0,
+          "the event is the rise; the return is it ending")
 
     sustained = base.copy()
     sustained[500:508] += ramp

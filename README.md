@@ -41,7 +41,7 @@ docker compose up -d das2 das2-ack        # go live
 |---|---|
 | `output/dashboard_*.html` | Regional map, region × equipment-type heatmap, every incident with the evidence behind its recommendation. Self-contained — email it, archive it, open it from a share. |
 | `output/*.png` | The same as images, for Telegram |
-| Telegram | One message **per incident**, not per sensor per run, with Acknowledge / Dispatched / False-alarm buttons |
+| Telegram | Two artefacts per run — the map of Singapore, then one PDF analysing the run: what to act on, what each incident is made of, what was held back and why. Per-incident messages with Acknowledge / Dispatched / False-alarm buttons are opt-in (`alert.p1_detail_messages`) |
 | SQL Server | Incidents with stable identity across runs, the reading history the daily job learns from, plus the operator feedback that is the only ground truth this system has |
 
 ## How it works
@@ -66,10 +66,27 @@ The second case is invisible to name-based grouping, which is what the previous
 system used: four different sensors at three different sites share no name, so
 nothing linked them.
 
+### Two files you are meant to edit
+
+Both live in `das2/data/` and are read at start-up, so a change is an edit and
+a restart, not a code change.
+
+| | |
+|---|---|
+| `equipment_rules.yaml` | What each sensor **is**, matched from its description, and which classes may raise an alert |
+| `event_signatures.yaml` | What a set of moving parameters usually **means** — "levels and flows rose together while it was raining" — in your engineers' words |
+
+A signature only ever *describes* an incident. It cannot change the class, the
+priority or the recommendation, and it never suppresses an alert: a wrong
+evidence class costs a wasted trip, a wrong reading able to stop a dispatch
+costs a flood. Every entry carries what would prove it wrong, and the report
+prints that line underneath it. Correcting one is the ground truth this system
+does not otherwise have.
+
 ## Development
 
 ```bash
-bash tests/run_all.sh              # 632 assertions, no network needed
+bash tests/run_all.sh              # 1018 assertions, no network needed
 python3 -m das2.cli demo           # synthetic data with known faults
 python3 tools/make_fixtures.py --out /tmp/fx
 ```
@@ -87,5 +104,5 @@ Two things to know before judging the output. The **daily profile job**
 (`das2 profile`) must be scheduled: `DRIFT`, `NOISE_BURST` and the whole
 baseline layer depend on it, and until it has run those produce nothing. And
 there is **no shadow-mode harness yet**, so there is no measured precision or
-recall against real data — the evidence is 632 assertions and a fixture
+recall against real data — the evidence is 1018 assertions and a fixture
 carrying 19 known faults, which is real but is not the same claim.

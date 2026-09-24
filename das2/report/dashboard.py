@@ -90,6 +90,10 @@ def _incident_json(incident: Incident) -> dict[str, Any]:
         "end": c.end.isoformat() if c.end else None,
         "recommendation": incident.recommendation,
         "evidence": incident.detail.get("evidence", []),
+        # The reading, if one fits. Carried whole -- headline, sentence and
+        # falsifier -- because a hedged claim shown without what would
+        # disprove it is the one form of this that is worse than silence.
+        "signature": incident.detail.get("signature") or None,
         "correlation": incident.neighbour_correlation,
         "rainfall_mm": incident.rainfall_mm,
         "ack": incident.ack_state.value,
@@ -273,6 +277,11 @@ _TEMPLATE = r"""<!DOCTYPE html>
   .ev { margin:0 0 10px; padding-left:18px; }
   .ev li { margin:2px 0; color:var(--muted); }
   .rec { font-weight:600; margin-bottom:10px; }
+  /* The reading sits BELOW the recommendation and is set apart from it, so
+     it cannot be mistaken for the verdict it describes. */
+  .sig { margin:0 0 10px; padding:8px 12px; border-left:3px solid var(--muted);
+         background:rgba(127,127,127,.06); }
+  .sig .muted { font-size:12px; }
   .muted { color:var(--muted); }
   .suppressed td { opacity:.5; }
   .empty { text-align:center; padding:40px; color:var(--muted); }
@@ -532,6 +541,11 @@ if (!inc.length) {
     <tr class="det" id="d${n}"><td colspan="8">
       <div class="rec">${esc(i.recommendation)}</div>
       <ul class="ev">${i.evidence.map(e => `<li>${esc(e)}</li>`).join("")}</ul>
+      ${i.signature ? `<div class="sig"><b>${esc(i.signature.headline)}</b>
+        <div>${esc(i.signature.reads_as)}</div>
+        <div class="muted">Would change this reading:
+          ${esc(i.signature.would_change_it)}</div>
+        <div class="muted">${esc(i.signature.caveat)}</div></div>` : ""}
       ${i.rainfall_mm != null ? `<div class="muted">Rainfall nearby: ${i.rainfall_mm} mm</div>` : ""}
       ${i.correlation != null ? `<div class="muted">Neighbour correlation: r=${i.correlation}</div>` : ""}
       <table style="margin-top:10px">

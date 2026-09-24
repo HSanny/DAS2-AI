@@ -101,6 +101,12 @@ DEFAULT_MERGE_GAP_MIN = 30
 #: Units that express a duration rather than a deviation from expected value.
 TIME_UNITS = frozenset({"s", "sec", "seconds", "min", "h"})
 
+#: Two magnitudes within this share of each other are "comparable", and the
+#: earlier one carries the sign. 0.75 is wide enough to catch a recovery that
+#: measures a little larger than its own departure, and narrow enough that a
+#: genuine step still outranks the drift before it.
+COMPARABLE_SHARE = 0.75
+
 #: Corroboration bonus. Two detectors answering different physical questions and
 #: agreeing is real evidence, but it is a modifier on severity, never a gate.
 CORROBORATION_BONUS = 1.15
@@ -181,7 +187,25 @@ def _severity(signals: list[Signal], sensor: SensorMeta,
     # nothing could tell "level rising while flow rises" (rain) from "level
     # rising while flow falls" (an obstruction). Ranking still uses the
     # magnitude; only the reporting layers need the sign.
+    # Which signal's SIGN describes the event.
+    #
+    # The largest magnitude, except that a fault which departs and returns
+    # produces two comparable signals -- a fall and its recovery -- and taking
+    # whichever happens to measure larger reports the direction by coin toss.
+    # On the fixture's regional event, four pressures and flows dropping
+    # together were reported as RISING, because the recovery came out a
+    # fraction bigger than the drop that caused it.
+    #
+    # The departure from normal is the event; the return is it ending. So
+    # among signals of comparable size, the earliest wins. A small drift
+    # followed by a large step is unaffected: the step is not comparable in
+    # size, so it still carries the sign.
     dominant = max(with_magnitude, key=lambda s: abs(s.magnitude), default=None)
+    if dominant is not None:
+        largest = abs(dominant.magnitude)
+        comparable = [s for s in with_magnitude
+                      if abs(s.magnitude) >= COMPARABLE_SHARE * largest]
+        dominant = min(comparable, key=lambda s: s.start)
     signed = float(dominant.magnitude) if dominant is not None else 0.0
     deviation = abs(signed)
     unit = (dominant.unit if dominant is not None else "") or sensor.unit or ""

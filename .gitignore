@@ -31,9 +31,15 @@ deploy/.env
 deploy/notes.txt
 **/notes.txt
 
-# Deployment artefacts holding real credentials or real data
-output/
-data/
+# Deployment artefacts holding real credentials or real data.
+#
+# ROOT-ANCHORED on purpose. Written as `data/`, the pattern matched EVERY
+# directory called data, which quietly included `das2/data/` -- the package's
+# own config. `event_signatures.yaml` is meant to be edited by a PUB engineer
+# and is useless if git will not track it, and the rules file next to it was
+# only in the repo because it had been force-added.
+/output/
+/data/
 *.db
 *.sqlite
 docker-compose.override.yml

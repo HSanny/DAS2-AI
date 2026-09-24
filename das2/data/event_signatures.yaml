@@ -1,0 +1,211 @@
+# DAS2-AI — event signatures
+# ===========================================================================
+# WHAT THIS FILE IS
+#
+# A table of "when these parameters move this way, in this rain context, it
+# usually means this". It turns a list of measurements into a sentence an
+# operator can act on or argue with.
+#
+# It is EDITABLE ON PURPOSE. This system has no labelled incidents, no
+# hydraulic model and no catchment map, so these rules cannot be derived from
+# data — they are hydraulic reasoning, and the people who know whether they
+# hold on PUB's network are PUB's engineers, not this file's author. Correcting
+# a rule here is a five-minute edit and a restart, not a code change, and your
+# corrections are the ground truth the system does not otherwise have.
+#
+#
+# WHAT A SIGNATURE CANNOT DO
+#
+# It cannot change what the system decides. The incident CLASS —
+# REGIONAL_EVENT, SENSOR_FAULT, TELEMETRY_FANOUT — is what drives priority and
+# dispatch, and it is computed from evidence the system can actually measure:
+# how many sites, how many parameters, whether the neighbours moved, what the
+# rain did. A signature sits beside that verdict and describes it. It never
+# suppresses an alert and never raises one.
+#
+# That separation is deliberate. A wrong evidence class costs a wasted trip; a
+# wrong signature that could stop a dispatch costs a flood. Until these rules
+# have been checked against real incidents, they get to explain and not to
+# decide.
+#
+#
+# STATUS, AND WHY EVERY ENTRY HAS ONE
+#
+#   supported    a published method or finding backs this reading
+#   unvalidated  plausible hydraulics, unchecked against this network
+#   confirmed    PUB has reviewed it against real incidents and agreed
+#
+# Nothing starts `confirmed`. Move an entry there once your operators have
+# seen it fire on incidents they recognise, and the report will stop hedging
+# about it.
+#
+#
+# HOW A SIGNATURE IS MATCHED
+#
+# First match wins, so order matters — most specific first. Every `parameters`
+# clause must be satisfied, and `rain_context` must match if present.
+#
+#   parameters:
+#     - any_of:      [CanalLevel, Level]   equipment classes, any one counts
+#       direction:   rising|falling|mixed|any
+#       min_sensors: 2                     across the listed classes together
+#   rain_context: wet|dry|unknown|any      wet means >= 2 mm over the lagged
+#                                          window; unknown means no gauge in
+#                                          range, which is NOT the same as dry
+#   min_sites: 2                           distinct sites in the incident
+#
+# `would_change_it` is required. A reading that cannot be falsified is not a
+# finding, and it is the line an operator uses to check the machine's work
+# against what they can see.
+#
+# `action` is stored but NOT shown in the alert or the report while a rule is
+# `unvalidated`. Several of these read like instructions — "log it, this is
+# the trip not worth making" — and printing that next to a computed
+# "investigate the area" lets a rule nobody has checked countermand a decision
+# in the reader's head. It is visible on the dashboard, where the rules are
+# reviewed, and it reaches operators when the rule reaches `confirmed`.
+
+version: 1
+
+signatures:
+
+  # -------------------------------------------------------------------------
+  - id: STORMWATER_RESPONSE
+    name: Stormwater response
+    status: supported
+    when:
+      parameters:
+        - any_of: [CanalLevel, Level]
+          direction: rising
+          min_sensors: 2
+        - any_of: [Flowrate]
+          direction: rising
+          min_sensors: 1
+      rain_context: wet
+    reads_as: >
+      Levels and flows rose together while it was raining on the same
+      catchment. That is the drainage system doing its job, not instruments
+      failing.
+    action: >
+      Log it. This is the trip not worth making.
+    would_change_it: >
+      The same rise with no rain at any weighted gauge over the lagged window,
+      or flows falling while levels rise.
+    basis: >
+      Rainfall-conditioned anomaly detection on level data is the published
+      standard for this setting — Branisavljevic, Kapelan & Prodanovic (2011),
+      J. Hydroinformatics 13(3), for context classification; Rosin, Kapelan,
+      Keedwell & Romano (2022), J. Hydroinformatics 24(2), for CSO level plus
+      rainfall with no hydraulic model. Note Rosin's documented weak spot: the
+      method degrades as rainfall intensity rises, which in Singapore is
+      exactly when the interesting events happen.
+
+  # -------------------------------------------------------------------------
+  - id: RAIN_INDEPENDENT_RISE
+    name: Rise with no rain to explain it
+    status: unvalidated
+    when:
+      parameters:
+        - any_of: [CanalLevel, Level]
+          direction: rising
+          min_sensors: 2
+      rain_context: dry
+      min_sites: 2
+    reads_as: >
+      Levels rose at more than one site with no rain recorded over the window
+      the water would have come from. Something is putting water in, or
+      something downstream is holding it back.
+    action: >
+      Worth a look. Check the gauges are reporting before assuming the water
+      is real — a dry reading from a failed gauge looks identical here.
+    would_change_it: >
+      Rain at a gauge outside the weighted radius, a tide or barrage gate
+      operation, or a scheduled discharge upstream.
+    basis: >
+      Deliberately NOT called a blockage. "Level rises while flow falls" is
+      the practitioner signature for an obstruction, and it is unavailable
+      here twice over: PUB's canal and drain points are LEVEL ONLY, with no
+      velocity or flow alongside them, and the depth-velocity scattergraph
+      method it comes from has no published detection or false-alarm rate
+      anywhere — it appears in US patents and trade material, where the same
+      sources note a faulty meter produces the identical picture.
+
+  # -------------------------------------------------------------------------
+  - id: CATCHMENT_RECESSION
+    name: Catchment draining down
+    status: unvalidated
+    when:
+      parameters:
+        - any_of: [CanalLevel, Level]
+          direction: falling
+          min_sensors: 2
+      rain_context: any
+    reads_as: >
+      Levels falling together across sites, which is what a catchment does
+      after rain.
+    action: >
+      Log it. Only of interest if it is falling FASTER than the system should
+      drain, which this cannot yet judge.
+    would_change_it: >
+      No preceding rise, or a fall during rain rather than after it.
+    basis: >
+      Included so that the recession half of a storm is not reported as a
+      separate unexplained event. Judging whether a recession is abnormal
+      needs a drawdown rate to compare against, which requires the daily
+      profile job and a fortnight of history.
+
+  # -------------------------------------------------------------------------
+  - id: PRESSURE_LOSS
+    name: Pressure falling across sites
+    status: unvalidated
+    when:
+      parameters:
+        - any_of: [Pressure]
+          direction: falling
+          min_sensors: 2
+      min_sites: 2
+    reads_as: >
+      Pressure down at more than one site at once. In a pressurised main that
+      is a supply-side change: a pump off, a valve moved, or a loss somewhere
+      upstream of both.
+    action: >
+      Check the upstream source and recent valve or pump operations before
+      treating it as a leak.
+    would_change_it: >
+      A scheduled pump or valve operation in the same window, or pressure
+      falling at only one site.
+    basis: >
+      The classic "pressure drop plus flow increase equals burst" rule is NOT
+      used here, and should not be added without evidence. No peer-reviewed
+      source gives a defensible threshold for it; every validated
+      implementation works on residuals from a forecast or a hydraulic model,
+      neither of which exists here. Bakker et al. (2014), Procedia
+      Engineering 70, is the honest field number for this class of problem:
+      44.4% of real bursts detected at a 5.0% false-alarm rate.
+
+  # -------------------------------------------------------------------------
+  - id: PUMP_STATION_MECHANICAL
+    name: Pump station, mechanical
+    status: unvalidated
+    when:
+      parameters:
+        - any_of: [Pump, Valve]
+          direction: any
+          min_sensors: 1
+    reads_as: >
+      A pump or valve is behaving mechanically rather than the water doing
+      something — short cycling, stuck, or running against no flow.
+    action: >
+      Mechanical callout, not a water investigation. Bring the maintenance
+      history for this unit.
+    would_change_it: >
+      The same pattern across many stations at once, which is a control-system
+      or telemetry problem rather than a machine.
+    basis: >
+      The highest-confidence class available on this estate: a pump's
+      head-flow-frequency-power relationship is a closed local physical
+      relation learnable from routine SCADA alone, with no network model.
+      The detectors behind it (SHORT_CYCLING, STUCK_IN_STATE,
+      RUN_STATE_INCONSISTENT) are counts and contradictions rather than
+      statistical inferences, which is why they are trusted on classes that
+      are otherwise not alertable.

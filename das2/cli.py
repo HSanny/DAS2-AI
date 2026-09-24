@@ -428,6 +428,18 @@ def cmd_demo(config: Config, args) -> int:
     except Exception as exc:                               # noqa: BLE001
         log.error("chart generation failed: %s", exc)
 
+    # The report too. The two things a run actually delivers are the map and
+    # this document, so a demo that builds everything except the deliverable
+    # cannot answer the question it exists to answer.
+    try:
+        from das2 import build_stamp
+        from das2.report import pdf as pdf_report
+        report = pdf_report.write(result, out / f"report_{result.run_id}.pdf",
+                                  stamp=f"das2 source {build_stamp()}")
+        print(f"Report: {report}")
+    except Exception as exc:                               # noqa: BLE001
+        log.error("report generation failed: %s", exc)
+
     from das2.models import IncidentClass
     regional = [i for i in result.incidents
                 if i.incident_class is IncidentClass.REGIONAL_EVENT]
