@@ -224,7 +224,8 @@ def main() -> int:
             print("    (pymupdf absent -- text assertions skipped)")
 
         if text:
-            for phrase in ("run summary", "Act first", "Where",
+            for phrase in ("this round of analysis", "What this run found",
+                           "Act first", "Where",
                            "What to act on", "held back",
                            "Data quality and coverage"):
                 check(f"the report says {phrase!r}", phrase in text)
@@ -242,7 +243,38 @@ def main() -> int:
                   "Missing hours" in text,
                   "24 missing hours inflate STALE; a reader must know")
 
-    print("\none document, not fourteen messages")
+    print("\nthe explanation says what happened, in sentences")
+    from das2.report import narrative
+
+    paras = narrative.paragraphs(run)
+    check("the run is explained in prose", len(paras) >= 3,
+          f"{len(paras)} paragraph(s)")
+    check("the first sentence leads with the decision",
+          "need a decision now" in paras[0] or "Nothing needs" in paras[0],
+          paras[0][:70])
+    joined = " ".join(paras)
+    check("it names the mechanism, not just the class",
+          "neighbours" in joined or "neighbour" in joined,
+          "'REGIONAL_EVENT' is a label; 'the neighbours moved too' is a reason")
+    check("the caveats travel with the findings",
+          "missing" in joined and "STALE" in joined,
+          "a 24-hour feed gap inflates STALE across the fleet")
+    check("what was held back is explained, not just counted",
+          "held back" in joined)
+    check("no sentence asserts a severity word the data cannot carry",
+          not any(w in joined.lower()
+                  for w in ("critical", "alarming", "urgent!", "severe")),
+          "it is P1, or it is 12 sensors across 4 sites")
+
+    quiet = busy_run(0)
+    quiet.stats["selection"] = {"held": 0, "held_reasons": {}}
+    quiet.stats["lifecycle"] = {"new": 0, "updated": 0, "resolved": 0}
+    quiet_text = " ".join(narrative.paragraphs(quiet))
+    check("a quiet run is explained too, not left blank",
+          "Nothing was detected" in quiet_text,
+          "silence has to read as a result, not as a crashed job")
+
+    print("\ntwo artefacts per run: the map, then the analysis")
     sent: list[tuple[str, str]] = []
 
     class FakeClient:
@@ -270,11 +302,21 @@ def main() -> int:
             out = pdf.write(run, Path(tmp) / "r.pdf")
             config = tg.TelegramConfig(token="t", chat_id="c", enabled=True)
 
+            map_png = Path(tmp) / "map.png"
+            charts.region_map_png(run.incidents, map_png,
+                                  view=charts.ISLAND_VIEW)
+
             sent.clear()
-            report = tg.send_report(run, config, report_pdf=out)
-            check("exactly one notification is sent", len(sent) == 1,
+            report = tg.send_report(run, config, report_pdf=out,
+                                    map_png=map_png)
+            check("exactly two notifications are sent", len(sent) == 2,
                   f"{len(sent)}: {[k for k, _ in sent]}")
-            check("and it is the document", sent[0][0] == "document")
+            check("the map comes first", sent[0][0] == "photo",
+                  "it renders inline on a phone; the PDF must be opened")
+            check("the analysis comes second", sent[1][0] == "document")
+            check("the numbers are said once, not twice",
+                  sent[0][1] != sent[1][1],
+                  "two identical captions read as a duplicate send")
             check("every alertable incident counts as delivered",
                   len(report.sent) == len(run.alertable),
                   "the document carried them all; reporting fewer would "
@@ -290,13 +332,26 @@ def main() -> int:
                   f"{len(caption)} of {tg.CAPTION_MAX}")
 
             sent.clear()
-            tg.send_report(run, config, report_pdf=out,
+            tg.send_report(run, config, report_pdf=out, map_png=map_png,
                            p1_detail_messages=True)
             p1 = sum(1 for i in run.alertable if i.priority.value == "P1")
             check("P1 detail messages are opt-in and bounded",
-                  len(sent) == 1 + p1,
-                  f"1 document + {p1} P1 message(s), not "
+                  len(sent) == 2 + p1,
+                  f"map + report + {p1} P1 message(s), not "
                   f"{len(run.alertable)}")
+
+            # A failed photo must not cost the analysis: the map is also a
+            # page of the document, so losing the picture loses the glance,
+            # not the delivery.
+            sent.clear()
+            missing = Path(tmp) / "not-here.png"
+            report = tg.send_report(run, config, report_pdf=out,
+                                    map_png=missing)
+            check("a missing map still delivers the report",
+                  len(sent) == 1 and sent[0][0] == "document",
+                  f"{[k for k, _ in sent]}")
+            check("and the report still counts as delivered",
+                  len(report.sent) == len(run.alertable))
 
             sent.clear()
             tg.send_run(run, config, charts={}, max_incidents=10)

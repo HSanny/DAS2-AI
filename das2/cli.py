@@ -327,6 +327,7 @@ def cmd_run(config: Config, args) -> int:
     if getattr(config.alert, "mode", "report") == "report" and report_pdf:
         report = send_report(
             result, telegram, report_pdf=report_pdf,
+            map_png=chart_paths.get("map"),
             p1_detail_messages=config.alert.p1_detail_messages,
             dashboard_url=config.report.public_url or None,
         )

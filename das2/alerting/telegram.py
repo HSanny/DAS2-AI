@@ -314,20 +314,25 @@ class TelegramClient:
 # Sending a run
 # --------------------------------------------------------------------------- #
 def send_report(result, config: TelegramConfig, *, report_pdf: Path,
+                map_png: Path | None = None,
                 p1_detail_messages: bool = False,
                 dashboard_url: str | None = None) -> SendReport:
     """
-    One document per run, and nothing else.
+    Two things per run: the cluster map, then the written analysis.
 
-    The mode the client asked for after a week of the alternative: *"the alert
-    messages are way too many, can we just give one summary report pdf each
-    time?"*. At their volume the old shape was a header, two photos, ten
-    incident messages and a digest -- fourteen notifications an hour, none of
-    which could be read as one picture.
+The shape the client asked for: *"1 cluster image on actual singapore map,
+    and 1 pdf explanation on the case"*. Two, not fourteen, and in that order
+    for a reason -- the map renders inline in the chat, so a phone shows where
+    the trouble is on the lock screen, while a PDF is an attachment that has to
+    be opened. The glance first, the reasoning behind it second.
 
-    The caption carries enough to act on without opening anything: how many
-    need a decision, where, and how many were deliberately held back. The
-    document carries the rest.
+    The map's caption carries enough to act on without opening anything: how
+    many need a decision, where, and how many were deliberately held back. The
+    document carries the reasoning, the tables and the caveats.
+
+    The map is also page three of the document, so a PDF forwarded on its own
+    still stands up. That duplication is deliberate: the two artefacts travel
+    separately once someone shares one of them.
 
     `p1_detail_messages` adds one button-carrying message per P1 on top. It is
     off by default and exists because a document cannot carry an inline
@@ -352,8 +357,21 @@ def send_report(result, config: TelegramConfig, *, report_pdf: Path,
     report.skipped = [i.incident_id for i in result.incidents
                       if i not in alertable]
 
+    caption = _report_caption(result, alertable)
+    if map_png is not None and Path(map_png).exists():
+        try:
+            client.send_photo(map_png, caption)
+            caption = ""          # said once; the document needs no repeat
+        except (error.URLError, error.HTTPError, OSError) as exc:
+            # Not fatal. The document carries the same map on page three, so a
+            # failed photo costs the glance, not the delivery -- and falling
+            # over here would lose the analysis to save the picture of it.
+            log.error("telegram map upload failed (report continues): %s", exc)
+            report.failed.append(("<map>", str(exc)))
+            caption = _report_caption(result, alertable)
+
     try:
-        client.send_document(report_pdf, _report_caption(result, alertable))
+        client.send_document(report_pdf, caption or _document_caption(result))
         # The document IS the delivery. Every alertable incident was in it, so
         # marking only the P1s as sent would misreport the run and would make
         # the next run re-announce everything it had already reported.
@@ -372,6 +390,20 @@ def send_report(result, config: TelegramConfig, *, report_pdf: Path,
                       incident.incident_id, exc)
             report.failed.append((incident.incident_id, str(exc)))
     return report
+
+
+def _document_caption(result) -> str:
+    """
+    The one line under the attachment when the map already carried the numbers.
+
+    Short on purpose: a caption repeated verbatim under two consecutive
+    messages reads as a duplicate send, and a reader who has decided the first
+    one was noise skips the second.
+    """
+    from das2.report import narrative
+
+    return (f"<b>Run {result.run_id}</b> — full analysis\n"
+            f"{_esc(narrative.summary_line(result))}")
 
 
 def _report_caption(result, alertable: list) -> str:

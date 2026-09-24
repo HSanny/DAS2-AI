@@ -470,8 +470,16 @@ def run_charts(result, out_dir: str | Path, *,
     out_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"_{result.run_id}" if stamped else ""
     return {
+        # Rendered at report size, not phone size. This PNG is one of the two
+        # things a run delivers, and the client's verdict on the small version
+        # was "very small and thus not very helpful ... not even all the text
+        # can be seen". Telegram shows a photo inline scaled to the chat width
+        # and lets the reader tap to zoom, so the pixels are not wasted --
+        # whereas at 7 inches the labels have nowhere to go.
         "map": region_map_png(result.incidents,
-                              out_dir / f"map{suffix}.png"),
+                              out_dir / f"map{suffix}.png",
+                              figsize=(10.4, 6.2), dpi=170,
+                              label_limit=12, view=ISLAND_VIEW),
         "matrix": region_matrix_png(result.region_matrix,
                                     out_dir / f"matrix{suffix}.png"),
     }
