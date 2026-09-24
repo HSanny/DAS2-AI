@@ -31,6 +31,8 @@ from types import SimpleNamespace as NS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from das2.incident import parameters        # noqa: E402
+from das2.models import AnomalyType, PhysicalSeverity  # noqa: E402
 from das2.report import charts, pdf, theme  # noqa: E402
 from das2.spatial.regions import Region     # noqa: E402
 
@@ -66,12 +68,23 @@ SITES = [
 ]
 
 
-def member(site: str, n: int) -> NS:
-    """One anomalous sensor, with the fields the message composer reads."""
-    return NS(sensor=NS(description=f"{site}-Sensor-{n}",
-                        sensor_key=f"K{n:05d}"),
-              dominant_type=NS(value="LEVEL_SHIFT"),
-              severity=NS(deviation=1.8, unit="m"))
+#: Parameter, unit, typical move. Shaped like a drainage incident: canal
+#: levels and flows rising together, pressure falling.
+PARAMS = [("CanalLevel", "m", 0.82), ("Flowrate", "L/s", 24.0),
+          ("Pressure", "bar", -0.4), ("Pump", "", 0.0)]
+
+
+def member(site: str, n: int, region: str = "East") -> NS:
+    """One anomalous sensor, with the fields the report and composer read."""
+    name, unit, move = PARAMS[n % len(PARAMS)]
+    return NS(sensor=NS(description=f"{site}-{name}-{n}",
+                        sensor_key=f"K{n:05d}", equipment=name,
+                        site=site, unit=unit, region=region),
+              dominant_type=AnomalyType.LEVEL_SHIFT,
+              score=40.0,
+              severity=PhysicalSeverity(deviation=abs(move),
+                                        signed_deviation=move,
+                                        unit=unit, duration_s=10800))
 
 
 def incident(idx: int, site_idx: int, severity: float, cls: str) -> NS:
@@ -81,7 +94,8 @@ def incident(idx: int, site_idx: int, severity: float, cls: str) -> NS:
     return NS(
         incident_id=f"INC{idx:04d}",
         cluster=NS(centroid_lat=lat, centroid_lon=lon, region=region,
-                   members=[member(name, k) for k in range(1 + idx % 12)],
+                   members=[member(name, k, str(region.value))
+                            for k in range(1 + idx % 12)],
                    sites={name},
                    radius_m=800.0,
                    start=datetime(2026, 9, 23, 2), end=datetime(2026, 9, 23, 5)),
@@ -225,7 +239,8 @@ def main() -> int:
 
         if text:
             for phrase in ("this round of analysis", "What this run found",
-                           "Act first", "Where",
+                           "Act first", "What each one is made of",
+                           "By region and by parameter", "Where",
                            "What to act on", "held back",
                            "Data quality and coverage"):
                 check(f"the report says {phrase!r}", phrase in text)
@@ -242,6 +257,16 @@ def main() -> int:
             check("the missing-hours caveat travels with the numbers",
                   "Missing hours" in text,
                   "24 missing hours inflate STALE; a reader must know")
+            check("the explanation names which parameters are moving",
+                  "parameters carrying this run" in text,
+                  "'18 incidents' without 'on canal level' does not say what "
+                  "kind of problem it is")
+            check("the breakdown reaches the incident pages",
+                  "Canal Level" in text and "typical move" in text.lower())
+            check("the explanation is continued, never truncated",
+                  "never alerted on" in text,
+                  "the caveats sit last, so an overflowing page drops the "
+                  "limits and keeps the counts they invalidate")
 
     print("\nthe explanation says what happened, in sentences")
     from das2.report import narrative

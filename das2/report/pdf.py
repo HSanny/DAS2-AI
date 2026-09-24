@@ -47,6 +47,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt                        # noqa: E402
 from matplotlib.backends.backend_pdf import PdfPages   # noqa: E402
 
+from das2.incident import parameters                   # noqa: E402
 from das2.report import charts, narrative, theme       # noqa: E402
 
 log = logging.getLogger("das2.report.pdf")
@@ -304,25 +305,35 @@ def _cover(pdf: PdfPages, result, stamp: str) -> None:
     ], top=y - 0.01)
 
     # The explanation. Wrapped by hand because matplotlib has no flow layout,
-    # and measured in characters rather than points -- close enough at a fixed
-    # size in a monospaced-enough sans, and it cannot throw.
+    # and continued onto a second page rather than truncated.
+    #
+    # Truncation was the first version's behaviour and it cut exactly the
+    # wrong thing: the caveats paragraph sits last, so a page that overflowed
+    # dropped "24 of the window's hourly files were missing" while keeping the
+    # counts that number invalidates. A report that silently discards its own
+    # limitations is worse than one that runs to two pages.
     y_text = y - 0.235
     fig.text(L, y_text, "What this run found",
              fontsize=theme.SIZE_HEADING, fontweight=theme.WEIGHT_BOLD,
              color=theme.INK, va="center")
     y_text -= 0.042
 
-    width_chars = 118
+    lines: list[tuple[str, bool]] = []          # (text, is_paragraph_start)
     for para in narrative.paragraphs(result):
-        for line in textwrap.wrap(para, width=width_chars):
-            fig.text(L, y_text, line, fontsize=theme.SIZE_BODY,
-                     color=theme.INK_SECONDARY, va="center")
-            y_text -= 0.0245
-            if y_text < BOTTOM + 0.04:
-                break
-        y_text -= 0.012
-        if y_text < BOTTOM + 0.04:
-            break
+        for n, line in enumerate(textwrap.wrap(para, width=118)):
+            lines.append((line, n == 0))
+
+    line_h, para_gap = 0.0245, 0.012
+    for text, starts in lines:
+        if starts:
+            y_text -= para_gap
+        if y_text < BOTTOM + 0.03:
+            _close(pdf, fig)
+            fig, y = _page(pdf, "What this run found (continued)", "")
+            y_text = y - 0.02
+        fig.text(L, y_text, text, fontsize=theme.SIZE_BODY,
+                 color=theme.INK_SECONDARY, va="center")
+        y_text -= line_h
     _close(pdf, fig)
 
 
@@ -348,12 +359,14 @@ def _act_first(pdf: PdfPages, result) -> None:
 
     page = urgent[:MAX_TABLE_ROWS]
     _table(fig, (L, BOTTOM, R - L, y - BOTTOM - 0.02),
-           [("", 0.04, "center"), ("class", 0.17, "left"),
-            ("region", 0.11, "left"), ("sites", 0.28, "left"),
-            ("sensors", 0.07, "right"), ("severity", 0.08, "right"),
-            ("what to do", 0.25, "left")],
+           [("", 0.04, "center"), ("class", 0.15, "left"),
+            ("region", 0.09, "left"), ("sites", 0.20, "left"),
+            ("what is moving", 0.26, "left"),
+            ("sensors", 0.06, "right"), ("sev", 0.05, "right"),
+            ("what to do", 0.19, "left")],
            [(i.priority.value, i.incident_class.value, _region_of(i),
-             _sites_of(i), len(i.cluster.members), f"{i.severity:.0f}",
+             _sites_of(i), parameters.inline_summary(i),
+             len(i.cluster.members), f"{i.severity:.0f}",
              _short_action(i)) for i in page],
            row_colors=[theme.PRIORITY_COLOR[i.priority.value] for i in page])
     if len(urgent) > MAX_TABLE_ROWS:
@@ -377,6 +390,83 @@ def _short_action(incident) -> str:
             return short
     text = text.split(" - ")[-1].rstrip(".")
     return text[:40] + ("…" if len(text) > 40 else "")
+
+
+def _anatomy_pages(pdf: PdfPages, result, *, limit: int = 6) -> None:
+    """
+    What the most severe incidents are actually made of.
+
+    The page the client asked for: "in a region, which kind of sensors or what
+    parameter are triggering the event". The tables elsewhere answer it in a
+    column; this answers it in full -- every parameter in the incident, how
+    many sensors, which way they moved, how far, and what QARTOD makes of it.
+
+    Two incidents to a page, because the block has to stay readable on a phone
+    and a page of eight would be a spreadsheet.
+    """
+    incidents = sorted(
+        [i for i in result.incidents if i.priority.value in ("P1", "P2")],
+        key=lambda i: -i.severity)[:limit]
+    if not incidents:
+        return
+
+    for start in range(0, len(incidents), 2):
+        chunk = incidents[start:start + 2]
+        page_no = start // 2 + 1
+        pages = (len(incidents) + 1) // 2
+        fig, y = _page(
+            pdf, "What each one is made of",
+            "Every parameter in the incident, which way it moved and how far"
+            + (f" · page {page_no} of {pages}" if pages > 1 else ""),
+            footer="Direction comes from the signed deviation of each sensor's "
+                   "dominant finding. A parameter whose sensors disagree is "
+                   "reported as mixed rather than resolved by majority.")
+
+        top = y - 0.03
+        for incident in chunk:
+            top = _anatomy_block(fig, incident, top)
+        _close(pdf, fig)
+
+
+def _anatomy_block(fig, incident, top: float) -> float:
+    """One incident's parameter table. Returns the y to continue from."""
+    groups = parameters.breakdown(incident)
+
+    fig.text(L, top, f"{incident.priority.value}  {incident.incident_class.value}"
+                     f"   ·   {_region_of(incident)}   ·   {_sites_of(incident)}",
+             fontsize=theme.SIZE_HEADING, fontweight=theme.WEIGHT_BOLD,
+             color=theme.PRIORITY_COLOR[incident.priority.value], va="center")
+    top -= 0.030
+
+    when = ""
+    if incident.cluster.start and incident.cluster.end:
+        when = (f"{incident.cluster.start:%d %b %H:%M}"
+                f" → {incident.cluster.end:%d %b %H:%M}   ·   ")
+    context = [f"{len(incident.cluster.members)} sensors",
+               f"{len(incident.cluster.sites)} sites",
+               f"severity {incident.severity:.0f}"]
+    if incident.rainfall_mm is not None:
+        context.append(f"rain {incident.rainfall_mm:.1f} mm")
+    if incident.neighbour_correlation is not None:
+        context.append(f"neighbours r={incident.neighbour_correlation:.2f}")
+    fig.text(L, top, when + "   ·   ".join(context),
+             fontsize=theme.SIZE_SMALL, color=theme.INK_MUTED, va="center")
+    top -= 0.034
+
+    rows = [(g.display, g.count, len(g.sites), g.direction_text(),
+             g.move_text() or "—",
+             ", ".join(t.value.replace("_", " ").title()
+                       for t in g.behaviours[:2]),
+             g.flag.name)
+            for g in groups]
+    height = min(0.30, 0.045 + 0.028 * len(rows))
+    _table(fig, (L, top - height, R - L, height),
+           [("parameter", 0.18, "left"), ("sensors", 0.07, "right"),
+            ("sites", 0.06, "right"), ("direction", 0.20, "left"),
+            ("typical move", 0.13, "right"),
+            ("behaviour", 0.26, "left"), ("qartod", 0.10, "left")],
+           rows)
+    return top - height - 0.055
 
 
 def _map_page(pdf: PdfPages, result) -> None:
@@ -457,6 +547,89 @@ def _breakdown(pdf: PdfPages, result) -> None:
     _close(pdf, fig)
 
 
+def _region_parameter_page(pdf: PdfPages, result) -> None:
+    """
+    Region by parameter, with direction. The whole-run view.
+
+    The existing matrix says "the East has 31 level findings". This says "31,
+    and 28 of them rising", which is the difference between a count and a
+    direction of travel -- and direction is what makes a combination mean
+    something.
+
+    Diverging, because the quantity has a true centre: zero net movement. That
+    is the one case where a diverging scale is right and a sequential one
+    would lie, by rendering "20 up, 20 down" and "no findings at all" as the
+    same colour. Blue for rising, red for falling, neutral grey between --
+    warm against cool, so the poles read as opposite.
+    """
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+
+    matrix = parameters.region_parameter_matrix(result.anomalies)
+    fig, y = _page(
+        pdf, "By region and by parameter",
+        "Net direction: sensors rising minus sensors falling. The number in "
+        "each cell is the total findings, so a pale cell with a large number "
+        "is a parameter pulling both ways at once.",
+        footer="Findings with no direction — a stale or flatlined sensor has "
+               "not moved either way — are counted in the total but not in "
+               "the net.")
+
+    regions = sorted(matrix)
+    totals: dict[str, int] = {}
+    for row in matrix.values():
+        for parameter, cell in row.items():
+            totals[parameter] = totals.get(parameter, 0) + sum(cell.values())
+    params = [p for p, _ in sorted(totals.items(), key=lambda kv: -kv[1])][:12]
+
+    if not regions or not params:
+        fig.text(L, y - 0.08, "No placed findings this run.",
+                 fontsize=theme.SIZE_BODY, color=theme.INK_SECONDARY)
+        _close(pdf, fig)
+        return
+
+    net = np.array([[parameters.net_direction(
+        matrix.get(r, {}).get(p, {})) for p in params] for r in regions],
+        dtype=float)
+    count = np.array([[sum(matrix.get(r, {}).get(p, {}).values())
+                       for p in params] for r in regions], dtype=float)
+
+    ax = fig.add_axes([L + 0.07, y - 0.60, R - L - 0.10, 0.52])
+    limit = max(1.0, float(np.abs(net).max()))
+    cmap = LinearSegmentedColormap.from_list(
+        "das2div", ["#b2182b", "#e8a598", theme.PAGE, "#9ec5f4", "#184f95"])
+    ax.imshow(net, cmap=cmap, aspect="auto",
+              norm=TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit))
+
+    ax.set_xticks(range(len(params)))
+    ax.set_xticklabels([parameters.display_name(p)[:16] for p in params],
+                       rotation=35, ha="right", fontsize=theme.SIZE_SMALL)
+    ax.set_yticks(range(len(regions)))
+    ax.set_yticklabels(regions, fontsize=theme.SIZE_SMALL)
+
+    for r in range(net.shape[0]):
+        for c in range(net.shape[1]):
+            if not count[r, c]:
+                continue
+            strong = abs(net[r, c]) > limit * 0.55
+            ax.text(c, r, f"{int(count[r, c])}", ha="center", va="center",
+                    fontsize=theme.SIZE_SMALL,
+                    color="white" if strong else theme.INK_SECONDARY)
+    theme.apply(ax)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_visible(False)
+
+    # A legend in words, because a diverging ramp with no anchor is a puzzle.
+    for i, (label, colour) in enumerate([
+            ("▲ net rising", "#184f95"),
+            ("  balanced / no direction", theme.INK_MUTED),
+            ("▼ net falling", "#b2182b")]):
+        fig.text(L + 0.07 + i * 0.21, BOTTOM + 0.055, label,
+                 fontsize=theme.SIZE_SMALL, color=colour,
+                 fontweight=theme.WEIGHT_BOLD, va="center")
+    _close(pdf, fig)
+
+
 def _matrix(ax, matrix: dict[str, dict[str, int]], *, max_types: int = 8) -> None:
     """Region by equipment type, as a heatmap. Sequential, one hue."""
     import numpy as np
@@ -484,8 +657,8 @@ def _matrix(ax, matrix: dict[str, dict[str, int]], *, max_types: int = 8) -> Non
     ax.imshow(grid, cmap=cmap, aspect="auto",
               vmin=0, vmax=max(grid.max(), 1))
     ax.set_xticks(range(len(types)))
-    ax.set_xticklabels([t[:11] for t in types], rotation=35, ha="right",
-                       fontsize=theme.SIZE_TINY)
+    ax.set_xticklabels([parameters.display_name(t)[:13] for t in types],
+                       rotation=35, ha="right", fontsize=theme.SIZE_TINY)
     ax.set_yticks(range(len(regions)))
     ax.set_yticklabels(regions, fontsize=theme.SIZE_TINY)
     # Counts in every cell: a heatmap alone is indicative, and a reader
@@ -527,14 +700,16 @@ def _action_pages(pdf: PdfPages, result) -> None:
                    "sensors: high means the water moved, low means the "
                    "instrument did.")
         _table(fig, (L, BOTTOM, R - L, y - BOTTOM - 0.02),
-               [("", 0.04, "center"), ("incident", 0.11, "left"),
-                ("class", 0.15, "left"), ("region", 0.11, "left"),
-                ("sites", 0.23, "left"), ("sensors", 0.06, "right"),
+               [("", 0.04, "center"), ("incident", 0.09, "left"),
+                ("class", 0.13, "left"), ("region", 0.09, "left"),
+                ("sites", 0.17, "left"), ("what is moving", 0.22, "left"),
+                ("sensors", 0.06, "right"),
                 ("sev", 0.05, "right"), ("r", 0.05, "right"),
-                ("rain", 0.06, "right"), ("what to do", 0.14, "left")],
+                ("rain", 0.06, "right"), ("what to do", 0.12, "left")],
                [(i.priority.value, i.incident_id[-10:],
                  i.incident_class.value, _region_of(i),
-                 _sites_of(i), len(i.cluster.members), f"{i.severity:.0f}",
+                 _sites_of(i), parameters.inline_summary(i, limit=2),
+                 len(i.cluster.members), f"{i.severity:.0f}",
                  "—" if i.neighbour_correlation is None
                  else f"{i.neighbour_correlation:.2f}",
                  "—" if i.rainfall_mm is None else f"{i.rainfall_mm:.1f}",
@@ -657,8 +832,10 @@ def write(result, out_path: str | Path, *, stamp: str = "") -> Path:
     with PdfPages(out_path) as pdf:
         _cover(pdf, result, stamp)
         _act_first(pdf, result)
+        _anatomy_pages(pdf, result)
         _map_page(pdf, result)
         _breakdown(pdf, result)
+        _region_parameter_page(pdf, result)
         _action_pages(pdf, result)
         _held_page(pdf, result)
         _quality_page(pdf, result)

@@ -128,6 +128,58 @@ def evidence(result) -> str:
             "separates a trip worth making from one that is not.")
 
 
+def driving_parameters(result) -> str:
+    """
+    Which parameters are actually moving, and which way.
+
+    The explanation was answering "how many" and "where" and never "what of".
+    A reader could finish the page knowing eighteen incidents needed a
+    decision without learning whether the estate's canal levels or its pump
+    motors were the thing misbehaving -- which is the first question anyone
+    asks before deciding who to send.
+    """
+    from das2.incident.parameters import display_name, net_direction, \
+        region_parameter_matrix
+
+    matrix = region_parameter_matrix(getattr(result, "anomalies", []) or [])
+    if not matrix:
+        return ""
+
+    totals: dict[str, dict[str, int]] = {}
+    for row in matrix.values():
+        for parameter, cell in row.items():
+            acc = totals.setdefault(
+                parameter, {"rising": 0, "falling": 0, "flat": 0})
+            for key, n in cell.items():
+                acc[key] += n
+
+    ranked = sorted(totals.items(), key=lambda kv: -sum(kv[1].values()))[:3]
+    if not ranked:
+        return ""
+
+    parts = []
+    for parameter, cell in ranked:
+        total = sum(cell.values())
+        net = net_direction(cell)
+        moving = cell["rising"] + cell["falling"]
+        if not moving:
+            way = "none of them moving in either direction"
+        elif abs(net) < moving * 0.34:
+            way = f"{cell['rising']} rising and {cell['falling']} falling"
+        else:
+            way = (f"{max(cell['rising'], cell['falling'])} of them "
+                   f"{'rising' if net > 0 else 'falling'}")
+        parts.append(f"{total} on {display_name(parameter).lower()}, {way}")
+
+    text = "The parameters carrying this run are " + _join(parts) + "."
+    if any(abs(net_direction(c)) >= sum(c.values()) * 0.66
+           for _, c in ranked if sum(c.values()) >= 4):
+        text += (" A parameter whose sensors nearly all move the same way is "
+                 "the network responding to something, not instruments "
+                 "failing independently.")
+    return text
+
+
 def movement(result) -> str:
     """What changed since the last run."""
     lifecycle = result.stats.get("lifecycle") or {}
@@ -218,7 +270,8 @@ def caveats(result) -> str:
 
 def paragraphs(result) -> list[str]:
     """The whole explanation, in reading order. Empty entries are dropped."""
-    return [p for p in (headline(result), evidence(result), movement(result),
+    return [p for p in (headline(result), driving_parameters(result),
+                        evidence(result), movement(result),
                         suppression(result), caveats(result)) if p]
 
 

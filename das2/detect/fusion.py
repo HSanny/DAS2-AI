@@ -175,9 +175,16 @@ def _severity(signals: list[Signal], sensor: SensorMeta,
     # which an operator would read as the instrument being 14,538 units out.
     with_magnitude = [s for s in signals
                       if s.magnitude and s.unit and s.unit not in TIME_UNITS]
-    deviation = max((abs(s.magnitude) for s in with_magnitude), default=0.0)
-    unit = next((s.unit for s in with_magnitude
-                 if abs(s.magnitude) == deviation), sensor.unit or "")
+    # The SIGNED magnitude is carried through as well as the absolute one.
+    # `abs()` here used to be the end of the line for direction: a level shift
+    # of -0.4 bar and one of +0.4 bar arrived downstream indistinguishable, so
+    # nothing could tell "level rising while flow rises" (rain) from "level
+    # rising while flow falls" (an obstruction). Ranking still uses the
+    # magnitude; only the reporting layers need the sign.
+    dominant = max(with_magnitude, key=lambda s: abs(s.magnitude), default=None)
+    signed = float(dominant.magnitude) if dominant is not None else 0.0
+    deviation = abs(signed)
+    unit = (dominant.unit if dominant is not None else "") or sensor.unit or ""
 
     span = sensor.span
     span_fraction = min(1.0, deviation / span) if (span and deviation) else None
@@ -187,6 +194,7 @@ def _severity(signals: list[Signal], sensor: SensorMeta,
 
     return PhysicalSeverity(
         deviation=round(deviation, 6),
+        signed_deviation=round(signed, 6),
         unit=unit or "",
         span_fraction=span_fraction,
         duration_s=duration_s,

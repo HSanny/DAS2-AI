@@ -422,6 +422,30 @@ class PhysicalSeverity:
     duration_s: float = 0.0
     window_fraction: float = 0.0    # fraction of the analysis window affected
 
+    #: The same deviation, with its SIGN kept.
+    #:
+    #: `deviation` is a magnitude because everything that ranks or scores wants
+    #: one. But the sign is what makes a group of findings mean something:
+    #: level rising while flow rises is the drainage system responding to rain,
+    #: level rising while flow falls is something obstructing the channel.
+    #: Same parameters, same magnitudes, opposite verdicts -- and the sign was
+    #: being discarded by an `abs()` in fusion, so no report could tell them
+    #: apart. Defaults to 0.0, which reads as "no direction", not "no change".
+    signed_deviation: float = 0.0
+
+    @property
+    def direction(self) -> str:
+        """`'rising'`, `'falling'`, or `''` when the finding has no direction."""
+        if not self.signed_deviation:
+            return ""
+        return "rising" if self.signed_deviation > 0 else "falling"
+
+    @property
+    def arrow(self) -> str:
+        """A glyph for a table cell. Never the only channel -- the word rides
+        with it everywhere this is used."""
+        return {"rising": "▲", "falling": "▼"}.get(self.direction, "—")
+
     def score(self) -> float:
         """
         Derived 0-100 ordering score.
