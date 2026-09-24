@@ -152,12 +152,16 @@ MIN_POINTS = 60
 #
 # Honest status: this is OUR construction. No paper validates these two tests
 # in combination, the thresholds below are engineering judgement rather than
-# anything inherited, and the verdict is emitted as SUSPECT, never FAIL. The
-# thing that would actually settle it is the maintenance work-order log: in
-# the one published deployment with full alarm attribution, Leow et al. (2017)
-# Environ. Sci.: Water Res. Technol. 3(2), 189 of 219 alarms were maintenance,
-# resolved by knowing the schedule rather than by a better algorithm. Asking
-# PUB for that log is worth more than any refinement of what follows.
+# anything inherited, and the verdict is emitted as SUSPECT, never FAIL.
+#
+# The thing that would actually settle it is not a better algorithm but the
+# maintenance work-order log. A recalibration is a scheduled human act; with
+# the schedule, telling it from a water-level change stops being an inference
+# at all. Asking PUB for that export is worth more than any refinement of what
+# follows -- see CITATIONS.md, which records that an earlier version of this
+# comment carried a specific published figure for how much of an alarm stream
+# maintenance accounts for, and that the citation could not be verified and
+# was removed rather than passed on.
 
 #: How many samples may sit between the old and new level and still count as
 #: "no transition". Two allows for one in-flight reading plus the sample the

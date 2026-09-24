@@ -156,7 +156,11 @@ QARTOD_TEST: dict["AnomalyType", tuple[int, str] | None] = {
     AnomalyType.ATTENUATED_SIGNAL: (10, "Attenuated Signal"),
     # Ours. No QARTOD equivalent, and saying so is the point.
     AnomalyType.REVERSE_FLOW: None,        # a signed gross-range special case
-    AnomalyType.QUANTISATION_COLLAPSE: None,   # measurement basis: Thornhill 2004
+    # Ours. The nearest published work is Thornhill, Choudhury & Shah (2004),
+    # J. Process Control 14(4) 389-398, on inferring compression and
+    # quantisation in historian data -- a method for the same measurement
+    # problem, not a QC test for this finding. See CITATIONS.md.
+    AnomalyType.QUANTISATION_COLLAPSE: None,
     AnomalyType.RESIDUAL_OUTLIER: None,
     AnomalyType.LEVEL_SHIFT: None,
     AnomalyType.INSTRUMENT_OFFSET: None,

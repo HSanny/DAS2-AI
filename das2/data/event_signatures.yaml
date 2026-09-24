@@ -94,11 +94,12 @@ signatures:
     basis: >
       Rainfall-conditioned anomaly detection on level data is the published
       standard for this setting — Branisavljevic, Kapelan & Prodanovic (2011),
-      J. Hydroinformatics 13(3), for context classification; Rosin, Kapelan,
-      Keedwell & Romano (2022), J. Hydroinformatics 24(2), for CSO level plus
-      rainfall with no hydraulic model. Note Rosin's documented weak spot: the
-      method degrades as rainfall intensity rises, which in Singapore is
-      exactly when the interesting events happen.
+      J. Hydroinformatics 13(3) 307-323, for context classification; Rosin,
+      Kapelan, Keedwell & Romano (2022), J. Hydroinformatics 24(2) 259-273,
+      for detecting unusual behaviour from CSO level with no hydraulic model.
+      Neither is a validation of THIS rule on THIS network; they establish that
+      conditioning on context rather than thresholding a level is the accepted
+      approach. See CITATIONS.md.
 
   # -------------------------------------------------------------------------
   - id: RAIN_INDEPENDENT_RISE
@@ -179,9 +180,12 @@ signatures:
       used here, and should not be added without evidence. No peer-reviewed
       source gives a defensible threshold for it; every validated
       implementation works on residuals from a forecast or a hydraulic model,
-      neither of which exists here. Bakker et al. (2014), Procedia
-      Engineering 70, is the honest field number for this class of problem:
-      44.4% of real bursts detected at a 5.0% false-alarm rate.
+      neither of which exists here. Bakker, Jung, Vreeburg, van de Roer,
+      Lansey & Rietveld (2014), Procedia Engineering 70, 85-92, is the honest
+      field number for this class of problem: 44.4% of real bursts detected at
+      a 5.0% false-alarm rate — and that is 4 of 9 reported bursts in a winter
+      subset, so treat it as the right order of magnitude rather than a
+      precise expectation. See CITATIONS.md.
 
   # -------------------------------------------------------------------------
   - id: PUMP_STATION_MECHANICAL

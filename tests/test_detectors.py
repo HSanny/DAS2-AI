@@ -381,6 +381,26 @@ def main():
           len(result.selected) + len(result.held) == len(flood))
     check("with a stated reason", all(reason for _, reason in result.held))
 
+    # A class that scores from a FLOOR rather than from its own evidence can
+    # produce a block of identical severities -- every ASSET_FAILURE lands on
+    # exactly 55.0 unless a member lifts it. Twenty of them at one station
+    # tie with each other, and if ranking were the only control they would
+    # take the whole run budget and push a genuine regional event onto the
+    # held list. The per-region cap is what stops that, so it is pinned here
+    # rather than left as a happy accident of the ordering.
+    station = [incident(IncidentClass.ASSET_FAILURE, "East", 55.0, f"a{i}")
+               for i in range(20)]
+    elsewhere = incident(IncidentClass.REGIONAL_EVENT, "West", 50.0, "regional")
+    result = select(station + [elsewhere])
+    check("a station full of failed machines cannot take the whole run",
+          len(result.selected) == 6,
+          f"({len(result.selected)}: 5 East + 1 West)")
+    check("and a lower-scoring event elsewhere still gets through",
+          any(i.incident_id == "West-regional" for i in result.selected),
+          "a floored severity outranks a genuinely-scored one, so without "
+          "the regional budget the real event would be held with 'run cap "
+          "reached'")
+
     p1 = incident(IncidentClass.REGIONAL_EVENT, "East", 90.0, "p1")
     result = select([p1] + flood, per_region=1, global_cap=1)
     check("a P1 is never held back by a budget",
