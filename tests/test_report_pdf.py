@@ -415,6 +415,10 @@ def main() -> int:
             sent.append(("document", caption))
             return {"ok": True}
 
+        def send_document_group(self, docs, caption="", **kw):
+            sent.append((f"group[{len(docs)}]", caption))
+            return {"ok": True}
+
         def send_photo(self, path, caption="", **kw):
             sent.append(("photo", caption))
             return {"ok": True}
@@ -466,6 +470,33 @@ def main() -> int:
             check("the caption fits Telegram's limit",
                   len(caption) <= tg.CAPTION_MAX,
                   f"{len(caption)} of {tg.CAPTION_MAX}")
+
+            # The interactive page: the client opens it to verify the run
+            # against the statistics he already runs. It must not cost a third
+            # notification, because the volume complaint that produced this
+            # shape applies to the fix for it too.
+            html = Path(tmp) / "dashboard.html"
+            html.write_text("<html><body>interactive</body></html>")
+            sent.clear()
+            tg.send_report(run, config, report_pdf=out, map_png=map_png,
+                           dashboard_html=html)
+            check("the interactive page rides with the PDF, not after it",
+                  len(sent) == 2 and sent[1][0] == "group[2]",
+                  f"{[k for k, _ in sent]}")
+            check("and the caption says what the .html is for",
+                  "interactive" in sent[1][1] and "browser" in sent[1][1],
+                  "Telegram cannot render an HTML attachment inline, so "
+                  "unlabelled it reads as a duplicate of the PDF")
+            check("it still fits the caption limit with the extra line",
+                  len(sent[1][1]) <= tg.CAPTION_MAX,
+                  f"{len(sent[1][1])} of {tg.CAPTION_MAX}")
+
+            sent.clear()
+            tg.send_report(run, config, report_pdf=out, map_png=map_png,
+                           dashboard_html=Path(tmp) / "missing.html")
+            check("a missing interactive page is not a failed delivery",
+                  len(sent) == 2 and sent[1][0] == "document",
+                  "the analysis is the deliverable; the page is an extra")
 
             sent.clear()
             tg.send_report(run, config, report_pdf=out, map_png=map_png,

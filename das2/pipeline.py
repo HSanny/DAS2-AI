@@ -30,6 +30,7 @@ from typing import Any
 import pandas as pd
 
 from das2.config import Config
+from das2.detect import conventional
 from das2.detect.baseline import baseline_summary, score_window
 from das2.detect.digital import run_digital_checks, run_pump_flow_checks
 from das2.detect.fusion import fuse_all, fusion_summary
@@ -74,6 +75,9 @@ class RunResult:
     #: gauges, and whether a lag was measurable. Keyed the same way as
     #: `rainfall_by_cluster` so an incident can find its own.
     rain_context: dict = field(default_factory=dict)
+    #: Per sensor, what `mean ± 3σ` over the same window would have said.
+    #: Reporting only -- nothing in detection, triage or selection reads it.
+    conventional: dict = field(default_factory=dict)
     correlations: dict[str, float] = field(default_factory=dict)
     neighbour_results: list = field(default_factory=list)
     selected: list[Incident] = field(default_factory=list)
@@ -282,6 +286,21 @@ def run(config: Config, *, now: datetime | None = None,
     result.stats["detection"] = fusion_summary(result.anomalies)
     log.info("detection: %s", result.stats["detection"])
 
+    # --- what a median-and-sigma check would have said ----------------------- #
+    # The client verifies this system by asking whether it found anything his
+    # existing statistics did not. So run his check -- mean, sigma, 3 sigma, on
+    # the same arrays -- and record the answer per sensor, INCLUDING where it
+    # would have fired and we added nothing. Nothing downstream reads it; see
+    # das2/detect/conventional.py for why that separation is not negotiable.
+    spans_by_sensor: dict[str, list] = {}
+    for anomaly in result.anomalies:
+        spans_by_sensor.setdefault(anomaly.sensor.sensor_key, []).append(
+            (anomaly.start, anomaly.end))
+    result.conventional = conventional.evaluate_all(
+        series, spans_by_sensor=spans_by_sensor)
+    result.stats["conventional"] = conventional.summarise(result.conventional)
+    log.info("median±3σ check: %s", result.stats["conventional"])
+
     # --- rain context -------------------------------------------------------- #
     # Sourced from the client's own 188 rain gauges, which v1 discarded as
     # unclassified. No external API, no internet dependency.
@@ -410,6 +429,13 @@ def run(config: Config, *, now: datetime | None = None,
         if found is not None:
             candidate.detail[signature.DETAIL_KEY] = signature.as_detail(found)
         signature_matches.append(found)
+
+        # And what their own median-and-sigma check makes of the same sensors,
+        # so the report can be checked against the spreadsheet it is asking to
+        # be trusted over.
+        panel = conventional.for_incident(candidate, result.conventional)
+        if panel:
+            candidate.detail["conventional"] = panel
 
     result.stats["signatures"] = signature.summary(signature_matches)
     log.info("signatures: %s", result.stats["signatures"])

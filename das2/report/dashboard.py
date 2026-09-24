@@ -43,7 +43,10 @@ import html
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
+
+import numpy as np
+import pandas as pd
 
 from das2.models import Incident, IncidentClass, Priority
 
@@ -72,9 +75,83 @@ CLASS_COLOR = {
 
 REGION_ORDER = ["Central", "East", "North", "North-East", "West", "Unknown"]
 
+#: Points kept per charted sensor. The trace exists so a reader can SEE that the
+#: event sits inside the band their own check draws, which needs shape, not
+#: every sample: 240 points is more than a 900px-wide chart can resolve.
+#: Decimation keeps the min and the max of each bucket so a spike survives --
+#: taking every Nth sample would delete the one reading the chart is about.
+SERIES_POINTS = 240
 
-def _incident_json(incident: Incident) -> dict[str, Any]:
+#: Sensors charted per run. A 198-incident run carries ~1,800 members, and
+#: embedding all of them produced a file too large to open on a phone. The
+#: budget goes to the incidents that need a decision; the rest keep their
+#: tables.
+MAX_CHARTED_SENSORS = 120
+
+
+def _downsample(stamps: Sequence[float], values: Sequence[float], *,
+                points: int = SERIES_POINTS) -> list[list[float]]:
+    """
+    Thin a series to something a chart can draw, keeping the extremes.
+
+    Min-and-max per bucket rather than every Nth sample. A spike is one
+    reading; stride decimation deletes it with probability `1 - 1/N`, which
+    would quietly remove the single most important point on a chart whose job
+    is to show an operator what the instrument actually did.
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    if n <= points:
+        return [[float(t), round(float(v), 4)] for t, v in zip(stamps, values)]
+
+    buckets = max(1, points // 2)
+    size = n / buckets
+    out: list[list[float]] = []
+    for b in range(buckets):
+        lo, hi = int(b * size), max(int(b * size) + 1, int((b + 1) * size))
+        chunk = values[lo:hi]
+        if not len(chunk):
+            continue
+        times = stamps[lo:hi]
+        i_min = int(np.argmin(chunk))
+        i_max = int(np.argmax(chunk))
+        for i in sorted({i_min, i_max}):
+            out.append([float(times[i]), round(float(chunk[i]), 4)])
+    return out
+
+
+def _series_for(result, keys: set[str]) -> dict[str, list[list[float]]]:
+    """Decimated traces for the sensors the page will chart."""
+    readings = getattr(result, "readings", None)
+    if readings is None or not len(readings) or not keys:
+        return {}
+    try:
+        wanted = readings[readings["sensor_key"].isin(keys)]
+    except (KeyError, TypeError):                          # pragma: no cover
+        return {}
+
+    out: dict[str, list[list[float]]] = {}
+    for key, group in wanted.groupby("sensor_key", sort=False):
+        group = group.sort_values("ts")
+        # NOT `.astype("int64") // 1e6`. That assumes nanosecond resolution,
+        # and pandas 2 keeps whatever resolution the parse produced -- these
+        # timestamps arrive as datetime64[s], so the naive form returned 1790
+        # where it meant 1790100542000, and every flagged span was drawn off
+        # the right-hand edge of its chart. Subtracting the epoch and dividing
+        # by a Timedelta is unit-agnostic by construction.
+        stamps = ((group["ts"] - pd.Timestamp("1970-01-01"))
+                  // pd.Timedelta("1ms")).to_numpy()
+        out[str(key)] = _downsample(stamps, group["value"].to_numpy(dtype=float))
+    return out
+
+
+def _incident_json(incident: Incident, *,
+                   series: dict[str, list[list[float]]] | None = None,
+                   checks: dict[str, Any] | None = None) -> dict[str, Any]:
     c = incident.cluster
+    series = series or {}
+    checks = checks or {}
     return {
         "id": incident.incident_id,
         "cls": incident.incident_class.value,
@@ -94,32 +171,74 @@ def _incident_json(incident: Incident) -> dict[str, Any]:
         # falsifier -- because a hedged claim shown without what would
         # disprove it is the one form of this that is worse than silence.
         "signature": incident.detail.get("signature") or None,
+        # What a median-and-sigma check makes of the same sensors. This is the
+        # panel the client verifies the system with -- "is this actually new?"
+        "conventional": incident.detail.get("conventional") or None,
         "correlation": incident.neighbour_correlation,
         "rainfall_mm": incident.rainfall_mm,
         "ack": incident.ack_state.value,
         "members": [
-            {
-                "key": m.sensor.sensor_key,
-                "desc": m.sensor.description,
-                "equipment": m.sensor.equipment,
-                "site": m.sensor.site,
-                "type": m.dominant_type.value,
-                "score": round(m.score, 1),
-                "deviation": m.severity.deviation,
-                "unit": m.severity.unit,
-                "duration_s": m.severity.duration_s,
-                "start": m.start.isoformat(),
-                "end": m.end.isoformat(),
-                "detectors": sorted({s.detector for s in m.signals}),
-            }
+            _member_json(m, series.get(m.sensor.sensor_key),
+                         checks.get(m.sensor.sensor_key))
             for m in c.members
         ],
     }
 
 
+def _member_json(m, trace: list[list[float]] | None, check: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "key": m.sensor.sensor_key,
+        "desc": m.sensor.description,
+        "equipment": m.sensor.equipment,
+        "site": m.sensor.site,
+        "type": m.dominant_type.value,
+        "score": round(m.score, 1),
+        "deviation": m.severity.deviation,
+        "unit": m.severity.unit,
+        "duration_s": m.severity.duration_s,
+        "start": m.start.isoformat(),
+        "end": m.end.isoformat(),
+        "start_ms": int(m.start.timestamp() * 1000),
+        "end_ms": int(m.end.timestamp() * 1000),
+        "detectors": sorted({s.detector for s in m.signals}),
+    }
+    if trace:
+        out["series"] = trace
+    if check is not None:
+        # The band the operator's own check would have drawn, so the chart can
+        # show the event sitting inside it rather than asserting that it does.
+        out["band"] = {
+            "mean": check.mean, "std": check.std, "k": check.k,
+            "peak_z": check.peak_z, "peak_z_excluded": check.peak_z_excluded,
+            "verdict": check.verdict,
+        }
+    return out
+
+
+def _charted_keys(result) -> set[str]:
+    """
+    Which sensors get a trace embedded, worst incident first.
+
+    Budgeted rather than exhaustive. The incidents that need a decision are
+    charted; a suppressed fan-out of 116 sensors is not, because nobody is
+    going to scroll through 116 traces of the same dead RTU.
+    """
+    ranked = sorted(result.incidents, key=lambda i: -i.severity)
+    keys: set[str] = set()
+    for incident in ranked:
+        for member in incident.cluster.members:
+            if len(keys) >= MAX_CHARTED_SENSORS:
+                return keys
+            keys.add(member.sensor.sensor_key)
+    return keys
+
+
 def build_payload(result) -> dict[str, Any]:
     """The JSON the page renders. Also useful on its own, for tests and the API."""
-    incidents = [_incident_json(i) for i in result.incidents]
+    series = _series_for(result, _charted_keys(result))
+    checks = getattr(result, "conventional", None) or {}
+    incidents = [_incident_json(i, series=series, checks=checks)
+                 for i in result.incidents]
     matrix = result.region_matrix
     equipment = sorted({e for row in matrix.values() for e in row})
     regions = [r for r in REGION_ORDER if r in matrix] + \
@@ -137,6 +256,7 @@ def build_payload(result) -> dict[str, Any]:
         "incidents": incidents,
         "matrix": {"regions": regions, "equipment": equipment, "counts": matrix},
         "rainfall": result.rainfall_by_region,
+        "conventional": (result.stats or {}).get("conventional") or {},
         "kpi": {
             "incidents": len(result.incidents),
             "alertable": len(result.alertable),
@@ -231,10 +351,18 @@ _TEMPLATE = r"""<!DOCTYPE html>
   :root {
     --bg: #f6f7f9; --card: #ffffff; --ink: #14181d; --muted: #667080;
     --line: #dfe3e8; --accent: #b2182b;
+    /* Status, not series. "new" = their check missed it and this one did not;
+       "known" = it would have fired too. Each ships with a word beside it, so
+       the colour is never the only carrier. */
+    --new: #1a6b45; --known: #8c5000; --band: rgba(102,112,128,.16);
   }
   @media (prefers-color-scheme: dark) {
+    /* Stepped for the dark surface rather than flipped: #1a6b45 on #1c2128 is
+       below any usable contrast, and an automatic inversion would leave it
+       technically present and practically invisible. */
     :root { --bg:#14181d; --card:#1c2128; --ink:#e8ecf1; --muted:#98a3b3;
-            --line:#2c333c; }
+            --line:#2c333c; --new:#63c39a; --known:#e0a95f;
+            --band:rgba(152,163,179,.18); }
   }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--ink);
@@ -289,6 +417,48 @@ _TEMPLATE = r"""<!DOCTYPE html>
             flex-wrap:wrap; margin-top:10px; }
   .legend span b { display:inline-block; width:10px; height:10px;
                    border-radius:50%; margin-right:5px; }
+
+  /* Filters sit in ONE row directly above the thing they filter, so the
+     relationship is positional and needs no explaining. */
+  .filters { display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end;
+             margin-bottom:12px; font-size:12px; color:var(--muted); }
+  .filters label { display:flex; flex-direction:column; gap:4px; }
+  .filters select, .filters input, .filters button {
+      font:inherit; font-size:13px; color:var(--ink); background:var(--card);
+      border:1px solid var(--line); border-radius:6px; padding:5px 8px; }
+  .filters button { cursor:pointer; }
+  .filters button:hover { border-color:var(--muted); }
+
+  /* The verification panel: what their own check says about these sensors. */
+  .cv { margin:12px 0; padding:10px 12px; border:1px solid var(--line);
+        border-radius:8px; }
+  .cv h4 { margin:0 0 6px; font-size:13px; }
+  .cv .because { color:var(--muted); font-size:12px; margin:6px 0 8px; }
+  .cv table { font-size:12px; }
+  .v-alarmed   { color:var(--known); font-weight:600; }
+  .v-missed    { color:var(--new); font-weight:600; }
+  .v-chance    { color:var(--muted); font-weight:600; }
+  .v-undefined { color:var(--muted); font-weight:600; }
+
+  /* Charts. One series each, so no legend: the caption names the sensor. */
+  .traces { display:grid; gap:12px; margin-top:12px;
+            grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); }
+  .trace { border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .trace .cap { font-size:12px; margin-bottom:2px; }
+  .trace .sub { font-size:11px; color:var(--muted); margin-bottom:4px; }
+  .trace svg { display:block; width:100%; height:110px; overflow:visible; }
+  .tip { position:fixed; pointer-events:none; z-index:9999; display:none;
+         background:var(--ink); color:var(--card); font-size:11px;
+         padding:4px 7px; border-radius:5px; white-space:nowrap; }
+  .tl { font-size:12px; margin-top:10px; }
+  .tl td { padding:3px 8px 3px 0; border:0; }
+  /* `display:block` is load-bearing: a `span` is inline, and height on an
+     inline box is ignored, so the first version drew the delays with no bars
+     beside them. */
+  .tl .bar { display:block; width:100%; min-width:120px; height:8px;
+             background:var(--line); border-radius:3px; position:relative; }
+  .tl .bar i { position:absolute; top:0; height:8px; border-radius:3px;
+               background:var(--accent); display:block; min-width:3px; }
 </style>
 </head>
 <body>
@@ -320,6 +490,15 @@ _TEMPLATE = r"""<!DOCTYPE html>
 
   <div class="card">
     <h2>Incidents — what to do</h2>
+    <div class="filters" id="filters">
+      <label>Region <select id="f-region"></select></label>
+      <label>Priority <select id="f-priority"></select></label>
+      <label>Class <select id="f-class"></select></label>
+      <label>Parameter <select id="f-equipment"></select></label>
+      <label>Search <input id="f-text" type="search" placeholder="site or sensor"></label>
+      <button id="f-reset" type="button">Reset</button>
+      <span class="muted" id="f-count"></span>
+    </div>
     <div id="incidents"></div>
   </div>
 </div>
@@ -503,7 +682,10 @@ if (!mx.equipment.length) {
       return `<td class="cell ${v ? "" : "zero"}" style="${bg};${fg}">${v || "·"}</td>`;
     }).join("");
     const total = mx.equipment.reduce((s, e) => s + ((mx.counts[r] || {})[e] || 0), 0);
-    return `<tr><th>${label}</th>${cells}<td class="cell">${total}</td></tr>`;
+    // The row header drills into the region, which is the "observe the anomaly
+    // by region" half of the original ask made clickable.
+    return `<tr><th><a href="#" onclick="focusRegion('${esc(r)}');return false"
+            >${label}</a></th>${cells}<td class="cell">${total}</td></tr>`;
   }).join("");
   document.getElementById("matrix").innerHTML =
     `<table class="mx"><thead><tr><th></th>` +
@@ -511,14 +693,223 @@ if (!mx.equipment.length) {
     `<th>Total</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
-/* ---- incident table ---- */
+/* ---- the verification panel -------------------------------------------- *
+ * The client's own test of this system: "is there really something here my
+ * existing statistics did not find?". So his check is run on the same sensors
+ * and the answer is printed whichever way it comes out.                      */
+function conventionalPanel(i) {
+  const c = i.conventional;
+  if (!c) return "";
+  const rows = c.sensors.map(s => `
+    <tr><td>${esc(s.sensor)}</td>
+        <td class="v-${esc(s.verdict)}">${esc(s.verdict)}</td>
+        <td>${s.peak_z.toFixed(1)}σ</td>
+        <td>${s.peak_z_excluded != null
+              ? s.peak_z_excluded.toFixed(1) + "σ"
+              : '<span class="muted">—</span>'}</td>
+        <td class="muted">${esc(s.why)}</td></tr>`).join("");
+  return `<div class="cv">
+    <h4>Would your median ± 3σ check have found this?</h4>
+    <div>${esc(c.headline)}</div>
+    <div class="because">Found here because ${esc(c.found_because)}</div>
+    <table><thead><tr><th>Sensor</th><th>Their check</th><th>Peak σ</th>
+      <th>σ vs before the event</th><th>Why</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    <div class="note">“Peak σ” uses the whole window, as a check run over this
+      window would. The next column recomputes it with the event's own samples
+      taken out of the baseline — where the two disagree, the event inflated
+      the σ meant to reveal it.</div>
+  </div>`;
+}
+
+/* ---- onset order -------------------------------------------------------- *
+ * Which sensor moved first is the cheapest root-cause evidence available, and
+ * it needs no model: it is in the timestamps already.                        */
+function timeline(i) {
+  const ms = i.members.filter(m => m.start_ms);
+  if (ms.length < 2) return "";
+  const t0 = Math.min(...ms.map(m => m.start_ms));
+  const t1 = Math.max(...ms.map(m => m.end_ms));
+  const span = Math.max(1, t1 - t0);
+  const rows = ms.slice().sort((a, b) => a.start_ms - b.start_ms).map((m, n) => {
+    const left = 100 * (m.start_ms - t0) / span;
+    const width = Math.max(1.5, 100 * (m.end_ms - m.start_ms) / span);
+    const delay = Math.round((m.start_ms - t0) / 60000);
+    return `<tr><td class="muted">${n + 1}</td><td>${esc(m.desc)}</td>
+      <td class="muted">${esc(m.equipment)}</td>
+      <td style="width:100%"><span class="bar">
+        <i style="left:${left}%;width:${width}%"></i></span></td>
+      <td class="muted">${delay ? "+" + delay + " min" : "first"}</td></tr>`;
+  }).join("");
+  return `<div class="tl"><b>Order of onset</b>
+    <table class="tl"><tbody>${rows}</tbody></table>
+    <div class="note">Ordering only. Which instrument reacted first is not
+      proof of where the cause is — a sensor nearer the source reports sooner,
+      and so does one that simply samples faster.</div></div>`;
+}
+
+/* ---- one sensor's trace ------------------------------------------------- *
+ * A single series, so no legend: the caption names it. The band is the
+ * operator's own mean ± 3σ, drawn so the page shows the event sitting inside
+ * it rather than asserting that it does.                                     */
+const TIP = document.createElement("div");
+TIP.className = "tip";
+document.body.appendChild(TIP);
+
+function trace(m) {
+  if (!m.series || m.series.length < 2) return "";
+  const W = 320, H = 110, PADL = 4, PADR = 4, PADT = 8, PADB = 8;
+  const xs = m.series.map(p => p[0]), ys = m.series.map(p => p[1]);
+  const b = m.band;
+  // Scale to the DATA, then admit as much of the band as fits within twice
+  // that range. Scaling to the band instead flattened every trace into a
+  // straight line whenever sigma was large -- which is exactly the sensor
+  // whose shape the reader needs to see, since a large sigma is why their
+  // check missed it. The band is clipped and the caption says so.
+  let lo = Math.min(...ys), hi = Math.max(...ys);
+  const pad = (hi - lo) * 0.08 || Math.abs(hi) * 0.01 || 1;
+  lo -= pad; hi += pad;
+  let clipped = false;
+  if (b && b.std > 0) {
+    const room = (hi - lo);
+    const want = [b.mean - b.k * b.std, b.mean + b.k * b.std];
+    const nlo = Math.max(lo - room, Math.min(lo, want[0]));
+    const nhi = Math.min(hi + room, Math.max(hi, want[1]));
+    clipped = (want[0] < nlo - 1e-9) || (want[1] > nhi + 1e-9);
+    lo = nlo; hi = nhi;
+  }
+  if (hi - lo < 1e-9) { hi = lo + 1; lo = lo - 1; }
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const sx = t => PADL + (W - PADL - PADR) * (t - x0) / Math.max(1, x1 - x0);
+  const sy = v => PADT + (H - PADT - PADB) * (1 - (v - lo) / (hi - lo));
+
+  const path = m.series.map((p, n) =>
+    (n ? "L" : "M") + sx(p[0]).toFixed(1) + " " + sy(p[1]).toFixed(1)).join(" ");
+  let band = "";
+  if (b && b.std > 0) {
+    const top = Math.max(0, sy(b.mean + b.k * b.std));
+    const bot = Math.min(H, sy(b.mean - b.k * b.std));
+    const mid = sy(b.mean);
+    band = `<rect x="0" y="${top.toFixed(1)}" width="${W}"
+             height="${Math.max(0.5, bot - top).toFixed(1)}"
+             fill="var(--band)"></rect>` +
+           (mid >= 0 && mid <= H
+            ? `<line x1="0" x2="${W}" y1="${mid.toFixed(1)}"
+                y2="${mid.toFixed(1)}" stroke="var(--muted)"
+                stroke-width="1" stroke-dasharray="3 3"
+                vector-effect="non-scaling-stroke"></line>` : "");
+  }
+  // The flagged span gets edges as well as a tint. A 12%-opacity fill laid
+  // over the sigma band was invisible in every chart it mattered in, and a
+  // span whose extent cannot be seen is not evidence of anything.
+  const ex0 = sx(m.start_ms), ex1 = sx(m.end_ms);
+  const hue = PC[m._pri] || "#b2182b";
+  const flagged = `<rect x="${ex0.toFixed(1)}" y="0"
+      width="${Math.max(1.5, ex1 - ex0).toFixed(1)}" height="${H}"
+      fill="${hue}" opacity=".18"></rect>
+    <line x1="${ex0.toFixed(1)}" x2="${ex0.toFixed(1)}" y1="0" y2="${H}"
+      stroke="${hue}" stroke-width="1" opacity=".75"
+      vector-effect="non-scaling-stroke"></line>
+    <line x1="${ex1.toFixed(1)}" x2="${ex1.toFixed(1)}" y1="0" y2="${H}"
+      stroke="${hue}" stroke-width="1" opacity=".75"
+      vector-effect="non-scaling-stroke"></line>`;
+  // The scale goes in the caption, not in the SVG. The chart is stretched to
+  // the column width with `preserveAspectRatio="none"`, which distorts any
+  // glyph drawn inside it; strokes escape that through `non-scaling-stroke`,
+  // text has no equivalent.
+  const range = `${Math.min(...ys).toPrecision(4)} – ` +
+                `${Math.max(...ys).toPrecision(4)}`;
+  const verdict = b ? ` · their check: <span class="v-${esc(b.verdict)}">` +
+                      `${esc(b.verdict)}</span> at ${b.peak_z.toFixed(1)}σ` : "";
+  return `<div class="trace">
+    <div class="cap">${esc(m.desc)}</div>
+    <div class="sub">${esc(m.equipment)}${m.unit ? " · " + esc(m.unit) : ""}
+      · ${esc(range)}${verdict}</div>
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"
+         data-series='${esc(JSON.stringify(m.series))}'
+         data-unit="${esc(m.unit || "")}"
+         data-x0="${x0}" data-x1="${x1}">
+      ${band}${flagged}
+      <path d="${path}" fill="none" stroke="var(--ink)" stroke-width="2"
+            vector-effect="non-scaling-stroke"
+            stroke-linejoin="round" stroke-linecap="round"></path>
+      <line class="cross" y1="0" y2="${H}" stroke="var(--muted)"
+            stroke-width="1" vector-effect="non-scaling-stroke"
+            style="display:none"></line>
+    </svg>
+    <div class="note">Shaded band: mean ± 3σ over this window${clipped
+      ? ", wider than this view and clipped to it" : ""}. Tinted span: what
+      this system flagged.</div>
+  </div>`;
+}
+
+/* Crosshair and tooltip. An SVG chart in a page IS interactive; a trace with
+   no readout makes the reader estimate values off a 110px axis. */
+function armTraces(root) {
+  root.querySelectorAll(".trace svg").forEach(svg => {
+    let pts = null;
+    const line = svg.querySelector(".cross");
+    svg.addEventListener("pointermove", ev => {
+      if (!pts) { try { pts = JSON.parse(svg.dataset.series); } catch (e) { pts = []; } }
+      if (!pts.length) return;
+      const box = svg.getBoundingClientRect();
+      const frac = (ev.clientX - box.left) / Math.max(1, box.width);
+      const t = +svg.dataset.x0 + frac * (+svg.dataset.x1 - +svg.dataset.x0);
+      let best = pts[0];
+      for (const p of pts) if (Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
+      line.setAttribute("x1", frac * 320);
+      line.setAttribute("x2", frac * 320);
+      line.style.display = "";
+      TIP.textContent = new Date(best[0]).toISOString().replace("T", " ").slice(5, 16)
+                      + "  ·  " + best[1] + " " + svg.dataset.unit;
+      TIP.style.display = "block";
+      TIP.style.left = (ev.clientX + 12) + "px";
+      TIP.style.top = (ev.clientY - 28) + "px";
+    });
+    svg.addEventListener("pointerleave", () => {
+      line.style.display = "none";
+      TIP.style.display = "none";
+    });
+  });
+}
+
+/* ---- incident table, filtered ------------------------------------------- */
 const inc = DATA.incidents;
-if (!inc.length) {
-  document.getElementById("incidents").innerHTML =
-    '<div class="empty">No incidents. Every sensor behaved within its own ' +
-    'normal range this run.</div>';
-} else {
-  const rows = inc.map((i, n) => {
+const F = {region: "", priority: "", cls: "", equipment: "", text: ""};
+
+function options(sel, values, label) {
+  sel.innerHTML = `<option value="">${label}</option>` +
+    values.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+}
+
+function matches(i) {
+  if (F.region && i.region !== F.region) return false;
+  if (F.priority && i.priority !== F.priority) return false;
+  if (F.cls && i.cls !== F.cls) return false;
+  if (F.equipment && !i.equipment.includes(F.equipment)) return false;
+  if (F.text) {
+    const hay = (i.sites.join(" ") + " " + i.id + " " +
+                 i.members.map(m => m.desc).join(" ")).toLowerCase();
+    if (!hay.includes(F.text.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function renderIncidents() {
+  const host = document.getElementById("incidents");
+  const shown = inc.filter(matches);
+  document.getElementById("f-count").textContent =
+    `${shown.length} of ${inc.length} shown`;
+  if (!inc.length) {
+    host.innerHTML = '<div class="empty">No incidents. Every sensor behaved ' +
+      'within its own normal range this run.</div>';
+    return;
+  }
+  if (!shown.length) {
+    host.innerHTML = '<div class="empty">Nothing matches these filters.</div>';
+    return;
+  }
+  const rows = shown.map((i, n) => {
     const quiet = i.cls === "TELEMETRY_FANOUT" || i.cls === "WATCH";
     const members = i.members.map(m =>
       `<tr><td>${esc(m.desc)}</td><td>${esc(m.equipment)}</td>
@@ -526,9 +917,10 @@ if (!inc.length) {
        <td>${m.deviation ? esc(m.deviation) + " " + esc(m.unit) : "—"}</td>
        <td>${Math.round(m.duration_s / 60)} min</td>
        <td>${esc(m.detectors.join(", "))}</td></tr>`).join("");
+    const charts = i.members.filter(m => m.series).slice(0, 6)
+      .map(m => trace(Object.assign({_pri: i.priority}, m))).join("");
     return `
-    <tr class="inc${quiet ? " suppressed" : ""}" onclick="
-        document.getElementById('d${n}').classList.toggle('open')">
+    <tr class="inc${quiet ? " suppressed" : ""}" data-det="d${n}">
       <td><span class="badge" style="background:${PC[i.priority]}">${esc(i.priority)}</span></td>
       <td><span class="badge" style="background:${CC[i.cls] || "#888"}">${esc(i.cls)}</span></td>
       <td>${esc(i.region)}</td>
@@ -548,20 +940,64 @@ if (!inc.length) {
         <div class="muted">${esc(i.signature.caveat)}</div></div>` : ""}
       ${i.rainfall_mm != null ? `<div class="muted">Rainfall nearby: ${i.rainfall_mm} mm</div>` : ""}
       ${i.correlation != null ? `<div class="muted">Neighbour correlation: r=${i.correlation}</div>` : ""}
+      ${conventionalPanel(i)}
+      ${timeline(i)}
       <table style="margin-top:10px">
         <thead><tr><th>Sensor</th><th>Equipment</th><th>Fault</th>
         <th>Deviation</th><th>Duration</th><th>Found by</th></tr></thead>
         <tbody>${members}</tbody></table>
+      ${charts ? `<div class="traces">${charts}</div>` : ""}
       <div class="note">Incident ${esc(i.id)}</div>
     </td></tr>`;
   }).join("");
-  document.getElementById("incidents").innerHTML =
+  host.innerHTML =
     `<table><thead><tr><th>Pri</th><th>Class</th><th>Region</th><th>Sensors</th>
      <th>Sites</th><th>Where</th><th>Sev</th><th>Recommendation</th></tr></thead>
      <tbody>${rows}</tbody></table>
-     <div class="note">Click a row for the evidence behind the recommendation.
-     Dimmed rows are suppressed and will not page anyone.</div>`;
+     <div class="note">Click a row for the evidence behind the recommendation,
+     what your own median ± 3σ check makes of the same sensors, and the traces
+     it is all drawn from. Dimmed rows are suppressed and will not page
+     anyone.</div>`;
+  host.querySelectorAll("tr.inc").forEach(row => {
+    row.addEventListener("click", () => {
+      const det = document.getElementById(row.dataset.det);
+      det.classList.toggle("open");
+      if (det.classList.contains("open")) armTraces(det);
+    });
+  });
 }
+
+(function initFilters() {
+  const uniq = f => [...new Set(inc.map(f).flat())].filter(Boolean).sort();
+  options(document.getElementById("f-region"), uniq(i => i.region), "all");
+  options(document.getElementById("f-priority"), uniq(i => i.priority), "all");
+  options(document.getElementById("f-class"), uniq(i => i.cls), "all");
+  options(document.getElementById("f-equipment"), uniq(i => i.equipment), "all");
+  const bind = (id, key) => document.getElementById(id)
+    .addEventListener("input", ev => { F[key] = ev.target.value; renderIncidents(); });
+  bind("f-region", "region"); bind("f-priority", "priority");
+  bind("f-class", "cls"); bind("f-equipment", "equipment");
+  bind("f-text", "text");
+  document.getElementById("f-reset").addEventListener("click", () => {
+    Object.keys(F).forEach(k => F[k] = "");
+    document.querySelectorAll(".filters select, .filters input")
+      .forEach(el => el.value = "");
+    renderIncidents();
+  });
+})();
+
+/* Drilling into a region from the map or the matrix sets the same filter the
+   controls do, so there is one state and not two. */
+function focusRegion(region) {
+  F.region = region;
+  document.getElementById("f-region").value = region;
+  renderIncidents();
+  document.getElementById("incidents").scrollIntoView({behavior: "smooth",
+                                                       block: "start"});
+}
+window.focusRegion = focusRegion;
+
+renderIncidents();
 </script>
 </body>
 </html>

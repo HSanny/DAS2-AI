@@ -170,6 +170,14 @@ def _hbar(ax, labels: Sequence[str], values: Sequence[float], *,
     ax.spines["left"].set_visible(False)
 
 
+def _fit(text: str, width_fraction: float) -> str:
+    """Trim a cell to the width it is drawn in, marking that it was trimmed."""
+    budget = max(4, int(CONTEXT_WRAP * width_fraction))
+    if len(text) <= budget:
+        return text
+    return text[:budget - 1].rstrip() + "…"
+
+
 def _table(fig, rect: tuple[float, float, float, float],
            columns: Sequence[tuple[str, float, str]],
            rows: Sequence[Sequence[Any]], *,
@@ -213,6 +221,12 @@ def _table(fig, rect: tuple[float, float, float, float],
             weight = "normal"
             if row_colors and r < len(row_colors) and align == "center":
                 color, weight = row_colors[r], theme.WEIGHT_BOLD
+            # Truncate to the column, visibly. Matplotlib draws the whole
+            # string and lets the page edge cut it off without a word, so a
+            # cell that outgrew its column lost its tail in silence -- which
+            # on this report cost the last clause of a sentence about what the
+            # numbers mean.
+            value = _fit(str(value), width * w / total)
             fig.text(cell, y, str(value), fontsize=theme.SIZE_SMALL,
                      color=color, fontweight=weight,
                      ha={"left": "left", "right": "right",
@@ -483,6 +497,7 @@ def _anatomy_block(fig, incident, top: float, *, budget: float = 0.42) -> float:
     top -= 0.012
 
     top = _signature_lines(fig, incident, top)
+    top = _conventional_line(fig, incident, top)
 
     rows = [(g.display, g.count, len(g.sites), g.direction_text(),
              g.move_text() or "—",
@@ -509,6 +524,33 @@ def _anatomy_block(fig, incident, top: float, *, budget: float = 0.42) -> float:
             ("behaviour", 0.26, "left"), ("qartod", 0.10, "left")],
            rows)
     return top - height - 0.055
+
+
+def _conventional_line(fig, incident, top: float) -> float:
+    """
+    What the client's own median-and-sigma check makes of the same sensors.
+
+    One line here, the full table in the interactive report. This is the
+    sentence he asked to be able to check -- *"verify oh there really is
+    something that is not yet discovered by already existing stats
+    calculation"* -- so it is printed whichever way it comes out, including
+    the runs where their check would have caught it and this one added
+    nothing.
+    """
+    panel = (incident.detail or {}).get("conventional") or {}
+    if not panel:
+        return top
+
+    fig.text(L, top, panel.get("headline", ""), fontsize=theme.SIZE_SMALL,
+             fontweight=theme.WEIGHT_BOLD, color=theme.INK_SECONDARY,
+             va="center")
+    top -= 0.022
+    because = f"Found here because {panel.get('found_because', '')}"
+    for line in textwrap.wrap(because, FOOTER_WRAP)[:2]:
+        fig.text(L, top, line, fontsize=theme.SIZE_TINY,
+                 color=theme.INK_MUTED, va="center")
+        top -= 0.017
+    return top - 0.008
 
 
 def _signature_lines(fig, incident, top: float) -> float:
@@ -888,6 +930,19 @@ def _quality_page(pdf: PdfPages, result) -> None:
                      f"{ingest.get('missing_hours_range', '')} — sensors "
                      f"silent across a gap read as STALE, so that count is "
                      f"inflated while this persists"))
+
+    # The fleet-level answer to "would my own statistics have found this?".
+    # It belongs beside the coverage numbers because it is the same kind of
+    # claim: what this run could and could not have seen, and by what method.
+    cvn = stats.get("conventional") or {}
+    if cvn.get("sensors"):
+        rows.append((
+            "Your median ± 3σ, fleet-wide",
+            f"{cvn.get('crossed', 0):,} of {cvn['sensors']:,}",
+            f"cross the band; noise explains "
+            f"{cvn.get('explained_by_noise', 0):,}, leaving "
+            f"{cvn.get('would_alarm', 0):,} to act on. "
+            f"{cvn.get('masked', 0):,} masked by their own event"))
 
     _table(fig, (L, y - 0.46, R - L, 0.44),
            [("measure", 0.26, "left"), ("value", 0.12, "left"),

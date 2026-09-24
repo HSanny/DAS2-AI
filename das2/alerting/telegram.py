@@ -254,17 +254,43 @@ class TelegramClient:
                             doc_path, caption=caption,
                             reply_markup=reply_markup, chat_id=chat_id)
 
+    def send_document_group(self, docs: list[tuple[str | Path, str]],
+                            caption: str = "", *,
+                            chat_id: str | None = None) -> dict[str, Any]:
+        """
+        Several attachments as ONE notification.
+
+        The run delivers a PDF and an interactive HTML page, and sending them
+        separately would put the notification count back up -- which is the
+        complaint the single-report shape exists to answer. `sendMediaGroup`
+        posts them as one album: one buzz, two files.
+
+        Telegram refuses to mix a photo with documents in a group, so the map
+        stays its own message. The caption goes on the FIRST item, which is
+        where Telegram shows an album's caption.
+        """
+        files: list[tuple[str, str, str, bytes]] = []
+        media: list[dict[str, Any]] = []
+        for n, (path, mime) in enumerate(docs):
+            path = Path(path)
+            field = f"file{n}"
+            files.append((field, path.name, mime, path.read_bytes()))
+            item: dict[str, Any] = {"type": "document",
+                                    "media": f"attach://{field}"}
+            if n == 0 and caption:
+                item["caption"] = caption[:CAPTION_MAX]
+                item["parse_mode"] = "HTML"
+            media.append(item)
+        return self._post_multipart(
+            "sendMediaGroup",
+            {"chat_id": chat_id or self.config.chat_id,
+             "media": json.dumps(media)},
+            files)
+
     def _upload(self, method: str, field: str, mime: str,
                 file_path: str | Path, *, caption: str = "",
                 reply_markup=None, chat_id: str | None = None) -> dict[str, Any]:
-        """
-        multipart/form-data, built by hand.
-
-        Deliberately not `requests`: the alert path has no dependency that
-        could fail to install in the container, so a message can still go out
-        when the rest of the stack is unhappy.
-        """
-        boundary = f"----das2{int(time.time()*1000)}"
+        """One file, with a caption. The ordinary case."""
         path = Path(file_path)
         fields = {
             "chat_id": chat_id or self.config.chat_id,
@@ -273,17 +299,30 @@ class TelegramClient:
         }
         if reply_markup:
             fields["reply_markup"] = json.dumps(reply_markup)
+        return self._post_multipart(
+            method, fields, [(field, path.name, mime, path.read_bytes())])
 
+    def _post_multipart(self, method: str, fields: dict[str, Any],
+                        files: list[tuple[str, str, str, bytes]]) -> dict[str, Any]:
+        """
+        multipart/form-data, built by hand.
+
+        Deliberately not `requests`: the alert path has no dependency that
+        could fail to install in the container, so a message can still go out
+        when the rest of the stack is unhappy.
+        """
+        boundary = f"----das2{int(time.time()*1000)}"
         body = bytearray()
         for key, value in fields.items():
             body += (f"--{boundary}\r\n"
                      f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
                      f"{value}\r\n").encode()
-        body += (f"--{boundary}\r\n"
-                 f'Content-Disposition: form-data; name="{field}"; '
-                 f'filename="{path.name}"\r\n'
-                 f"Content-Type: {mime}\r\n\r\n").encode()
-        body += path.read_bytes() + b"\r\n"
+        for field, filename, mime, blob in files:
+            body += (f"--{boundary}\r\n"
+                     f'Content-Disposition: form-data; name="{field}"; '
+                     f'filename="{filename}"\r\n'
+                     f"Content-Type: {mime}\r\n\r\n").encode()
+            body += blob + b"\r\n"
         body += f"--{boundary}--\r\n".encode()
 
         req = request.Request(
@@ -332,16 +371,28 @@ class TelegramClient:
 # --------------------------------------------------------------------------- #
 def send_report(result, config: TelegramConfig, *, report_pdf: Path,
                 map_png: Path | None = None,
+                dashboard_html: Path | None = None,
                 p1_detail_messages: bool = False,
                 dashboard_url: str | None = None) -> SendReport:
     """
-    Two things per run: the cluster map, then the written analysis.
+    The cluster map, then the analysis, then the page to dig into it.
 
-The shape the client asked for: *"1 cluster image on actual singapore map,
-    and 1 pdf explanation on the case"*. Two, not fourteen, and in that order
-    for a reason -- the map renders inline in the chat, so a phone shows where
-    the trouble is on the lock screen, while a PDF is an attachment that has to
-    be opened. The glance first, the reasoning behind it second.
+    The shape the client asked for: *"1 cluster image on actual singapore map,
+    and 1 pdf explanation on the case"*, and in that order for a reason -- the
+    map renders inline in the chat, so a phone shows where the trouble is on
+    the lock screen, while a PDF is an attachment that has to be opened. The
+    glance first, the reasoning behind it second.
+
+    `dashboard_html` is the third: *"can be interactive collective report show
+    on the web ... he will click into the collective or interactive report to
+    view, then verify"*. It rides along as a second document in the SAME
+    media group as the PDF, so the run still costs two notifications rather
+    than three -- the volume complaint that produced this shape in the first
+    place applies to the fix for it as well.
+
+    Telegram will not mix a photo and documents in one media group, which is
+    why the map stays a separate message rather than all three arriving
+    together.
 
     The map's caption carries enough to act on without opening anything: how
     many need a decision, where, and how many were deliberately held back. The
@@ -387,8 +438,26 @@ The shape the client asked for: *"1 cluster image on actual singapore map,
             report.failed.append(("<map>", str(exc)))
             caption = _report_caption(result, alertable)
 
+    body = caption or _document_caption(result)
+    interactive = (Path(dashboard_html)
+                   if dashboard_html and Path(dashboard_html).exists() else None)
+    if interactive is not None:
+        body = (body + "\n\n" + _interactive_note())[:CAPTION_MAX]
     try:
-        client.send_document(report_pdf, caption or _document_caption(result))
+        if interactive is not None:
+            try:
+                client.send_document_group(
+                    [(report_pdf, "application/pdf"),
+                     (interactive, "text/html")], body)
+            except (error.URLError, error.HTTPError, OSError) as exc:
+                # An album is a nicety; the report is not. Two notifications
+                # beat none, so a group that will not post falls back rather
+                # than losing the run's only delivery to save a buzz.
+                log.warning("media group failed, sending separately: %s", exc)
+                client.send_document(report_pdf, body)
+                client.send_document(interactive, "")
+        else:
+            client.send_document(report_pdf, body)
         # The document IS the delivery. Every alertable incident was in it, so
         # marking only the P1s as sent would misreport the run and would make
         # the next run re-announce everything it had already reported.
@@ -421,6 +490,19 @@ def _document_caption(result) -> str:
 
     return (f"<b>Run {result.run_id}</b> — full analysis\n"
             f"{_esc(narrative.summary_line(result))}")
+
+
+def _interactive_note() -> str:
+    """
+    What the second attachment is for, in one line.
+
+    Telegram will not render an HTML attachment inline, so without this the
+    file reads as a duplicate of the PDF and never gets opened. It says what
+    it does and what it costs to open.
+    """
+    return ("📊 The .html is the interactive version — open it in a browser to "
+            "filter by region, see each sensor's trace, and check what your "
+            "own median ± 3σ would have made of the same data.")
 
 
 def _report_caption(result, alertable: list) -> str:

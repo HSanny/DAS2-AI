@@ -39,9 +39,9 @@ docker compose up -d das2 das2-ack        # go live
 
 | | |
 |---|---|
-| `output/dashboard_*.html` | Regional map, region × equipment-type heatmap, every incident with the evidence behind its recommendation. Self-contained — email it, archive it, open it from a share. |
+| `output/dashboard_*.html` | The interactive report. Regional map, region × parameter heatmap, and every incident expanding to its evidence, its sensors' own traces, and what a median ± 3σ check would have made of them. Filter by region, priority, class or parameter. Self-contained — email it, archive it, open it from a share, with no server behind it. |
 | `output/*.png` | The same as images, for Telegram |
-| Telegram | Two artefacts per run — the map of Singapore, then one PDF analysing the run: what to act on, what each incident is made of, what was held back and why. Per-incident messages with Acknowledge / Dispatched / False-alarm buttons are opt-in (`alert.p1_detail_messages`) |
+| Telegram | Two notifications per run — the map of Singapore, then the PDF analysis and the interactive page together as one album. Per-incident messages with Acknowledge / Dispatched / False-alarm buttons are opt-in (`alert.p1_detail_messages`) |
 | SQL Server | Incidents with stable identity across runs, the reading history the daily job learns from, plus the operator feedback that is the only ground truth this system has |
 
 ## How it works
@@ -66,6 +66,25 @@ The second case is invisible to name-based grouping, which is what the previous
 system used: four different sensors at three different sites share no name, so
 nothing linked them.
 
+### Checking it against the statistics you already run
+
+Every incident carries what a median-and-σ check would have concluded about
+the same sensors, computed on the same data — including the cases where it
+would have caught the event and this system added nothing. Two numbers are
+worth knowing before reading it:
+
+- **A 3σ band does not filter much at this sample count.** The probability
+  that pure Gaussian noise touches 3σ somewhere in a 900-sample window is
+  **91%**. Across 2,600 sensors that is around 2,370 healthy sensors crossing
+  the line every run, so each crossing is scored against what noise produces
+  and reported as a find only when noise does not explain it.
+- **σ is computed from the window that contains the event.** A sustained
+  excursion inflates its own denominator — the masking effect that robust
+  statistics exist to deal with. Where that happens, the report gives both
+  numbers: the score against the whole window, and the score against the hours
+  before the event. On the fixture a real step reads 1.8σ one way and 17.7σ
+  the other.
+
 ### Two files you are meant to edit
 
 Both live in `das2/data/` and are read at start-up, so a change is an edit and
@@ -86,7 +105,7 @@ does not otherwise have.
 ## Development
 
 ```bash
-bash tests/run_all.sh              # 1018 assertions, no network needed
+bash tests/run_all.sh              # 1079 assertions, no network needed
 python3 -m das2.cli demo           # synthetic data with known faults
 python3 tools/make_fixtures.py --out /tmp/fx
 ```
@@ -104,5 +123,5 @@ Two things to know before judging the output. The **daily profile job**
 (`das2 profile`) must be scheduled: `DRIFT`, `NOISE_BURST` and the whole
 baseline layer depend on it, and until it has run those produce nothing. And
 there is **no shadow-mode harness yet**, so there is no measured precision or
-recall against real data — the evidence is 1018 assertions and a fixture
+recall against real data — the evidence is 1079 assertions and a fixture
 carrying 19 known faults, which is real but is not the same claim.

@@ -328,6 +328,11 @@ def cmd_run(config: Config, args) -> int:
         report = send_report(
             result, telegram, report_pdf=report_pdf,
             map_png=chart_paths.get("map"),
+            # The interactive page rides with the PDF. Until it is served over
+            # HTTP somewhere the client's phone can reach, the file itself IS
+            # the link -- it is self-contained, so it opens from the download
+            # folder with no server behind it.
+            dashboard_html=html_path,
             p1_detail_messages=config.alert.p1_detail_messages,
             dashboard_url=config.report.public_url or None,
         )
