@@ -171,6 +171,34 @@ rules:
     # Condition), every one of them digital. The unit never appears in a
     # description here.
 
+  # Canal, drain and river water level -- PUB's CWS/EWS network, and the
+  # largest single family of sensors in the estate (~1,600 points).
+  #
+  # Separated from Level deliberately, and it must stay ABOVE it: `_WL_` also
+  # matches Level's `\bwl\b`, so first-match-wins is what keeps the two apart.
+  #
+  # Why they are not the same parameter. A reservoir level and a canal level
+  # are both metres of water, but they answer different questions and they
+  # respond to different things. A canal rising 0.8 m in twenty minutes during
+  # a storm is the drainage system doing its job; a service reservoir doing the
+  # same is an emergency. Merging them would make every "which parameter is
+  # driving this event" view answer "Level", which is the question the client
+  # actually asked and the answer that tells them nothing.
+  #
+  # These are level-only points: there is no flow or velocity measurement
+  # alongside them anywhere in the feed. That rules out the depth-velocity
+  # blockage signature used in sewer practice, and it is why the drainage
+  # literature that fits this estate (Rosin et al. 2022) works from level and
+  # rainfall alone.
+  - equipment: CanalLevel
+    patterns:
+      # CWS001_WL_Alex Canal Sub Drain B, EWS008_WL_Seletar Rd/Neram Rd.
+      # Anchored on the station-code prefix so it cannot pick up an unrelated
+      # "WL" appearing mid-description.
+      - "^[a-z]{2,5}[0-9]{2,4}[\\s_-]*wl[\\s_-]"
+      - "(canal|drain|culvert|nullah)[\\s_-]?.*(water[\\s_-]?level|\\blevel\\b)"
+      - "(water[\\s_-]?level|\\blevel\\b)[\\s_-]?.*(canal|drain|culvert)"
+
   - equipment: Level
     patterns:
       - "water[\\s_-]?level"
@@ -269,6 +297,23 @@ classes:
   Pressure:          {kind: measurement, unit: bar,    alertable: true,  range: [0, 20]}
   Flowrate:          {kind: measurement, unit: "L/s",  alertable: true,  range: [-2000, 2000]}
   Level:             {kind: measurement, unit: "%",    alertable: true,  range: null}
+
+  # Canal/drain water level. Starts NON-alerting on purpose, and this line is
+  # the whole of the decision -- flip it to true when you want them to page.
+  #
+  # Classifying them is the fix; promoting them is a separate, measurable step.
+  # There are ~1,600 of these against ~2,500 alertable sensors today, so this
+  # one flag is the largest single change in alert volume available, and there
+  # is a specific reason not to take it blind: while the 24-hour gap in the
+  # historian feed persists, a sensor silent across that gap reads as STALE.
+  # Turning this on before the gap is fixed would page on missing files, at
+  # canal-network scale.
+  #
+  # Measure before you flip it:  docker compose run --rm das2-dryrun
+  # and compare `coverage.alertable` and the incident count against a run with
+  # it false. Nothing is hidden meanwhile -- they are classified, analysed,
+  # counted and on the map either way.
+  CanalLevel:        {kind: measurement, unit: m,      alertable: false, range: null}
   Temperature:       {kind: measurement, unit: C,      alertable: true,  range: [0, 60]}
   Conductivity:      {kind: measurement, unit: "uS/cm", alertable: true, range: [0, 50000]}
   Dissolved Oxygen:  {kind: measurement, unit: "mg/L", alertable: true,  range: [0, 20]}

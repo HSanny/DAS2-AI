@@ -59,6 +59,64 @@ ANALOG_RAWTYPES = {1, 5}
 
 UNCLASSIFIED = "UNCLASSIFIED"
 
+#: A word boundary that treats `_` as a separator, which `\b` does not.
+#:
+#: This is the single most expensive defect the rule table has had. In Python
+#: -- and in every other flavour of regex -- `_` is a WORD character, so `\b`
+#: sees no boundary between an underscore and a letter. `\bwl\b` therefore
+#: never matches `CWS001_WL_Alex Canal Sub Drain B`, and roughly 1,600 of PUB's
+#: canal and drain water-level sensors sat in UNCLASSIFIED for exactly that
+#: reason -- the single parameter that matters most for a drainage estate,
+#: invisible because of one character class.
+#:
+#: It was not one rule. Fifty-two patterns across nearly every class had it:
+#: `\bflow\b`, `\bpump\b`, `\btemp\b`, `\bdo\b`, `\brain\b`. The CWS/EWS
+#: naming convention is underscore-delimited throughout, so every one of them
+#: was blind to it. `\bwl\b` was simply the one with enough sensors behind it
+#: to be noticed in a coverage report.
+#:
+#: Fixing the patterns by hand would fix today's table and guarantee the next
+#: rule anyone adds reintroduces the bug, because `\b` is what a person writes
+#: when they mean "a whole word". So the translation happens here, once, at
+#: compile time: rule authors keep writing `\b` and it now means what they
+#: intended.
+#:
+#: The expression is `\b`'s own definition with the alphabet narrowed to
+#: letters and digits: a boundary exists where exactly one side is
+#: alphanumeric. Written as an explicit alternation because it has to work
+#: both before and after a token, and a bare lookbehind would only do one.
+ALNUM_BOUNDARY = (r"(?:(?<=[A-Za-z0-9])(?![A-Za-z0-9])"
+                  r"|(?<![A-Za-z0-9])(?=[A-Za-z0-9]))")
+
+
+def expand_boundaries(pattern: str) -> str:
+    """
+    Rewrite `\\b` to a boundary that also breaks on `_`.
+
+    Leaves `\\B`, `[\\b]` (backspace in a character class) and an escaped
+    `\\\\b` alone -- none appear in the rule table today, and silently
+    rewriting them would be a different bug.
+    """
+    out, i, in_class = [], 0, False
+    while i < len(pattern):
+        char = pattern[i]
+        if char == "\\" and i + 1 < len(pattern):
+            # Inside [...] a `\b` is a BACKSPACE, not a boundary. Rewriting it
+            # would turn a character class into a syntax error.
+            if pattern[i + 1] == "b" and not in_class:
+                out.append(ALNUM_BOUNDARY)
+            else:
+                out.append(pattern[i:i + 2])
+            i += 2
+            continue
+        if char == "[":
+            in_class = True
+        elif char == "]":
+            in_class = False
+        out.append(char)
+        i += 1
+    return "".join(out)
+
 
 @dataclass(frozen=True)
 class EquipmentClass:
@@ -136,8 +194,12 @@ class EquipmentClassifier:
             allowed = rule.get("signal_types")
             allowed_set = frozenset(allowed) if allowed else None
             for pattern in rule.get("patterns", []):
+                # `pattern` is kept UNexpanded for reporting, so a coverage
+                # report names the rule the author wrote rather than the
+                # generated boundary expression.
                 self._rules.append(
-                    (equipment, re.compile(pattern, re.IGNORECASE), pattern, allowed_set))
+                    (equipment, re.compile(expand_boundaries(pattern), re.IGNORECASE),
+                     pattern, allowed_set))
         self._classes = classes
         self._analog_fallback = analog_fallback
         self._digital_fallback = digital_fallback

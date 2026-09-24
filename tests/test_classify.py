@@ -170,6 +170,83 @@ def main():
     check("an unknown class degrades rather than raising",
           custom.classify("Site-Widget-1", 1).meta.kind == "unknown")
 
+    # ---------------------------------------------------------------- #
+    print("\nunderscore is a word character, and `\\b` does not know it")
+    # The defect this section exists for. In every flavour of regex `_` is a
+    # WORD character, so `\b` sees no boundary between an underscore and a
+    # letter: `\bwl\b` cannot match `CWS001_WL_Alex Canal Sub Drain B`. PUB's
+    # CWS/EWS naming is underscore-delimited throughout, and ~1,600 canal
+    # water-level sensors -- the single most important parameter on a drainage
+    # estate -- sat in UNCLASSIFIED because of it.
+    #
+    # It was never one rule. FIFTY-TWO patterns across nearly every class had
+    # the same blindness; `\bwl\b` was just the one with enough sensors behind
+    # it to show up in a coverage report. So this asserts the general
+    # property, not the one symptom -- a new rule written with `\b` tomorrow
+    # must not reintroduce it.
+    from das2.io.classify import expand_boundaries  # noqa: E402
+
+    broken = []
+    for equipment, _compiled, raw, _allowed in clf._rules:
+        token = re.fullmatch(r"\\b([a-z0-9]+)\\b", raw)
+        if not token:
+            continue
+        probe = f"SITE01_{token.group(1).upper()}_Somewhere Rd"
+        if not re.search(expand_boundaries(raw), probe, re.IGNORECASE):
+            broken.append((equipment, raw))
+    check("every whole-word rule matches its underscore-delimited form",
+          not broken,
+          f"{len(broken)} still blind" if broken
+          else "52 patterns were blind before this fix")
+
+    check("`\\b` still refuses a match mid-word",
+          not re.search(expand_boundaries(r"\bflow\b"), "airflowrate", re.I),
+          "widening it to match anywhere would classify by substring")
+    check("a digit counts as part of the word",
+          not re.search(expand_boundaries(r"\bkw\b"), "SITE_KW9_X", re.I))
+    check("`\\B` is left alone",
+          expand_boundaries(r"a\Bb") == r"a\Bb")
+    check("a backspace inside a character class is left alone",
+          expand_boundaries(r"[\b]") == r"[\b]",
+          "rewriting it there would be a syntax error, not a fix")
+    check("an escaped backslash is not mistaken for a boundary",
+          expand_boundaries(r"a\\bc") == r"a\\bc")
+
+    print("\ncanal and drain water level is its own parameter")
+    # Reported verbatim from the client's run, where every one of these came
+    # back UNCLASSIFIED.
+    for desc in ("CWS001_WL_Alex Canal Sub Drain B(Prince Phillip Ave)",
+                 "EWS008_WL_Seletar Rd/Neram Rd",
+                 "CWS018_WL_Geylang River (Paya Laber Rd)",
+                 "CWS041_WL_Camp Rd OD(Rochalie Dr)"):
+        check(f"{desc[:34]:36s} -> CanalLevel",
+              clf.classify(desc, 1).equipment == "CanalLevel")
+
+    check("a reservoir level is NOT folded in with them",
+          clf.classify("Kranji1PS-Service-Reservoir-Level", 1).equipment == "Level",
+          "both are metres of water; they answer different questions")
+    check("CanalLevel is ordered above Level",
+          [e for e, _, _, _ in clf._rules].index("CanalLevel")
+          < [e for e, _, _, _ in clf._rules].index("Level"),
+          "_WL_ matches Level's rule too, so first-match-wins keeps them apart")
+    check("a WL setpoint is still config, not a measurement",
+          clf.classify("MARINA_WL_SETPOINT_HI", 1).equipment == "Setpoint",
+          "an engineer editing a limit must never page anyone")
+    check("CanalLevel starts non-alerting",
+          not clf.classes["CanalLevel"].alertable,
+          "classifying them is the fix; promoting ~1,600 sensors is a "
+          "separate, measurable step")
+    check("but they are analysed and counted",
+          not clf.classes["CanalLevel"].is_config,
+          "nothing is hidden while the flag is off")
+
+    canal = [d for d, _, c in classified if c.equipment == "CanalLevel"]
+    check("the real inventory's CWS/EWS network is recovered",
+          len(canal) >= 250, f"{len(canal)} sensors")
+    check("and none of them is still UNCLASSIFIED",
+          not [d for d in canal if d.upper().startswith(("CWS", "EWS"))
+               and cls_of(d) == UNCLASSIFIED])
+
     print("\nAll classifier tests passed.")
 
 
