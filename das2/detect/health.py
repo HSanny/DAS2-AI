@@ -111,14 +111,14 @@ QUANT_MIN_POINTS = 60
 #: steps is reporting a number rather than measuring one -- the classic
 #: symptom of an input stuck upstream of the ADC, which FLATLINE misses
 #: because the value is not exactly constant.
-DITHER_MAX_STEPS = 2.0
+ATTENUATED_MAX_STEPS = 2.0
 
 #: ...and it only counts if the sensor normally moves far more than that.
-DITHER_FRACTION_OF_NORMAL = 0.1
+ATTENUATED_FRACTION_OF_NORMAL = 0.1
 
 #: Window over which dithering is judged. Long enough that a genuinely quiet
 #: process period does not look dead.
-DITHER_WINDOW_S = 21600.0        # 6 hours
+ATTENUATED_WINDOW_S = 21600.0        # 6 hours
 
 
 def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -534,7 +534,7 @@ def detect_quantisation_collapse(ts: pd.Series, values: np.ndarray,
     return signals
 
 
-def detect_dithering_dead(ts: pd.Series, values: np.ndarray,
+def detect_attenuated_signal(ts: pd.Series, values: np.ndarray,
                           profile: SensorProfile | None,
                           unit: str = "") -> list[Signal]:
     """
@@ -566,8 +566,8 @@ def detect_dithering_dead(ts: pd.Series, values: np.ndarray,
     normal_spread = 1.4826 * profile.mad if np.isfinite(profile.mad) else 0.0
     if normal_spread <= 0:
         return []
-    ceiling = min(DITHER_MAX_STEPS * resolution,
-                  DITHER_FRACTION_OF_NORMAL * normal_spread)
+    ceiling = min(ATTENUATED_MAX_STEPS * resolution,
+                  ATTENUATED_FRACTION_OF_NORMAL * normal_spread)
     if ceiling <= 0:
         return []
 
@@ -595,10 +595,10 @@ def detect_dithering_dead(ts: pd.Series, values: np.ndarray,
 
         duration = seconds[end] - seconds[start]
         held_span = hi - lo
-        if (duration >= DITHER_WINDOW_S and held_span > 0
+        if (duration >= ATTENUATED_WINDOW_S and held_span > 0
                 and (end - start) >= 20):
             signals.append(Signal(
-                type=AnomalyType.DITHERING_DEAD,
+                type=AnomalyType.ATTENUATED_SIGNAL,
                 start=pd.Timestamp(ts.iloc[start]).to_pydatetime(),
                 end=pd.Timestamp(ts.iloc[end]).to_pydatetime(),
                 detector=DETECTOR,
@@ -649,7 +649,7 @@ def run_health_checks(ts: pd.Series, values: np.ndarray,
     signals += detect_range_violation(ts, values, range_min, range_max, profile, unit)
     signals += detect_spike(ts, values, profile, unit)
     signals += detect_quantisation_collapse(ts, values, profile, unit)
-    signals += detect_dithering_dead(ts, values, profile, unit)
+    signals += detect_attenuated_signal(ts, values, profile, unit)
     if is_flow:
         signals += detect_reverse_flow(ts, values, profile, unit)
     return signals

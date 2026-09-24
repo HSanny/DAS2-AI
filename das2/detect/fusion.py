@@ -72,12 +72,18 @@ TYPE_PRECEDENCE: tuple[AnomalyType, ...] = (
     AnomalyType.RANGE_VIOLATION,          # physically impossible value
     AnomalyType.REVERSE_FLOW,             # physically meaningful, and specific
     AnomalyType.QUANTISATION_COLLAPSE,    # resolution has degraded
-    AnomalyType.DITHERING_DEAD,
+    AnomalyType.ATTENUATED_SIGNAL,
     AnomalyType.SHORT_CYCLING,
     AnomalyType.RUN_STATE_INCONSISTENT,
     AnomalyType.STUCK_IN_STATE,
     AnomalyType.MASS_BALANCE_VIOLATION,
     AnomalyType.SPIKE,
+    # Above LEVEL_SHIFT on purpose. When the same step satisfies both, the
+    # instrument explanation is the more specific claim -- it says the
+    # transition was instantaneous and never came back -- and acting on it
+    # (check the calibration) is cheaper and safer than acting on the process
+    # reading (send a crew to the water).
+    AnomalyType.INSTRUMENT_OFFSET,
     AnomalyType.LEVEL_SHIFT,
     AnomalyType.DRIFT,
     AnomalyType.NOISE_BURST,

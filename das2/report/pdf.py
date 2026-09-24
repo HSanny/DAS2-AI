@@ -230,6 +230,26 @@ def _region_of(incident) -> str:
     return str(getattr(region, "value", region))
 
 
+def _type_label(name: str) -> str:
+    """
+    `'Flat Line  Q8'` -- the finding, and the standard test it is.
+
+    The citation is the entire point of adopting QARTOD's names. An operator
+    who wants to know what "Attenuated Signal" means can look up Test 10 in a
+    published manual; one who reads `DITHERING_DEAD` has only us to ask. Types
+    that are ours carry no suffix, so the page never implies a standard we do
+    not have.
+    """
+    from das2.models import QARTOD_TEST, AnomalyType
+
+    pretty = name.replace("_", " ").title()
+    try:
+        test = QARTOD_TEST.get(AnomalyType(name))
+    except ValueError:
+        return pretty
+    return f"{pretty}  Q{test[0]}" if test else pretty
+
+
 def _sites_of(incident) -> str:
     sites = sorted(incident.cluster.sites)
     if not sites:
@@ -425,12 +445,12 @@ def _breakdown(pdf: PdfPages, result) -> None:
     detection = stats.get("detection", {}).get("by_type", {})
     ax = fig.add_axes([L + 0.10, BOTTOM + 0.035, w - 0.10, h - 0.055])
     types = sorted(detection.items(), key=lambda kv: -kv[1])[:8]
-    _hbar(ax, [k.replace("_", " ").title() for k, _ in types],
+    _hbar(ax, [_type_label(k) for k, _ in types],
           [v for _, v in types],
           title="Anomalies by type",
           subtitle=f"{stats.get('detection', {}).get('anomalies', 0):,} "
                    f"across {stats.get('detection', {}).get('sensors', 0):,} "
-                   f"sensors")
+                   f"sensors · Q<n> cites the IOOS QARTOD test")
 
     ax = fig.add_axes([L + w + 0.13, BOTTOM + 0.035, w - 0.13, h - 0.055])
     _matrix(ax, result.region_matrix)

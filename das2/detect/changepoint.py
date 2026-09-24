@@ -120,6 +120,105 @@ MERGE_GAP_S = 1800.0
 MIN_POINTS = 60
 
 
+# --------------------------------------------------------------------------- #
+# Telling a recalibration from a water-level change
+# --------------------------------------------------------------------------- #
+# They are the same signal. Something stepped and stayed stepped, and nothing
+# in the series says which. Every published sensor-fault taxonomy carries
+# offset as an instrument fault -- Ni et al. (2009) ACM TOSN 5(3), Sharma et
+# al. (2010) ACM TOSN 6(3), Leigh et al. (2019) STOTEN 664 -- and until now we
+# had no way to express it, so every recalibration bump was reported as "the
+# water moved, go look".
+#
+# Two properties separate them, and BOTH are required, because either alone is
+# ambiguous:
+#
+#   1. **The transition is instantaneous.** Water has mass. A canal, a wet
+#      well or a trunk main takes time to change level, so a real move has a
+#      ramp -- samples that sit between the old level and the new one. An
+#      engineer entering a new calibration constant produces a step with no
+#      transition at all: one sample at the old value, the next at the new.
+#
+#   2. **It never comes back.** A hydraulic event recedes; a calibration is
+#      the new truth. This is the test the literature leans on, and on its own
+#      it cannot distinguish an offset from an event that simply has not
+#      finished within our window -- which is why property 1 is also required.
+#
+# Honest status: this is OUR construction. No paper validates these two tests
+# in combination, the thresholds below are engineering judgement rather than
+# anything inherited, and the verdict is emitted as SUSPECT, never FAIL. The
+# thing that would actually settle it is the maintenance work-order log: in
+# the one published deployment with full alarm attribution, Leow et al. (2017)
+# Environ. Sci.: Water Res. Technol. 3(2), 189 of 219 alarms were maintenance,
+# resolved by knowing the schedule rather than by a better algorithm. Asking
+# PUB for that log is worth more than any refinement of what follows.
+
+#: How many samples may sit between the old and new level and still count as
+#: "no transition". Two allows for one in-flight reading plus the sample the
+#: change-point detector picked as the edge.
+OFFSET_MAX_TRANSITION_SAMPLES = 2
+
+#: A sample is "between the levels" when it is at least this far from both, as
+#: a fraction of the step. Generous, so ordinary noise around either level is
+#: not mistaken for a ramp.
+OFFSET_LEVEL_TOLERANCE = 0.25
+
+#: Counts as having come back if it ever returns within this fraction of the
+#: step towards the old level.
+OFFSET_RETURN_FRACTION = 0.5
+
+#: Do not call it an offset without at least this much data after the step. A
+#: shift near the end of the window has not had the chance to recede, and
+#: "never came back" over eleven minutes is not evidence of anything.
+OFFSET_MIN_HOLD_S = 3600.0
+
+
+def _is_instrument_offset(values: np.ndarray, seconds: np.ndarray,
+                          peak: int, pre: float, magnitude: float) -> dict | None:
+    """
+    Evidence that a step is the instrument, not the water. `None` if not.
+
+    Returns the measurements behind the verdict rather than a bare bool, so
+    the report can show its working and an operator can disagree with it.
+    """
+    n = len(values)
+    step = abs(magnitude)
+    if step <= 0 or peak >= n - 1:
+        return None
+
+    held_s = float(seconds[-1] - seconds[peak])
+    if held_s < OFFSET_MIN_HOLD_S:
+        return None                      # too near the window's edge to judge
+
+    post = pre + magnitude
+    tol = OFFSET_LEVEL_TOLERANCE * step
+
+    # 1. Is there a ramp? Count samples around the edge that sit at neither
+    #    level. A window rather than a single sample because the change-point
+    #    statistic's chosen edge is approximate.
+    lo = max(0, peak - 3)
+    hi = min(n, peak + 4)
+    segment = values[lo:hi]
+    between = int(np.count_nonzero(
+        (np.abs(segment - pre) > tol) & (np.abs(segment - post) > tol)))
+    if between > OFFSET_MAX_TRANSITION_SAMPLES:
+        return None                      # it ramped: water, not a constant
+
+    # 2. Does it ever come back towards where it was?
+    after = values[peak + 1:]
+    if after.size == 0:
+        return None
+    closest = float(np.min(np.abs(after - pre)))
+    if closest <= OFFSET_RETURN_FRACTION * step:
+        return None                      # it receded: an event, not an offset
+
+    return {
+        "transition_samples": between,
+        "held_h": round(held_s / 3600.0, 2),
+        "closest_return_fraction": round(closest / step, 3),
+    }
+
+
 def _step_sigma(values: np.ndarray) -> float:
     """
     Per-sample noise, estimated from consecutive differences.
@@ -235,8 +334,14 @@ def detect_level_shift(ts: pd.Series, values: np.ndarray,
 
         end_index = min(n - 1, int(np.searchsorted(seconds,
                                                    seconds[peak] + min_sustain_s)))
+
+        # Which of the two is it: the water, or the instrument?
+        offset = _is_instrument_offset(values, seconds, peak, pre, magnitude)
+        extra = {"offset_evidence": offset} if offset else {}
+
         signals.append(Signal(
-            type=AnomalyType.LEVEL_SHIFT,
+            type=(AnomalyType.INSTRUMENT_OFFSET if offset
+                  else AnomalyType.LEVEL_SHIFT),
             start=pd.Timestamp(ts.iloc[max(0, peak - 1)]).to_pydatetime(),
             end=pd.Timestamp(ts.iloc[end_index]).to_pydatetime(),
             detector=DETECTOR,
@@ -250,6 +355,7 @@ def detect_level_shift(ts: pd.Series, values: np.ndarray,
                 "sample_noise": round(sigma, 6),
                 "level_wander": round(shift_scale, 6),
                 "relative": (round(magnitude / pre, 4) if pre else None),
+                **extra,
             },
         ))
     return signals

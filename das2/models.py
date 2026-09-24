@@ -46,20 +46,42 @@ class AnomalyType(str, Enum):
     What is wrong, not how wrong.
 
     Inherits from str so values serialise to JSON/CSV/SQL as plain strings.
+
+    Names follow IOOS QARTOD where QARTOD has a name for the thing
+    -- see `QARTOD_TEST` below. That is not cosmetic. QARTOD's
+    *Manual for Real-Time Quality Control of Water Level Data* is the
+    operational standard for exactly this estate, and a finding an operator
+    can look up in a published manual is worth more than one that exists only
+    in our source. Where we have no standard equivalent the name is ours and
+    `QARTOD_TEST` says so, so nothing invented is ever mistaken for inherited.
     """
 
     # --- L1: sensor health. Physical facts, no quantile calibration needed. ---
     FLATLINE = "FLATLINE"                          # value unchanged while still reporting
     STALE = "STALE"                                # stopped reporting altogether
     RANGE_VIOLATION = "RANGE_VIOLATION"            # outside physical plausibility
-    SPIKE = "SPIKE"                                # |dv/dt| beyond physical limit
+    SPIKE = "SPIKE"                                # excursion that returns
     REVERSE_FLOW = "REVERSE_FLOW"                  # sustained negative flow
     QUANTISATION_COLLAPSE = "QUANTISATION_COLLAPSE"  # resolution degraded
-    DITHERING_DEAD = "DITHERING_DEAD"              # oscillating in the last bit
+    #: Alive, reporting, and measuring nothing -- the reading dithers in the
+    #: last bit or two and never moves. Renamed from the invented
+    #: `DITHERING_DEAD`: this is QARTOD Test 10, and our detector (rolling
+    #: range below a ceiling) is already the `check_type="range"` form of it.
+    #: The old spelling still deserialises; see `_missing_`.
+    ATTENUATED_SIGNAL = "ATTENUATED_SIGNAL"
 
     # --- L2: behavioural ---
     RESIDUAL_OUTLIER = "RESIDUAL_OUTLIER"          # vs time-of-day baseline
-    LEVEL_SHIFT = "LEVEL_SHIFT"                    # CUSUM change point
+    LEVEL_SHIFT = "LEVEL_SHIFT"                    # the PROCESS stepped
+    #: The same shape, the other cause: the INSTRUMENT stepped.
+    #:
+    #: Split out of LEVEL_SHIFT because a post-maintenance recalibration and a
+    #: genuine water-level change are the same signal, and every published
+    #: taxonomy carries offset as a sensor fault -- Ni et al. (2009) ACM TOSN
+    #: 5(3), Sharma et al. (2010) ACM TOSN 6(3), Leigh et al. (2019) STOTEN
+    #: 664. Before this, every recalibration bump was routed to "the water
+    #: moved, go look".
+    INSTRUMENT_OFFSET = "INSTRUMENT_OFFSET"
     MASS_BALANCE_VIOLATION = "MASS_BALANCE_VIOLATION"  # dLevel/dt*A != Qin - Qout
 
     # --- L2: digital (pump/valve) ---
@@ -71,6 +93,133 @@ class AnomalyType(str, Enum):
     DRIFT = "DRIFT"                                # slow calibration drift
     NOISE_BURST = "NOISE_BURST"                    # spread grew vs baseline
 
+    @classmethod
+    def _missing_(cls, value):
+        """
+        Accept names this project used before it aligned with QARTOD.
+
+        `das2_sensor_anomaly.dominant_type` is a string column with months of
+        rows in it. Renaming the enum without this turns every historical
+        `DITHERING_DEAD` row into a ValueError the first time the profile job
+        reads it back.
+        """
+        legacy = {"DITHERING_DEAD": cls.ATTENUATED_SIGNAL}
+        return legacy.get(str(value).upper())
+
+
+#: Where each finding sits in IOOS QARTOD's numbered test list.
+#:
+#: `None` means we have no standard equivalent and the name is ours. Keeping
+#: that explicit is the point of the table: it is the difference between "this
+#: is Test 8, Flat Line, and here is the manual" and "we called it something".
+#:
+#: Two gaps worth naming, because they are absent rather than renamed:
+#:
+#:   * **Test 7, Rate of Change.** We do not have it. Our SPIKE requires the
+#:     excursion to come back, which makes it Test 6 -- a fast move that does
+#:     NOT return is caught only if it happens to be a clean step. Adding it is
+#:     easy and deliberately deferred: an unconditioned rate test on a drainage
+#:     estate fires on every storm, so it belongs after rainfall conditioning
+#:     exists, not before.
+#:   * **Tests 2, 3 and 5** (Syntax, Location, Climatology). Climatology needs
+#:     more history than a 72-hour window holds.
+QARTOD_TEST: dict["AnomalyType", tuple[int, str] | None] = {
+    AnomalyType.STALE: (1, "Gap"),
+    AnomalyType.RANGE_VIOLATION: (4, "Gross Range"),
+    AnomalyType.SPIKE: (6, "Spike"),
+    AnomalyType.FLATLINE: (8, "Flat Line"),
+    AnomalyType.MASS_BALANCE_VIOLATION: (9, "Multi-Variate"),
+    AnomalyType.RUN_STATE_INCONSISTENT: (9, "Multi-Variate"),
+    AnomalyType.ATTENUATED_SIGNAL: (10, "Attenuated Signal"),
+    # Ours. No QARTOD equivalent, and saying so is the point.
+    AnomalyType.REVERSE_FLOW: None,        # a signed gross-range special case
+    AnomalyType.QUANTISATION_COLLAPSE: None,   # measurement basis: Thornhill 2004
+    AnomalyType.RESIDUAL_OUTLIER: None,
+    AnomalyType.LEVEL_SHIFT: None,
+    AnomalyType.INSTRUMENT_OFFSET: None,
+    AnomalyType.SHORT_CYCLING: None,
+    AnomalyType.STUCK_IN_STATE: None,
+    AnomalyType.DRIFT: None,
+    AnomalyType.NOISE_BURST: None,
+}
+
+
+
+class QartodFlag(int, Enum):
+    """
+    IOOS QARTOD's disposition vocabulary, which is orthogonal to `AnomalyType`.
+
+    `AnomalyType` says WHY a reading is suspect; this says HOW BADLY, in the
+    four values every QARTOD-conformant system emits. Reporting both means an
+    operator can filter on a standard severity without us having to invent one,
+    and a future consumer of this data does not have to learn our taxonomy to
+    use it.
+    """
+
+    GOOD = 1
+    UNKNOWN = 2        # test not applicable, or not run
+    SUSPECT = 3        # failed a secondary criterion; use with caution
+    FAIL = 4           # failed the primary criterion
+    MISSING = 9
+
+
+#: Aggregation precedence, verbatim from QARTOD's own reference implementation
+#: (`ioos_qc.qartod.aggregate`): later in this tuple wins. Note it is NOT
+#: numeric order -- MISSING is 9 but loses to FAIL, because "we have no data"
+#: is a weaker statement than "the data we have is wrong".
+FLAG_PRECEDENCE: tuple[QartodFlag, ...] = (
+    QartodFlag.MISSING,
+    QartodFlag.UNKNOWN,
+    QartodFlag.GOOD,
+    QartodFlag.SUSPECT,
+    QartodFlag.FAIL,
+)
+
+_FLAG_RANK = {flag: i for i, flag in enumerate(FLAG_PRECEDENCE)}
+
+
+def aggregate_flags(flags) -> QartodFlag:
+    """The worst flag among several, by QARTOD's precedence."""
+    worst = QartodFlag.UNKNOWN
+    for flag in flags:
+        if _FLAG_RANK.get(flag, -1) > _FLAG_RANK.get(worst, -1):
+            worst = flag
+    return worst
+
+
+#: The QARTOD disposition each finding carries.
+#:
+#: FAIL is reserved for facts about the channel -- it is not reporting, it is
+#: frozen, the value is physically impossible. SUSPECT is for everything that
+#: is an inference, however strong, because QARTOD's own definition of FAIL is
+#: "failed the primary criterion" and a statistical verdict is not that.
+#:
+#: This is why a two-tier gross range matters and is the next thing to build:
+#: instrument span gives a defensible FAIL tier without PUB's commissioned
+#: alarm limits, which we have asked for and not received.
+TYPE_FLAG: dict["AnomalyType", QartodFlag] = {
+    AnomalyType.STALE: QartodFlag.MISSING,
+    AnomalyType.FLATLINE: QartodFlag.FAIL,
+    AnomalyType.RANGE_VIOLATION: QartodFlag.FAIL,
+    AnomalyType.QUANTISATION_COLLAPSE: QartodFlag.FAIL,
+    AnomalyType.ATTENUATED_SIGNAL: QartodFlag.FAIL,
+    AnomalyType.RUN_STATE_INCONSISTENT: QartodFlag.FAIL,
+    AnomalyType.MASS_BALANCE_VIOLATION: QartodFlag.FAIL,
+}
+
+
+def flag_for(anomaly_type: "AnomalyType") -> QartodFlag:
+    """The QARTOD flag for a finding. Anything inferred is SUSPECT."""
+    return TYPE_FLAG.get(anomaly_type, QartodFlag.SUSPECT)
+
+
+def qartod_label(anomaly_type: "AnomalyType") -> str:
+    """`'FLATLINE (QARTOD 8 Flat Line)'`, or just the name when it is ours."""
+    test = QARTOD_TEST.get(anomaly_type)
+    if not test:
+        return anomaly_type.value
+    return f"{anomaly_type.value} (QARTOD {test[0]} {test[1]})"
+
 
 #: Types that mean the INSTRUMENT is faulty -- these justify dispatching someone.
 SENSOR_HEALTH_TYPES: frozenset[AnomalyType] = frozenset({
@@ -78,7 +227,7 @@ SENSOR_HEALTH_TYPES: frozenset[AnomalyType] = frozenset({
     AnomalyType.STALE,
     AnomalyType.RANGE_VIOLATION,
     AnomalyType.QUANTISATION_COLLAPSE,
-    AnomalyType.DITHERING_DEAD,
+    AnomalyType.ATTENUATED_SIGNAL,
     AnomalyType.NOISE_BURST,
 })
 
@@ -96,6 +245,15 @@ PROCESS_TYPES: frozenset[AnomalyType] = frozenset({
 MAINTENANCE_TYPES: frozenset[AnomalyType] = frozenset({
     AnomalyType.DRIFT,
     AnomalyType.SHORT_CYCLING,
+    # Maintenance, not dispatch -- and deliberately NOT in SENSOR_HEALTH_TYPES.
+    #
+    # The response to an instrument offset is "check the calibration", the same
+    # as DRIFT, not "send a crew to look at the water". Keeping it out of the
+    # sensor-health set also keeps it out of the TELEMETRY_OUTAGE rule, which
+    # fires on a block of health faults across sites: a maintenance sweep
+    # recalibrating twenty instruments in an afternoon would otherwise be
+    # reported as the comms link having failed.
+    AnomalyType.INSTRUMENT_OFFSET,
 })
 
 #: Faults where the instrument is definitively broken, and no amount of
@@ -113,7 +271,7 @@ DEFINITIVE_INSTRUMENT_FAULTS: frozenset[AnomalyType] = frozenset({
     AnomalyType.FLATLINE,
     AnomalyType.STALE,
     AnomalyType.QUANTISATION_COLLAPSE,
-    AnomalyType.DITHERING_DEAD,
+    AnomalyType.ATTENUATED_SIGNAL,
 })
 
 #: Findings strong enough to alert even on an equipment class that is still

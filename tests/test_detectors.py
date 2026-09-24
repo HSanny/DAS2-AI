@@ -36,7 +36,7 @@ from das2.detect.digital import (  # noqa: E402
     detect_stuck_in_state,
 )
 from das2.detect.health import (  # noqa: E402
-    detect_dithering_dead,
+    detect_attenuated_signal,
     detect_quantisation_collapse,
 )
 from das2.detect.massbalance import BalanceGroup, evaluate_group, find_groups  # noqa: E402
@@ -121,14 +121,14 @@ def main():
           len(detect_quantisation_collapse(ts, half, spoiled, "bar")) >= 1)
 
     # ---------------------------------------------------------------- #
-    print("\nDITHERING_DEAD — alive, reporting, measuring nothing")
+    print("\nATTENUATED_SIGNAL (QARTOD 10) — alive, reporting, measuring nothing")
     swinging = np.round(50 + 8 * np.sin(np.arange(n) / 120) + rng.normal(0, 0.5, n), 1)
     check("a healthy swinging sensor is silent",
-          not detect_dithering_dead(ts, swinging, profile_of(ts, swinging), "%"))
+          not detect_attenuated_signal(ts, swinging, profile_of(ts, swinging), "%"))
 
     stuck = swinging.copy()
     stuck[800:1400] = 50.0 + rng.integers(0, 2, 600) * 0.1
-    signals = detect_dithering_dead(ts, stuck, profile_of(ts, stuck), "%")
+    signals = detect_attenuated_signal(ts, stuck, profile_of(ts, stuck), "%")
     check("a sensor wandering by one LSB for 20 h is found", len(signals) == 1,
           f"({len(signals)})")
     check("its reported range is one resolution step",
@@ -137,7 +137,7 @@ def main():
     frozen = swinging.copy()
     frozen[800:1400] = 50.0
     check("an exactly frozen sensor is NOT reported here",
-          not detect_dithering_dead(ts, frozen, profile_of(ts, frozen), "%"),
+          not detect_attenuated_signal(ts, frozen, profile_of(ts, frozen), "%"),
           "(that is FLATLINE's; the two must stay disjoint or it is alerted twice)")
 
     # ---------------------------------------------------------------- #
