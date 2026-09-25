@@ -482,6 +482,8 @@ def _anatomy_block(fig, incident, top: float, *, budget: float = 0.42) -> float:
         when = (f"{incident.cluster.start:%d %b %H:%M}"
                 f" → {incident.cluster.end:%d %b %H:%M}   ·   ")
     context = [f"{len(incident.cluster.members)} sensors",
+               *([f"{incident.cluster.episodes} separate bursts"]
+                 if getattr(incident.cluster, "episodes", 1) > 1 else []),
                f"{len(incident.cluster.sites)} sites",
                f"severity {incident.severity:.0f}"]
     if incident.rainfall_mm is not None:

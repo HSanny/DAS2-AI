@@ -22,7 +22,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from das2.models import AnomalyType, PhysicalSeverity, SensorAnomaly, SensorMeta  # noqa: E402
+from das2.models import AnomalyType, Cluster, PhysicalSeverity, SensorAnomaly, SensorMeta  # noqa: E402
 from das2.spatial.cluster import (  # noqa: E402
     ClusterParams,
     cluster_anomalies,
@@ -336,6 +336,58 @@ def main():
     check("all unplaced", cluster_anomalies([
         anomaly("q1", "BedokPS", "Pressure", placed=False),
         anomaly("q2", "BedokPS", "Flowrate", placed=False)]) == [])
+
+    # --- one event, reported once ------------------------------------------ #
+    # Clustering runs over ANOMALIES, and the client's estate averages 2.8 per
+    # abnormal sensor across a 72-hour window. So one site contributes several
+    # points at several times, the time gate splits them into separate
+    # clusters, and on the first production run that produced NINE P1 regional
+    # events where there were about four -- five of them Bedok and Tampines,
+    # overlapping sites, 23 then 15 then 8 sensors, each announced as its own
+    # emergency.
+    print("\nthe same places going abnormal twice is one event")
+    from das2.spatial.cluster import merge_episodes
+
+    def episode(sites, hours_in, n=3):
+        members = [anomaly(f"{s}-{hours_in}-{i}", s, "Level",
+                           start_min=hours_in * 60, dur_min=120)
+                   for s in sites for i in range(n)]
+        return Cluster(members=members, region="East", centroid_lat=1.34,
+                       centroid_lon=103.93, radius_m=2000.0)
+
+    wide = ["BedokPS", "BedokPond4", "TampinesPS"]
+    merged = merge_episodes([episode(wide, 0), episode(wide, 2),
+                             episode(wide[:2], 4)])
+    check("overlapping bursts at the same sites become one incident",
+          len(merged) == 1, f"3 clusters -> {len(merged)}")
+    check("and it says how many bursts it was",
+          merged[0].episodes == 3,
+          "hiding that inside one sensor count would misreport a storm that "
+          "came back twice as a single continuous event")
+    check("no member is counted twice",
+          len(merged[0].members) == len({m.sensor.sensor_key
+                                         for m in merged[0].members}))
+    check("the window spans all of them",
+          (merged[0].end - merged[0].start) >= timedelta(hours=4))
+
+    apart = merge_episodes([episode(wide, 0), episode(wide, 72)])
+    check("bursts days apart stay separate", len(apart) == 2,
+          "one trip on Monday and one on Thursday is two trips")
+
+    other = Cluster(members=[anomaly("k1", "Kranji1PS", "Level"),
+                             anomaly("k2", "Kranji1PS", "Flowrate")],
+                    region="North", centroid_lat=1.41, centroid_lon=103.72)
+    kept = merge_episodes([episode(wide, 0), other])
+    check("different regions never merge", len(kept) == 2)
+
+    far = merge_episodes([episode(["BedokPS", "BedokPond4"], 0),
+                          episode(["TampinesPS"], 1)])
+    check("clusters that share no site stay separate", len(far) == 2,
+          "site overlap is the test, not proximity in time")
+
+    check("a single cluster is returned untouched",
+          len(merge_episodes([episode(wide, 0)])) == 1)
+    check("and an empty run does not explode", merge_episodes([]) == [])
 
     print("\nAll cluster tests passed.")
 

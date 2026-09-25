@@ -47,6 +47,7 @@ from das2.profile.build import TimeOfDayBaseline
 from das2.spatial.correlation import cluster_correlation, correlation_summary
 from das2.spatial.cluster import (
     cluster_by_asset,
+    merge_episodes,
     ClusterParams,
     cluster_anomalies,
     cluster_summary,
@@ -358,7 +359,11 @@ def run(config: Config, *, now: datetime | None = None,
     consumed_keys = {a.sensor.sensor_key for a in consumed}
     spatial = [a for a in pageable if a.sensor.sensor_key not in consumed_keys]
 
-    result.clusters = cluster_anomalies(spatial, params) + asset_clusters
+    # Merge the episodes BEFORE the asset clusters are added, never after: two
+    # machines at one station share a site set exactly, and merging them would
+    # turn two callouts into one.
+    spatial_clusters = merge_episodes(cluster_anomalies(spatial, params))
+    result.clusters = spatial_clusters + asset_clusters
     result.loose = unclustered(spatial, result.clusters)
     result.stats["clustering"] = cluster_summary(result.clusters, result.loose)
     log.info("clustering: %s", result.stats["clustering"])
@@ -424,6 +429,13 @@ def run(config: Config, *, now: datetime | None = None,
 
         result.rain_context = rain_context
         result.stats["rain_context"] = summarise(rain_context)
+        if provider.rejected_gauges:
+            # A gauge reporting impossible totals is not just noise to be
+            # filtered: every cluster near it loses its rain evidence and is
+            # judged on fewer gauges, or none. That belongs in the report.
+            result.stats["rain_context"]["rejected_gauges"] = \
+                dict(sorted(provider.rejected_gauges.items(),
+                            key=lambda kv: -kv[1])[:10])
         log.info("rain context: %s", result.stats["rain_context"])
 
     candidates = build_incidents(result.clusters, now=now, loose=result.loose,

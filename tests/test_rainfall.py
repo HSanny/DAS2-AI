@@ -53,7 +53,12 @@ def check(label: str, condition: bool, detail: str = "") -> None:
 
 def total(values, dt: int = 120):
     """Millimetres this provider reads out of one gauge's series."""
+    # `__new__` on purpose: `_gauge_total` needs only a readings frame, and
+    # building a full provider would need an inventory too. The cost is that
+    # this helper has to maintain the object's invariants by hand -- every
+    # attribute `_gauge_total` touches has to be set here.
     provider = InternalRainGaugeProvider.__new__(InternalRainGaugeProvider)
+    provider.rejected_gauges = {}
     provider.readings = pd.DataFrame({
         "sensor_key": ["g"] * len(values),
         "ts": [T0 + timedelta(seconds=i * dt) for i in range(len(values))],

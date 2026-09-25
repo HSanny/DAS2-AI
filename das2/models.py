@@ -592,6 +592,11 @@ class Cluster:
     centroid_lat: float | None = None
     centroid_lon: float | None = None
     radius_m: float = 0.0
+    #: How many separate bursts of activity were merged into this one event.
+    #: 1 is the ordinary case. Higher means the same places went abnormal
+    #: several times across the window, which is worth saying out loud rather
+    #: than hiding inside a single sensor count.
+    episodes: int = 1
 
     @property
     def start(self) -> datetime | None:

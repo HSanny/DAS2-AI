@@ -446,6 +446,106 @@ def cluster_anomalies(anomalies: list[SensorAnomaly],
     return clusters
 
 
+#: How much two clusters' SITE sets must overlap before they are read as the
+#: same event recurring, rather than two events.
+#:
+#: Sites and not sensors, deliberately. Across a 72-hour window the same place
+#: goes abnormal on different instruments at different times, so the sensor
+#: sets of two episodes at Bedok can overlap hardly at all while being, to
+#: anyone who has to drive there, the same problem.
+EPISODE_SITE_OVERLAP = 0.5
+
+#: ...and how far apart in time they may sit and still be one event. Six hours
+#: keeps a storm and its recession together, and keeps Monday's incident
+#: separate from Wednesday's.
+EPISODE_GAP_HOURS = 6.0
+
+
+def _site_jaccard(a: Cluster, b: Cluster) -> float:
+    left, right = a.sites, b.sites
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _hours_apart(a: Cluster, b: Cluster) -> float:
+    """0.0 when the windows overlap, else the gap between them in hours."""
+    if not (a.start and a.end and b.start and b.end):
+        return 0.0
+    if a.start <= b.end and b.start <= a.end:
+        return 0.0
+    gap = (b.start - a.end) if b.start > a.end else (a.start - b.end)
+    return gap.total_seconds() / 3600.0
+
+
+def merge_episodes(clusters: list[Cluster], *,
+                   site_overlap: float = EPISODE_SITE_OVERLAP,
+                   gap_hours: float = EPISODE_GAP_HOURS) -> list[Cluster]:
+    """
+    One event that recurs at the same places is one incident, not five.
+
+    Clustering runs over ANOMALIES, not sensors, and this estate averages 2.8
+    anomalies per abnormal sensor across a 72-hour window. So one site
+    contributes several points at several times, the time-overlap gate splits
+    them into separate clusters, and nothing downstream ever asks whether those
+    clusters are the same thing. `reconcile` gives an incident identity across
+    RUNS; nothing gave it identity within one.
+
+    On the client's first production run that produced nine P1 regional events
+    where there were about four. Five of them were Bedok and Tampines --
+    overlapping sites, overlapping membership, 23 then 15 then 8 sensors --
+    reported as five separate emergencies in the same region. An operator
+    reading that does not see one storm; they see a system that cannot count.
+
+    Merging is on sites and time, and it is deliberately conservative: two
+    machines at one station stay two callouts, because asset clusters are not
+    passed through here at all.
+    """
+    if len(clusters) < 2:
+        return list(clusters)
+
+    remaining = list(clusters)
+    merged: list[Cluster] = []
+    while remaining:
+        head = remaining.pop(0)
+        group = [head]
+        changed = True
+        # Repeated passes: A may not reach C directly, but if it reaches B and
+        # B reaches C then all three are the same event.
+        while changed:
+            changed = False
+            for other in list(remaining):
+                if any(str(other.region) == str(c.region)
+                       and _site_jaccard(other, c) >= site_overlap
+                       and _hours_apart(other, c) <= gap_hours
+                       for c in group):
+                    group.append(other)
+                    remaining.remove(other)
+                    changed = True
+        merged.append(_union(group) if len(group) > 1 else head)
+    return merged
+
+
+def _union(group: list[Cluster]) -> Cluster:
+    """One cluster from several, keeping every member exactly once."""
+    seen: dict[tuple, SensorAnomaly] = {}
+    for cluster in group:
+        for member in cluster.members:
+            seen.setdefault((member.sensor.sensor_key, member.start), member)
+    members = list(seen.values())
+
+    lats = [m.sensor.latitude for m in members if m.sensor.latitude is not None]
+    lons = [m.sensor.longitude for m in members if m.sensor.longitude is not None]
+    return Cluster(
+        members=members,
+        region=group[0].region,
+        centroid_lat=sum(lats) / len(lats) if lats else None,
+        centroid_lon=sum(lons) / len(lons) if lons else None,
+        radius_m=max(c.radius_m for c in group),
+        episodes=len(group),
+    )
+
+
 def cluster_by_asset(
         anomalies: list[SensorAnomaly]) -> tuple[list[Cluster], list[SensorAnomaly]]:
     """

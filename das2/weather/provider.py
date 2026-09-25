@@ -220,6 +220,10 @@ class InternalRainGaugeProvider:
         self.gauges = gauges.reset_index(drop=True)
         keys = set(gauges["sensor_key"].astype(str))
         self.readings = readings[readings["sensor_key"].astype(str).isin(keys)]
+        #: {sensor_key: the impossible total it reported}. A gauge excluded
+        #: from rain context is a data-quality finding in its own right, so it
+        #: is carried into the run stats rather than only shouted at the log.
+        self.rejected_gauges: dict[str, float] = {}
 
     @property
     def available(self) -> bool:
@@ -292,9 +296,18 @@ class InternalRainGaugeProvider:
             return None
 
         if total > MAX_PLAUSIBLE_WINDOW_MM:
-            log.warning(
-                "gauge %s totals %.0f mm over the window, which is not "
-                "weather -- reporting rainfall as unknown", key, total)
+            # Said ONCE per gauge per run, and recorded. This is evaluated for
+            # every cluster that has the gauge in range, so on the client's
+            # first production run one broken gauge filled the log with
+            # twenty-two identical warnings -- which reads as a storm of
+            # problems and buries the single fact worth acting on, which is
+            # that gauge 420288:16825961 needs looking at.
+            if key not in self.rejected_gauges:
+                self.rejected_gauges[key] = round(total, 1)
+                log.warning(
+                    "gauge %s totals %.0f mm over the window, which is not "
+                    "weather -- excluded from rain context for this run",
+                    key, total)
             return None
         return max(0.0, total)
 
