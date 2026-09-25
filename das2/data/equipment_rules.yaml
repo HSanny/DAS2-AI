@@ -61,6 +61,31 @@ rules:
       - "alarm[\\s_-]?(setpoint|limit|threshold)"
       - "(high|low|hi|lo)[\\s_-]?(high|low)?[\\s_-]?alarm[\\s_-]?setpoint"
       - "\\bthreshold\\b"
+      # Abbreviated alarm configuration, which is what this SCADA writes. The
+      # spelled-out patterns above match "...Current-low-alarm-setpoint" and
+      # miss "...-HA" entirely. These 337 points are the reservoir stock
+      # thresholds -- `UpperSeletarPS-SEASON1-STOCK-HA`, high alarm, low alarm
+      # and tolerance, per season -- and they were landing on Level through
+      # its `\bstock\b` pattern, so a configured threshold was being analysed
+      # as if it were a reservoir level. A threshold sits still by definition,
+      # which makes it a permanent FLATLINE.
+      #
+      # `-SP` is deliberately NOT here, and that is the interesting part. It
+      # looks like the obvious win -- 1,824 points end in it -- but it does
+      # not mean "setpoint" consistently across this estate:
+      #
+      #   MRRS_ALEX VALVE (Open)-SP     a live valve state
+      #   MRRS_ALEX RTU FAILED-SP       a live alarm bit
+      #   MacRitchie-LT-Pump1-Status-SP that pump's ONLY status point
+      #
+      # At the MRRS sites nearly every point carries the suffix, so there it is
+      # part of the naming convention rather than a description of the point.
+      # Treating it as configuration would have moved 877 digital points out of
+      # the digital detector stack and taken at least one pump's run status
+      # with it, which the asset layer needs. It stays unmatched until PUB says
+      # what the suffix means at each site -- see CITATIONS.md's closing
+      # section for the standing data requests.
+      - "[\\s_-](ha|la|tol)\\s*$"
 
   - equipment: Simulation
     patterns:
@@ -82,6 +107,7 @@ rules:
       - "\\bhr[\\s_-]?runtime\\b"
       - "(operating|running)[\\s_-]?hours"
       - "\\bhours[\\s_-]?run\\b"
+      - "\\bhrs\\b"          # 131 pump hour counters named `<site>-P1-HRS-C`
       - "\\btotaliser\\b"
       - "\\btotalizer\\b"
 
@@ -247,6 +273,7 @@ rules:
     patterns:
       - "turbidit"
       - "\\bntu\\b"
+      - "\\bturb\\b"
 
   - equipment: pH
     signal_types: [Analog]
@@ -259,6 +286,76 @@ rules:
       - "chlorine"
       - "\\bcl2\\b"
       - "residual"
+
+  # --- the waterway sonde suite -------------------------------------------
+  # A 28-station network on the rivers, lakes and basins -- Bedok, Geylang
+  # River, Hougang Ave 7, Jurong Lake, Kallang Basin, Kallang River and the
+  # rest -- each reporting the same parameters from a multiparameter sonde
+  # plus a small met package. Every one of these was landing in UNCLASSIFIED
+  # and being dropped before detection, which is ~280 points and the only
+  # direct measurement of water QUALITY, as opposed to water movement, that
+  # this estate has.
+  #
+  # `Chl` is chlorophyll here, not chloride or chlorine. It sits beside
+  # BGAlgae on the same sonde, and the inventory contains no chlorine
+  # measurement at all -- only two digital leak alarms. `\bchl\b` also cannot
+  # reach "chlorine", because the boundary after the l fails on the o.
+  - equipment: Chlorophyll
+    signal_types: [Analog]
+    patterns:
+      - "chlorophyll"
+      - "\\bchl[\\s_-]?a\\b"
+      - "\\bchl\\b"
+
+  - equipment: BlueGreenAlgae
+    signal_types: [Analog]
+    patterns:
+      - "blue[\\s_-]?green[\\s_-]?algae"
+      - "bg[\\s_-]?algae"
+      - "\\bbga\\b"
+      - "phycocyanin"
+
+  - equipment: Ammonia
+    signal_types: [Analog]
+    patterns:
+      - "ammoni"                 # ammonia, ammonium, ammoniacal
+      - "\\bnh3\\b"
+      - "\\bnh4\\b"
+      - "\\bnh4[\\s_-]?n\\b"
+
+  - equipment: Nitrate
+    signal_types: [Analog]
+    patterns:
+      - "nitrate"
+      - "\\bno3\\b"
+      - "\\bno3[\\s_-]?n\\b"
+
+  - equipment: Salinity
+    signal_types: [Analog]
+    patterns:
+      - "salinity"
+      - "\\bpsu\\b"
+
+  - equipment: TotalDissolvedSolids
+    signal_types: [Analog]
+    patterns:
+      - "total[\\s_-]?dissolved[\\s_-]?solids"
+      - "\\btds\\b"
+
+  # The sonde's own submersion depth. Deliberately NOT folded into Level:
+  # Level is alertable and carries the canal and reservoir fleet, and a
+  # buoy's depth channel has nothing to do with either. Mixing them would
+  # put a sonde into the region-level water statistics.
+  - equipment: Depth
+    signal_types: [Analog]
+    patterns:
+      - "\\bdepth\\b"
+
+  - equipment: Humidity
+    signal_types: [Analog]
+    patterns:
+      - "humidity"
+      - "\\brh\\b"
 
   - equipment: Temperature
     patterns:
@@ -337,6 +434,26 @@ classes:
   Turbidity:         {kind: measurement, unit: NTU,    alertable: false, range: [0, 1000]}
   pH:                {kind: measurement, unit: "",     alertable: false, range: [0, 14]}
   Chlorine:          {kind: measurement, unit: "mg/L", alertable: false, range: [0, 10]}
+
+  # The waterway sonde suite. All start non-alerting, like every other newly
+  # classified class, and these have a specific reason to stay there for at
+  # least one run: in the inventory snapshot every one of these channels reads
+  # exactly 5000 while the temperature beside it reads 25, so 5000 is a
+  # no-data sentinel rather than a measurement. Alertable, that would be a
+  # RANGE_VIOLATION on every sonde in the network, every run.
+  #
+  # Ranges are the instruments' own plausible spans, not commissioned limits.
+  # They are wide on purpose -- their job is to catch a sentinel or a wiring
+  # fault, not to judge water quality, which is PUB's call and not this
+  # system's.
+  Chlorophyll:       {kind: measurement, unit: "ug/L", alertable: false, range: [0, 500]}
+  BlueGreenAlgae:    {kind: measurement, unit: "ug/L", alertable: false, range: [0, 500]}
+  Ammonia:           {kind: measurement, unit: "mg/L", alertable: false, range: [0, 100]}
+  Nitrate:           {kind: measurement, unit: "mg/L", alertable: false, range: [0, 100]}
+  Salinity:          {kind: measurement, unit: PSU,    alertable: false, range: [0, 50]}
+  TotalDissolvedSolids: {kind: measurement, unit: "mg/L", alertable: false, range: [0, 50000]}
+  Depth:             {kind: measurement, unit: m,      alertable: false, range: [0, 100]}
+  Humidity:          {kind: measurement, unit: "%",    alertable: false, range: [0, 100]}
 
   # Counters only ever climb. A flat counter means the plant is idle, which is
   # normal; a drop is a rollover or reset, not a fault. Running flatline or

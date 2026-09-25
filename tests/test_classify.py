@@ -247,6 +247,77 @@ def main():
           not [d for d in canal if d.upper().startswith(("CWS", "EWS"))
                and cls_of(d) == UNCLASSIFIED])
 
+    # --- the waterway sonde suite ------------------------------------------ #
+    # A 28-station network on the rivers, lakes and basins, all of it landing
+    # in UNCLASSIFIED and being dropped before detection -- the only direct
+    # measurement of water QUALITY, as opposed to water movement, in the whole
+    # estate.
+    print("\nwater quality: the sonde suite is classified")
+    for desc, expected in (
+            ("Bedok-Turb", "Turbidity"),
+            ("Kallang Basin-Chl", "Chlorophyll"),
+            ("Jurong Lake-BGAlgae", "BlueGreenAlgae"),
+            ("Geylang River-NH3", "Ammonia"),
+            ("Hougang Ave 7-NH4-N", "Ammonia"),
+            ("Kallang River-NO3", "Nitrate"),
+            ("Bedok-Salinity", "Salinity"),
+            ("Bedok-TDS", "TotalDissolvedSolids"),
+            ("Bedok-Depth", "Depth"),
+            ("Bedok-RH", "Humidity"),
+    ):
+        got = clf.classify(desc, 1).equipment
+        check(f"{desc} is {expected}", got == expected, f"got {got}")
+
+    check("chlorophyll does not swallow chlorine",
+          clf.classify("Pandan2PS-Chlorine-Residual", 1).equipment == "Chlorine",
+          "`Chl` and `chlorine` are different measurements, and the boundary "
+          "after the l is what keeps them apart")
+    check("every new water-quality class starts non-alerting",
+          not any(clf.classify(f"X-{p}", 1).meta.alertable for p in
+                  ("Turb", "Chl", "BGAlgae", "NH3", "NO3", "Salinity", "TDS",
+                   "Depth", "RH")),
+          "in the inventory snapshot every one of these reads exactly 5000 "
+          "while the temperature beside it reads 25 -- a no-data sentinel, "
+          "which alertable would make a RANGE_VIOLATION on every sonde")
+    check("sonde depth is not filed with the canal and reservoir levels",
+          clf.classify("Bedok-Depth", 1).equipment != "Level",
+          "Level is alertable and carries the water fleet; a buoy's "
+          "submersion depth belongs in neither")
+
+    print("\nalarm thresholds are configuration, not measurements")
+    for desc in ("UpperSeletarPS-SEASON1-STOCK-HA",
+                 "Murai-SEASON3-STOCK-LA",
+                 "PandanTG-SEASON1-STOCK-TOL"):
+        got = clf.classify(desc, 1).equipment
+        check(f"{desc.split('-', 1)[1]} is a Setpoint", got == "Setpoint",
+              f"got {got} -- `\\bstock\\b` was filing these as reservoir "
+              f"levels, and a threshold that never moves is a permanent "
+              f"FLATLINE")
+
+    # The negative case, and the one most likely to be "fixed" by someone
+    # later. `-SP` looks like the obvious next win: 1,824 points carry it.
+    # It is not safe, because it does not mean setpoint consistently --
+    # at the MRRS sites nearly every point ends in it, including live valve
+    # states and alarm bits, and `MacRitchie-LT-Pump1-Status-SP` is that
+    # pump's ONLY status point.
+    print("\nand -SP is deliberately NOT treated as one")
+    for desc in ("MRRS_ALEX VALVE (Open)-SP",
+                 "MRRS_ALEX RTU FAILED-SP",
+                 "MacRitchie-LT-Pump1-Status-SP"):
+        got = clf.classify(desc, 3).equipment
+        check(f"{desc} stays a live point", got != "Setpoint", f"got {got}")
+    check("no run-state point is reachable by the Setpoint rule",
+          clf.classify("MacRitchie-LT-Pump1-Status-SP", 3).equipment
+          != "Setpoint",
+          "the asset layer pairs a machine on its run state; taking it into "
+          "config would silently remove the machine from detection")
+
+    print("\nrun-hour counters are counters")
+    check("HRS-C is Runtime",
+          clf.classify("BedokPS-P1-HRS-C", 1).equipment == "Runtime",
+          "131 pump hour counters; a counter only ever climbs, so the "
+          "ordinary detectors are actively wrong on it")
+
     print("\nAll classifier tests passed.")
 
 
