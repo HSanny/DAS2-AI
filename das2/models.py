@@ -635,11 +635,26 @@ class IncidentClass(str, Enum):
     # does. Separate from FANOUT, which is one panel, because the remedy is
     # different: a link or an RTU group, not a fuse.
     TELEMETRY_OUTAGE = "TELEMETRY_OUTAGE"
-    REGIONAL_EVENT = "REGIONAL_EVENT"            # several sites, several types -> escalate
     SENSOR_FAULT = "SENSOR_FAULT"                # instrument is broken -> dispatch
     DRIFT_MAINTENANCE = "DRIFT_MAINTENANCE"      # schedule calibration
-    PROCESS_EVENT = "PROCESS_EVENT"              # the water moved -> monitor
-    WEATHER_DRIVEN = "WEATHER_DRIVEN"            # rain explains it -> do not dispatch
+    # Something happened, and it was not the instrument. The water moved, or it
+    # rained, or an operator opened a valve. Recorded with its evidence so a
+    # reader can see what was set aside and disagree -- and never paged.
+    #
+    # This one class replaces three earlier verdicts -- REGIONAL_EVENT,
+    # PROCESS_EVENT and WEATHER_DRIVEN -- which the client ruled out of scope:
+    #
+    #     "we dont want explicit potential like operational events being
+    #      alerted as anomaly, or some extreme weather condition that result
+    #      in abnormal data intake to be alerted as anomaly ... but not the
+    #      operational event, or weather condition, or close/on valve things"
+    #
+    # They were kept as verdicts rather than deleted outright because they are
+    # what keeps a storm response off the dispatch list: the rain and the
+    # neighbour agreement are still measured, and reaching this class is how a
+    # cluster is excused. Deleting the tests would not stop the weather being
+    # reported -- it would stop it being recognised.
+    OUT_OF_SCOPE = "OUT_OF_SCOPE"
     # Two instruments cannot both be right. Physically conclusive, so it is a
     # dispatch rather than a WATCH -- what is unknown is which one to believe,
     # not whether something is wrong.
@@ -670,8 +685,6 @@ class AckState(str, Enum):
 RECOMMENDATION: dict[IncidentClass, str] = {
     IncidentClass.TELEMETRY_FANOUT:
         "Telemetry fan-out from shared equipment - no site visit needed.",
-    IncidentClass.REGIONAL_EVENT:
-        "Multiple sites affected together - investigate the area, not one sensor.",
     IncidentClass.SENSOR_FAULT:
         "Instrument fault with no corroboration from neighbours - dispatch a technician.",
     IncidentClass.TELEMETRY_OUTAGE:
@@ -679,10 +692,9 @@ RECOMMENDATION: dict[IncidentClass, str] = {
         "the comms path or the historian feed. Do NOT dispatch per sensor.",
     IncidentClass.DRIFT_MAINTENANCE:
         "Gradual drift - schedule recalibration, not urgent.",
-    IncidentClass.PROCESS_EVENT:
-        "Neighbouring sensors moved together - this looks like the process, not a fault.",
-    IncidentClass.WEATHER_DRIVEN:
-        "Rainfall nearby explains this - monitor only, do not dispatch.",
+    IncidentClass.OUT_OF_SCOPE:
+        "Not an instrument problem - the process, the weather or an operator "
+        "moved this. Shown for context only; nobody is paged.",
     IncidentClass.WATCH:
         "Evidence is weak or conflicting - re-evaluate on the next run.",
     IncidentClass.INSTRUMENT_CONFLICT:
@@ -690,6 +702,49 @@ RECOMMENDATION: dict[IncidentClass, str] = {
     IncidentClass.ASSET_FAILURE:
         "The machine, not the instrument - mechanical callout. Bring this "
         "unit's maintenance history.",
+}
+
+
+#: The classes that reach a person. An allow-list, not a deny-list.
+#:
+#: The client set this boundary in one sentence:
+#:
+#:     "we want to anticipate the potential unnormal, or abnormal behavior of
+#:      the SENSOR based on the stats, but not the operational event, or
+#:      weather condition, or close/on valve things like that"
+#:
+#: So the paging line is sensor health, and nothing else. All four classes
+#: below are statements about an instrument or about the path its readings
+#: travel on -- something a technician with a calibrator or a comms engineer
+#: can act on. Everything else the run finds is still detected, still scored
+#: and still in the interactive report; it just does not wake anybody.
+#:
+#: Written as an allow-list on purpose. The previous form was a deny-list --
+#: "everything except fan-out and WATCH" -- which meant every class added
+#: later silently started paging on the day it was written. ASSET_FAILURE did
+#: exactly that. A new class now has to be put on this line deliberately.
+PAGEABLE_CLASSES: frozenset[IncidentClass] = frozenset({
+    IncidentClass.SENSOR_FAULT,
+    IncidentClass.DRIFT_MAINTENANCE,
+    IncidentClass.INSTRUMENT_CONFLICT,
+    IncidentClass.TELEMETRY_OUTAGE,
+})
+
+#: Why a class is not on the paging line, for the run record.
+#:
+#: Held incidents are not thrown away: the selection layer records a reason for
+#: every one, and an operator asking "why did nobody tell me about the East?"
+#: gets it from the run record rather than from reading the source. These are
+#: those reasons, kept beside the allow-list so the two cannot disagree.
+NOT_PAGED_BECAUSE: dict[IncidentClass, str] = {
+    IncidentClass.TELEMETRY_FANOUT:
+        "telemetry fan-out, not a site visit",
+    IncidentClass.OUT_OF_SCOPE:
+        "the process, the weather or an operator - not the instrument",
+    IncidentClass.ASSET_FAILURE:
+        "plant, not instrument - on the report, not the paging line",
+    IncidentClass.WATCH:
+        "evidence too weak or conflicting",
 }
 
 
@@ -732,26 +787,12 @@ class Incident:
 
     @property
     def should_alert(self) -> bool:
-        """
-        Fan-out is noise by construction, and an unacknowledged WATCH is not
-        worth anyone's attention until the evidence firms up.
-        """
-        if self.incident_class is IncidentClass.TELEMETRY_FANOUT:
-            return False
-        if self.incident_class is IncidentClass.WATCH:
-            return False
-        return True
+        """Does this reach a person? Only if it is about an instrument."""
+        return self.incident_class in PAGEABLE_CLASSES
 
     @property
     def should_dispatch(self) -> bool:
-        return self.incident_class in (
-            IncidentClass.SENSOR_FAULT,
-            IncidentClass.REGIONAL_EVENT,
-            # A machine that has stopped delivering is the one dispatch here
-            # that does not need a second opinion: two independent channels
-            # already agree, so there is nothing a further run will add.
-            IncidentClass.ASSET_FAILURE,
-        )
+        return self.incident_class is IncidentClass.SENSOR_FAULT
 
     @property
     def sensor_keys(self) -> set[str]:

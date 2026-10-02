@@ -446,8 +446,8 @@ def run(config: Config, *, now: datetime | None = None,
     signature_matches: list = []
 
     # Attach the rain PROVENANCE, not just the number. A millimetre figure on
-    # its own cannot be checked: a reader disagreeing with a WEATHER_DRIVEN
-    # verdict needs to see how many gauges, how far away, over which window,
+    # its own cannot be checked: a reader disagreeing with rain being blamed
+    # needs to see how many gauges, how far away, over which window,
     # and whether a lag was measurable at all.
     for candidate in candidates:
         key = (",".join(sorted(candidate.cluster.sensor_keys))

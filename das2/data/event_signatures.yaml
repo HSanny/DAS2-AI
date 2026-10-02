@@ -17,7 +17,7 @@
 # WHAT A SIGNATURE CANNOT DO
 #
 # It cannot change what the system decides. The incident CLASS —
-# REGIONAL_EVENT, SENSOR_FAULT, TELEMETRY_FANOUT — is what drives priority and
+# SENSOR_FAULT, TELEMETRY_OUTAGE, OUT_OF_SCOPE — is what drives priority and
 # dispatch, and it is computed from evidence the system can actually measure:
 # how many sites, how many parameters, whether the neighbours moved, what the
 # rain did. A signature sits beside that verdict and describes it. It never

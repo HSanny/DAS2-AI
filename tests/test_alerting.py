@@ -141,13 +141,13 @@ class FakeResult:
 
 def main():
     print("the message leads with the decision")
-    incident = make_incident(IncidentClass.REGIONAL_EVENT)
+    incident = make_incident(IncidentClass.SENSOR_FAULT)
     text = compose(incident)
     lines = [ln for ln in text.splitlines() if ln.strip()]
     check("first line is priority and class",
-          "P2" in lines[0] and "REGIONAL_EVENT" in lines[0], f"({lines[0]})")
+          "P2" in lines[0] and "SENSOR_FAULT" in lines[0], f"({lines[0]})")
     check("second line is what to do",
-          "investigate the area" in lines[1].lower(), f"({lines[1]})")
+          "dispatch a technician" in lines[1].lower(), f"({lines[1]})")
     check("where it is appears before the sensor list",
           text.index("Where:") < text.index("Sensors:"))
     check("the evidence is included", "2 equipment types affected" in text)
@@ -157,7 +157,7 @@ def main():
           f"({len(text)} chars)")
 
     print("\n  a 60-sensor incident stays readable on a phone")
-    many = make_incident(IncidentClass.REGIONAL_EVENT, members=[
+    many = make_incident(IncidentClass.SENSOR_FAULT, members=[
         anomaly(str(i), f"Site{i}-Pump{i}-Delivery-Pressure",
                 f"Site{i}", "Pressure", AnomalyType.LEVEL_SHIFT)
         for i in range(60)])
@@ -168,7 +168,7 @@ def main():
     check("the count is still stated in full", "60 sensor(s)" in long_text)
 
     print("\n  and truncation is a real backstop, not decoration")
-    huge = make_incident(IncidentClass.REGIONAL_EVENT, members=[
+    huge = make_incident(IncidentClass.SENSOR_FAULT, members=[
         anomaly(str(i), "X" * 900, f"Site{i}", "Pressure",
                 AnomalyType.LEVEL_SHIFT) for i in range(8)])
     huge_text = compose(huge)
@@ -200,25 +200,39 @@ def main():
     check("empty data is rejected", parse_callback("") == (None, None))
 
     # --- what gets sent, and what must not --------------------------------- #
-    print("\nsuppressed classes are never sent")
+    # The paging line is sensor health and nothing else, so this is the test
+    # that holds the client's scope decision in place. An area event, a failed
+    # pump and a rain-explained excursion are all real findings, all on the
+    # report, and none of them is allowed into the chat.
+    print("\nonly sensor-health classes are sent")
     fake = FakeTelegram().install()
     result = FakeResult([
-        make_incident(IncidentClass.REGIONAL_EVENT, "East-1"),
         make_incident(IncidentClass.SENSOR_FAULT, "West-1", severity=45.0),
+        make_incident(IncidentClass.DRIFT_MAINTENANCE, "West-2", severity=40.0),
+        make_incident(IncidentClass.INSTRUMENT_CONFLICT, "West-3", severity=52.0),
+        make_incident(IncidentClass.TELEMETRY_OUTAGE, "West-4", severity=38.0),
+        make_incident(IncidentClass.OUT_OF_SCOPE, "East-1", severity=70.0),
+        make_incident(IncidentClass.ASSET_FAILURE, "East-3", severity=60.0),
         make_incident(IncidentClass.TELEMETRY_FANOUT, "East-2", severity=8.0),
         make_incident(IncidentClass.WATCH, "North-1", severity=12.0),
     ])
     report = send_run(result, TelegramConfig(token="t", chat_id="c"))
-    check("the two actionable incidents are sent", len(report.sent) == 2,
+    check("the four sensor-health incidents are sent", len(report.sent) == 4,
           f"({report.sent})")
+    check("an area event is not sent, even at severity 70",
+          "East-1" not in report.sent,
+          "(the client ruled operational events out of the paging line)")
+    check("a failed pump is not sent either", "East-3" not in report.sent,
+          "(plant, not instrument -- it stays on the report)")
     check("fan-out is not sent", "East-2" not in report.sent)
     check("watch is not sent", "North-1" not in report.sent)
-    check("and both are recorded as skipped, not lost",
-          set(report.skipped) == {"East-2", "North-1"}, f"({report.skipped})")
+    check("and every one is recorded as skipped, not lost",
+          set(report.skipped) == {"East-1", "East-3", "East-2", "North-1"},
+          f"({report.skipped})")
     check("an overview message precedes the incidents",
           "DAS2 run" in fake.messages()[0], f"({fake.messages()[0][:60]})")
     check("the overview says how many were suppressed",
-          "2 suppressed" in fake.messages()[0], f"({fake.messages()[0]})")
+          "4 suppressed" in fake.messages()[0], f"({fake.messages()[0]})")
 
     print("\n  a quiet run says so explicitly, rather than saying nothing")
     fake = FakeTelegram().install()

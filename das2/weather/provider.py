@@ -17,8 +17,13 @@ Why it matters operationally
 A flow or level excursion during a downpour is the most common wasted trip in a
 water network: the numbers really did move, nothing is broken, and somebody
 drives out anyway. Attaching rainfall to the incident lets triage say
-`WEATHER_DRIVEN -- monitor only, do not dispatch`, with the millimetres quoted
-so the operator can disagree.
+`OUT_OF_SCOPE -- the weather, nobody paged`, with the millimetres quoted so the
+operator can disagree.
+
+This is why the rain gauges survived the client narrowing the paging line to
+sensor health. Weather is not something this system reports any more -- but it
+is the reason a storm's worth of level excursions is not reported as a hundred
+broken level sensors, and removing it would have produced exactly that.
 
 What it deliberately does not do
 --------------------------------
@@ -129,7 +134,7 @@ class RainObservation:
     A bare millimetre figure cannot be checked. This carries the provenance
     with it -- how many gauges, how far the nearest was, which window was
     actually integrated, and whether a lag was applied -- so a reader who
-    disagrees with a WEATHER_DRIVEN verdict can see exactly what produced it.
+    disagrees with rain being blamed can see exactly what produced it.
     """
 
     mm: float | None = None

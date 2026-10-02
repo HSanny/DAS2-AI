@@ -131,7 +131,7 @@ CREATE INDEX IF NOT EXISTS ix_das2_anomaly_type ON das2_sensor_anomaly (dominant
 -- Incidents ------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS das2_incident (
     incident_id       VARCHAR(64) NOT NULL PRIMARY KEY,
-    incident_class    VARCHAR(48),           -- REGIONAL_EVENT, SENSOR_FAULT, ...
+    incident_class    VARCHAR(48),           -- SENSOR_FAULT, OUT_OF_SCOPE, ...
     status            VARCHAR(16),           -- OPEN | UPDATED | RESOLVED
     severity          DOUBLE PRECISION,
     priority          VARCHAR(4),            -- P1..P4

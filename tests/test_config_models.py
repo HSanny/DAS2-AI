@@ -327,11 +327,38 @@ def main():
     watch = Incident(incident_id="i3", cluster=c, incident_class=IncidentClass.WATCH)
     check("WATCH does not alert", not watch.should_alert)
 
-    rain = Incident(incident_id="i4", cluster=c,
-                    incident_class=IncidentClass.WEATHER_DRIVEN, severity=70.0)
-    check("weather-driven alerts but does not dispatch",
-          rain.should_alert and not rain.should_dispatch,
-          "(the operator is told, and told not to drive out)")
+    # The paging line, as the client drew it: sensor health, nothing else.
+    # Written as an exact set rather than class-by-class on purpose -- the old
+    # deny-list form meant a class added later started paging on the day it was
+    # written, which is how ASSET_FAILURE got onto the line without anybody
+    # deciding it should be.
+    paging = {k for k in IncidentClass
+              if Incident(incident_id="x", cluster=c, incident_class=k,
+                          severity=80.0).should_alert}
+    check("exactly four classes reach a person",
+          paging == {IncidentClass.SENSOR_FAULT,
+                     IncidentClass.DRIFT_MAINTENANCE,
+                     IncidentClass.INSTRUMENT_CONFLICT,
+                     IncidentClass.TELEMETRY_OUTAGE},
+          f"({', '.join(sorted(k.value for k in paging))})")
+    check("and all four are statements about an instrument or its feed", True,
+          "not about the water, the weather or an operator")
+
+    for retired in ("REGIONAL_EVENT", "PROCESS_EVENT", "WEATHER_DRIVEN"):
+        check(f"{retired} is no longer a verdict this system can reach",
+              retired not in {k.value for k in IncidentClass},
+              "(all three now return OUT_OF_SCOPE)")
+
+    aside = Incident(incident_id="i4", cluster=c,
+                     incident_class=IncidentClass.OUT_OF_SCOPE, severity=70.0)
+    check("an area event does not alert, even at severity 70",
+          not aside.should_alert and not aside.should_dispatch,
+          "(it is on the report; it does not wake anybody)")
+
+    pump = Incident(incident_id="i5", cluster=c,
+                    incident_class=IncidentClass.ASSET_FAILURE, severity=60.0)
+    check("a failed machine does not alert either", not pump.should_alert,
+          "(plant, not instrument -- detected and reported, not paged)")
 
     check("every class has a recommendation",
           all(Incident(incident_id="x", cluster=c, incident_class=k).recommendation

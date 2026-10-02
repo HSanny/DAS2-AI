@@ -31,6 +31,33 @@ The classification order is the order of *certainty*, not severity. Fan-out is
 tested first because it is the one verdict that can be established structurally
 -- sensors sharing an RTU that fail together share a cause, and that is a fact
 about the wiring rather than an inference about the water.
+
+Scope: only four of these verdicts page
+---------------------------------------
+The client narrowed the paging line to sensor health:
+
+    "i only want some detection that makes a suggestion of area where might
+     need a close look, we dont want explicit potential like operational
+     events being alerted as anomaly, or some extreme weather condition that
+     result in abnormal data intake to be alerted as anomaly, we want to
+     anticipate the potential unnormal, or abnormal behavior of the sensor
+     based on the stats, but not the operational event, or weather condition,
+     or close/on valve things like that"
+
+`models.PAGEABLE_CLASSES` holds the four that reach a person: SENSOR_FAULT,
+DRIFT_MAINTENANCE, INSTRUMENT_CONFLICT, TELEMETRY_OUTAGE.
+
+That does *not* make the other verdicts dead weight, and this is the part worth
+understanding before touching anything below. Three of the branches here --
+rain, the area event, the neighbours moving together -- exist to recognise
+things the client does not want paged. Deleting them would not stop a storm
+being reported; it would stop the storm being *recognised*, and its members
+would arrive at the sensor-health rules with nothing left to excuse them. They
+all now return one verdict, OUT_OF_SCOPE, which is recorded with its evidence
+and never sent.
+
+So the rules below divide into two jobs: find the broken instrument, and
+account for everything that looks broken but is not.
 """
 
 from __future__ import annotations
@@ -89,6 +116,26 @@ RAIN_EXPLICABLE: frozenset[AnomalyType] = frozenset({
     AnomalyType.SPIKE,
     AnomalyType.RESIDUAL_OUTLIER,
     AnomalyType.MASS_BALANCE_VIOLATION,
+})
+
+#: RANGE_VIOLATION is rain-explicable too, but only on an instrument measuring
+#: water, and only when it is actually raining.
+#:
+#: This is the one case where the client's "do not alert me about the weather"
+#: and the sensor-health paging line pull against each other. A flood pushes a
+#: canal level over its configured high limit; the reading is correct, the
+#: instrument is fine, and RANGE_VIOLATION is a sensor-health type, so the
+#: cluster lands squarely on the dispatch line. The reading being outside its
+#: limits is exactly what the gauge is for.
+#:
+#: The equipment gate is what stops this from being a blanket excuse. Rain
+#: raises a canal, a flow and a turbidity reading; it does not raise a motor
+#: voltage, so a Voltage over-range during a storm is still an over-range.
+RAIN_MOVED_EQUIPMENT: frozenset[str] = frozenset({
+    "Flowrate", "Pressure", "Level", "CanalLevel", "Depth", "Turbidity",
+})
+RAIN_EXPLICABLE_IF_WET: frozenset[AnomalyType] = RAIN_EXPLICABLE | frozenset({
+    AnomalyType.RANGE_VIOLATION,
 })
 
 
@@ -189,25 +236,47 @@ def classify(cluster: Cluster, *,
                    "feed before dispatching anyone")
         return IncidentClass.TELEMETRY_OUTAGE, why
 
-    # --- 3. Rain explains it ------------------------------------------------ #
+    # --- 3. It rained ------------------------------------------------------- #
     # Checked before the area rules, because a regional flow excursion during a
-    # downpour is the single most common false dispatch in a water network.
-    if (rainfall_mm is not None and rainfall_mm >= RAIN_EXPLAINS_MM
-            and types and types <= RAIN_EXPLICABLE):
-        why.append(f"{rainfall_mm:.1f} mm of rain at nearby gauges during the window")
-        why.append(f"affected types ({', '.join(sorted(t.value for t in types))}) "
-                   f"are all rain-explicable")
-        return IncidentClass.WEATHER_DRIVEN, why
+    # downpour is the single most common false dispatch in a water network --
+    # and it is the client's own first example of what they do not want paged.
+    #
+    # Note which way the equipment gate runs. Rain excuses the four
+    # RAIN_EXPLICABLE types on any instrument, because those types are already
+    # statements about the water having moved. RANGE_VIOLATION is excused only
+    # on an instrument that measures water: a canal over its high limit in a
+    # storm is the gauge doing its job, while a motor voltage over its limit in
+    # the same storm is still an over-range.
+    if rainfall_mm is not None and rainfall_mm >= RAIN_EXPLAINS_MM and types:
+        wet_types = (RAIN_EXPLICABLE_IF_WET
+                     if equipment and equipment <= RAIN_MOVED_EQUIPMENT
+                     else RAIN_EXPLICABLE)
+        if types <= wet_types:
+            why.append(f"{rainfall_mm:.1f} mm of rain at nearby gauges during "
+                       f"the window")
+            why.append(f"affected types ({', '.join(sorted(t.value for t in types))}) "
+                       f"are all rain-explicable")
+            why.append("the weather, not the instrument -- recorded, nobody paged")
+            return IncidentClass.OUT_OF_SCOPE, why
 
-    # --- 4. Area event ------------------------------------------------------ #
-    # An area event means the WATER moved, so it needs enough members whose
-    # anomaly is about a process rather than an instrument. Without this test,
-    # any three independent broken sensors at nearby sites whose windows happen
-    # to overlap are reported as a regional event -- and on the fixture that is
-    # exactly what happened: a quantisation collapse, a stale transmitter, a
-    # pump contradiction and a brief reverse flow, four unrelated faults with
-    # nothing in common but a shared instant, scored P2 and recommended for
-    # area investigation.
+    # --- 4. The water moved across the area --------------------------------- #
+    # Several sites, several parameters, mostly process-type findings: an area
+    # event. Real, and deliberately NOT paged.
+    #
+    # This used to be the system's loudest verdict -- REGIONAL_EVENT, severity
+    # weight 1.00, and on the client's last real run all seven P1 alerts were
+    # one. The client then ruled it out: an area whose water moved is an
+    # operational event, which is their operators' job and not this system's.
+    # What survives is the test itself, because recognising an area event is
+    # what keeps its members off the dispatch line.
+    #
+    # The process-member requirement stays as it was. Without it, any three
+    # independent broken sensors at nearby sites whose windows happen to
+    # overlap are read as an area event -- and on the fixture that is exactly
+    # what happened: a quantisation collapse, a stale transmitter, a pump
+    # contradiction and a brief reverse flow, four unrelated faults with
+    # nothing in common but a shared instant. Those are four sensor faults, and
+    # under this scope that distinction decides whether anyone is told at all.
     process_members = [m for m in members if m.dominant_type in PROCESS_TYPES]
     if (len(members) >= REGIONAL_MIN_MEMBERS and len(sites) >= REGIONAL_MIN_SITES
             and len(process_members) >= REGIONAL_MIN_MEMBERS):
@@ -223,7 +292,9 @@ def classify(cluster: Cluster, *,
         if neighbour_correlation is not None and neighbour_correlation >= CORRELATION_STRONG:
             why.append(f"neighbouring sensors correlate (r={neighbour_correlation:.2f}) "
                        f"-- the water moved, not the instruments")
-        return IncidentClass.REGIONAL_EVENT, why
+        why.append("an area event in the water, not a sensor problem -- "
+                   "recorded, nobody paged")
+        return IncidentClass.OUT_OF_SCOPE, why
 
     # --- 5. Instruments contradicting each other ----------------------------- #
     # Checked before the correlation-dependent rules, because a contradiction
@@ -277,10 +348,20 @@ def classify(cluster: Cluster, *,
                    f"which a pure instrument fault cannot explain")
         return IncidentClass.WATCH, why
 
+    # --- 9. The neighbours moved with it ------------------------------------ #
+    # Last, because it must not be allowed to answer ahead of the sensor-health
+    # rules above: a frozen transmitter does not stop being frozen because a
+    # sensor two kilometres away happened to move in sympathy.
+    #
+    # Reaching here means the finding is not a health type at all, and the
+    # neighbours confirm it: an operator opened a valve, a pump started, a tide
+    # came in. The client's "close/on valve things like that", and the reason
+    # correlation is still computed on a sensor-health-only paging line.
     if neighbour_correlation is not None and neighbour_correlation >= CORRELATION_STRONG:
         why.append(f"neighbours moved together (r={neighbour_correlation:.2f})")
         why.append("consistent with a real change in the process")
-        return IncidentClass.PROCESS_EVENT, why
+        why.append("operational, not instrumental -- recorded, nobody paged")
+        return IncidentClass.OUT_OF_SCOPE, why
 
     why.append(f"{len(members)} sensor(s), "
                f"{', '.join(sorted(t.value for t in types))}, "
@@ -308,7 +389,6 @@ MEMBERS_SATURATE = 8
 #: Class multipliers. Fan-out is driven to the floor because acting on it is
 #: exactly the wasted trip this system exists to prevent.
 CLASS_WEIGHT: dict[IncidentClass, float] = {
-    IncidentClass.REGIONAL_EVENT: 1.00,
     # A physical contradiction is as certain as this system gets: two readings
     # cannot both be true, so there is nothing probabilistic left to discount.
     IncidentClass.INSTRUMENT_CONFLICT: 0.90,
@@ -319,9 +399,14 @@ CLASS_WEIGHT: dict[IncidentClass, float] = {
     # hundred sensors. Member count is already part of the raw score, so left
     # unweighted an outage would dominate every run it appears in.
     IncidentClass.TELEMETRY_OUTAGE: 0.45,
-    IncidentClass.PROCESS_EVENT: 0.55,
     IncidentClass.DRIFT_MAINTENANCE: 0.40,
-    IncidentClass.WEATHER_DRIVEN: 0.30,
+    # Kept low deliberately, and lower than WATCH. An area event is often the
+    # largest cluster of the run -- most members, most sites, most equipment
+    # types -- which is precisely what `severity` rewards, so left near 1.00 it
+    # would head every report with the one thing nobody is meant to act on. It
+    # still has to sort above fan-out, because a reader scanning what was set
+    # aside wants the real area events before the panel noise.
+    IncidentClass.OUT_OF_SCOPE: 0.25,
     IncidentClass.WATCH: 0.35,
     IncidentClass.TELEMETRY_FANOUT: 0.15,
     # As certain as INSTRUMENT_CONFLICT, and it also says which of the two
@@ -342,6 +427,13 @@ CLASS_WEIGHT: dict[IncidentClass, float] = {
 #: drainage pump matters this hour or next week, because it has no forecast and
 #: no duty schedule. The floor only stops a certainty from being filed as
 #: noise; a high member severity still lifts it above.
+#:
+#: Since the paging line narrowed to sensor health, ASSET_FAILURE no longer
+#: reaches anybody's phone, so this floor now decides only where a failed
+#: machine SORTS in the report -- which is still worth getting right, because
+#: a reader scanning what the run found should meet the conclusive findings
+#: before the marginal ones. It is kept rather than removed for the day the
+#: client wants the plant back on the line.
 CLASS_FLOOR: dict[IncidentClass, float] = {
     IncidentClass.ASSET_FAILURE: 55.0,
 }

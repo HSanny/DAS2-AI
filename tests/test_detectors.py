@@ -381,27 +381,42 @@ def main():
           len(result.selected) + len(result.held) == len(flood))
     check("with a stated reason", all(reason for _, reason in result.held))
 
-    # A class that scores from a FLOOR rather than from its own evidence can
-    # produce a block of identical severities -- every ASSET_FAILURE lands on
-    # exactly 55.0 unless a member lifts it. Twenty of them at one station
-    # tie with each other, and if ranking were the only control they would
-    # take the whole run budget and push a genuine regional event onto the
-    # held list. The per-region cap is what stops that, so it is pinned here
-    # rather than left as a happy accident of the ordering.
-    station = [incident(IncidentClass.ASSET_FAILURE, "East", 55.0, f"a{i}")
+    # Ranking alone is not a control when severities TIE. Twenty faults at one
+    # station on the same score sort against each other arbitrarily, and if the
+    # run cap were the only limit they would take the whole budget and push a
+    # lower-scoring fault in another region onto the held list. The per-region
+    # cap is what stops that, so it is pinned here rather than left as a happy
+    # accident of the ordering.
+    station = [incident(IncidentClass.SENSOR_FAULT, "East", 55.0, f"a{i}")
                for i in range(20)]
-    elsewhere = incident(IncidentClass.REGIONAL_EVENT, "West", 50.0, "regional")
+    elsewhere = incident(IncidentClass.SENSOR_FAULT, "West", 50.0, "lonely")
     result = select(station + [elsewhere])
-    check("a station full of failed machines cannot take the whole run",
+    check("a station full of faults cannot take the whole run",
           len(result.selected) == 6,
           f"({len(result.selected)}: 5 East + 1 West)")
-    check("and a lower-scoring event elsewhere still gets through",
-          any(i.incident_id == "West-regional" for i in result.selected),
-          "a floored severity outranks a genuinely-scored one, so without "
-          "the regional budget the real event would be held with 'run cap "
-          "reached'")
+    check("and a lower-scoring fault elsewhere still gets through",
+          any(i.incident_id == "West-lonely" for i in result.selected),
+          "without the regional budget it would be held with 'run cap reached'")
 
-    p1 = incident(IncidentClass.REGIONAL_EVENT, "East", 90.0, "p1")
+    # The scope boundary, enforced before any budget. These are real findings
+    # that the client ruled off the paging line, so they must not be competing
+    # for a region's allowance at all -- counting them would let the suppressed
+    # crowd out the one thing meant to get through.
+    off_line = ([incident(IncidentClass.OUT_OF_SCOPE, "East", 95.0, f"o{i}")
+                 for i in range(10)]
+                + [incident(IncidentClass.ASSET_FAILURE, "East", 90.0, f"m{i}")
+                   for i in range(10)])
+    one_fault = incident(IncidentClass.SENSOR_FAULT, "East", 30.0, "quiet")
+    result = select(off_line + [one_fault])
+    check("twenty off-line incidents do not consume the East's budget",
+          [i.incident_id for i in result.selected] == ["East-quiet"],
+          f"({[i.incident_id for i in result.selected]})")
+    check("and all twenty are held with a reason naming why",
+          len(result.held) == 20
+          and all(reason for _, reason in result.held),
+          f"({len(result.held)} held)")
+
+    p1 = incident(IncidentClass.SENSOR_FAULT, "East", 90.0, "p1")
     result = select([p1] + flood, per_region=1, global_cap=1)
     check("a P1 is never held back by a budget",
           any(i.incident_id == "East-p1" for i in result.selected),

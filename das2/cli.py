@@ -445,17 +445,31 @@ def cmd_demo(config: Config, args) -> int:
     except Exception as exc:                               # noqa: BLE001
         log.error("report generation failed: %s", exc)
 
+    # The demo passes on the thing this system is for: an injected instrument
+    # fault that reached the paging line. It used to pass on the injected
+    # REGIONAL_EVENT, which was the right test while area events were the
+    # headline verdict -- but those are now recorded and never paged, so a run
+    # that found only the area event would be a run that told nobody anything.
     from das2.models import IncidentClass
-    regional = [i for i in result.incidents
-                if i.incident_class is IncidentClass.REGIONAL_EVENT]
+    paged = [i for i in result.incidents if i.should_alert]
+    faults = [i for i in paged
+              if i.incident_class is IncidentClass.SENSOR_FAULT]
+    out_of_scope = [i for i in result.incidents
+                    if i.incident_class is IncidentClass.OUT_OF_SCOPE]
     print("\n" + "=" * 68)
-    if regional:
-        sites = ", ".join(sorted(regional[0].cluster.sites))
-        print(f"OK — the injected regional event was found across {sites}.")
+    if faults:
+        sites = ", ".join(sorted(faults[0].cluster.sites)) or "an unnamed site"
+        print(f"OK — an injected instrument fault was found at {sites}, and "
+              f"{len(paged)} incident(s) reached the paging line.")
         print("Ingest, classification, detection, clustering, triage and the")
         print("dashboard are all working. Point it at your real data next.")
+        if out_of_scope:
+            print(f"\n{len(out_of_scope)} incident(s) were set aside as the "
+                  f"process, the weather or an operator —")
+            print("deliberately: they are in the report, not in anyone's "
+                  "Telegram.")
     else:
-        print("PROBLEM — the injected regional event was NOT found.")
+        print("PROBLEM — no injected instrument fault reached the paging line.")
         print("Something upstream is broken; the detail above says where.")
     print("=" * 68)
 
@@ -464,7 +478,7 @@ def cmd_demo(config: Config, args) -> int:
         shutil.rmtree(root, ignore_errors=True)
     else:
         print(f"\nFixtures kept in {root}")
-    return 0 if regional else 1
+    return 0 if faults else 1
 
 
 def cmd_profile(config: Config, args) -> int:

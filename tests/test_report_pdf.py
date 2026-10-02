@@ -101,9 +101,14 @@ def incident(idx: int, site_idx: int, severity: float, cls: str) -> NS:
                    start=datetime(2026, 9, 23, 2), end=datetime(2026, 9, 23, 5)),
         incident_class=NS(value=cls),
         priority=NS(value=priority), severity=severity,
+        # The stub has to carry this, because the document's front pages are
+        # now filtered on it: "Act first" is the paging line, not a priority
+        # band. A stub without it would make those pages unreachable and the
+        # assertions below would pass on an empty report.
+        should_alert=cls in {"SENSOR_FAULT", "DRIFT_MAINTENANCE",
+                             "INSTRUMENT_CONFLICT", "TELEMETRY_OUTAGE"},
         neighbour_correlation=0.42, rainfall_mm=3.1, detail={},
-        recommendation="Multiple sites affected together - investigate the "
-                       "area, not one sensor.",
+        recommendation="Dispatch a technician.",
     )
     # The reading the pipeline attaches, through the same code path the
     # pipeline uses. Built here rather than hand-written so a rule edited in
@@ -115,7 +120,7 @@ def incident(idx: int, site_idx: int, severity: float, cls: str) -> NS:
 
 
 def busy_run(n: int = 198) -> NS:
-    classes = ["REGIONAL_EVENT", "SENSOR_FAULT", "TELEMETRY_FANOUT",
+    classes = ["OUT_OF_SCOPE", "SENSOR_FAULT", "TELEMETRY_FANOUT",
                "WATCH", "DRIFT_MAINTENANCE"]
     incidents = []
     for k in range(n):
@@ -328,9 +333,15 @@ def main() -> int:
                            "What to act on", "held back",
                            "Data quality and coverage"):
                 check(f"the report says {phrase!r}", phrase in text)
+            # The tile counts what reached the PAGING LINE at P1/P2, not every
+            # incident at those priorities. A failed pump sits at P2 by its
+            # class floor and an area event can carry fifty sensors; neither is
+            # something this document asks anybody to decide, so counting them
+            # would open the report with a number nothing inside it acts on.
             check("the headline count is the one an operator acts on",
                   str(sum(1 for i in run.incidents
-                          if i.priority.value in ("P1", "P2"))) in text)
+                          if i.should_alert
+                          and i.priority.value in ("P1", "P2"))) in text)
             check("regions are named, not repr'd",
                   "North-East" in text and "Region.NORTH_EAST" not in text,
                   "str(enum) gives Region.NORTH_EAST, which is not a place")
@@ -356,7 +367,7 @@ def main() -> int:
                   "a hedged sentence with nothing to check it against is a "
                   "horoscope; this line is how PUB corrects the rule")
             check("the reading does not displace the decision",
-                  text.index("Investigate the area")
+                  text.index("Dispatch a technician")
                   < text.index("Looks like:"),
                   "the class and the action were computed without it and "
                   "must be read first")
@@ -385,7 +396,7 @@ def main() -> int:
     joined = " ".join(paras)
     check("it names the mechanism, not just the class",
           "neighbours" in joined or "neighbour" in joined,
-          "'REGIONAL_EVENT' is a label; 'the neighbours moved too' is a reason")
+          "'OUT_OF_SCOPE' is a label; 'the neighbours moved too' is a reason")
     check("the caveats travel with the findings",
           "missing" in joined and "STALE" in joined,
           "a 24-hour feed gap inflates STALE across the fleet")

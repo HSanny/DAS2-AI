@@ -104,7 +104,7 @@ def synthetic_run(sensors: int = 4) -> NS:
     incident = NS(
         incident_id="East-20260921-abc",
         cluster=cluster,
-        incident_class=NS(value="REGIONAL_EVENT"),
+        incident_class=NS(value="OUT_OF_SCOPE"),
         priority=NS(value="P1"), severity=88.0,
         neighbour_correlation=0.71, rainfall_mm=0.0,
         recommendation="Multiple sites affected together - investigate the area.",
@@ -236,7 +236,7 @@ def big_run(sensors: int) -> NS:
         for m in members], ignore_index=True)
     cluster = Cluster(members=members, region="East")
     incident = NS(incident_id="big", cluster=cluster,
-                  incident_class=NS(value="REGIONAL_EVENT"),
+                  incident_class=NS(value="OUT_OF_SCOPE"),
                   priority=NS(value="P1"), severity=90.0,
                   neighbour_correlation=None, rainfall_mm=None,
                   recommendation="x", ack_state=NS(value="none"), detail={})

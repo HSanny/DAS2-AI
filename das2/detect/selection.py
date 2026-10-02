@@ -53,7 +53,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from das2.models import Incident, IncidentClass, Priority
+from das2.models import NOT_PAGED_BECAUSE, Incident, Priority
 
 #: Priorities in descending urgency, for ordering and comparison.
 PRIORITY_ORDER = (Priority.P1, Priority.P2, Priority.P3, Priority.P4)
@@ -117,16 +117,15 @@ def select(incidents: list[Incident], *,
     result = SelectionResult()
     min_rank = _PRIORITY_RANK.get(min_priority, len(PRIORITY_ORDER))
 
-    # Class suppression first. A fan-out or a WATCH is not competing for budget
-    # -- it is not a candidate at all, and counting it against a region's
-    # allowance would let noise crowd out a real finding.
+    # Class suppression first. Anything off the paging line -- a fan-out, a
+    # WATCH, an area event, a failed pump -- is not competing for budget. It is
+    # not a candidate at all, and counting it against a region's allowance
+    # would let the suppressed crowd out the one finding meant to get through.
     candidates: list[Incident] = []
     for incident in sorted(incidents, key=_rank):
         if not incident.should_alert:
-            reason = ("telemetry fan-out, not a site visit"
-                      if incident.incident_class is IncidentClass.TELEMETRY_FANOUT
-                      else "evidence too weak or conflicting")
-            result.held.append((incident, reason))
+            result.held.append((incident, NOT_PAGED_BECAUSE.get(
+                incident.incident_class, "not on the paging line")))
         elif _PRIORITY_RANK.get(incident.priority, 99) > min_rank:
             result.held.append(
                 (incident, f"below the {min_priority.value} alerting threshold"))

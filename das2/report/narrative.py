@@ -24,7 +24,7 @@ The rules it follows
 * **Lead with the decision.** The first paragraph says whether anyone needs to
   act and where, because on most runs that is all that gets read.
 * **Name the mechanism, not the label.** "Four sites moved together and the
-  neighbouring sensors moved with them" is actionable; "REGIONAL_EVENT" is a
+  neighbouring sensors moved with them" is actionable; "OUT_OF_SCOPE" is a
   class name.
 * **Say what was NOT concluded.** A run with no baselines, or a 24-hour hole in
   the feed, is a run whose silence means less than it appears to. Those
@@ -98,8 +98,6 @@ def evidence(result) -> str:
     # Phrased as the mechanism, because the class name is a label and the
     # mechanism is what tells a reader whether to believe it.
     MEANING = {
-        "REGIONAL_EVENT": ("several sites moved together and their neighbours "
-                           "moved with them, which is water, not instruments"),
         "SENSOR_FAULT": ("the sensor moved and nothing around it did, which is "
                          "the instrument, not the water"),
         "TELEMETRY_FANOUT": ("sensors on one RTU went at the same instant, "
@@ -107,10 +105,9 @@ def evidence(result) -> str:
         "TELEMETRY_OUTAGE": ("a block of sensors across separate sites stopped "
                              "reporting together, which is the link or the "
                              "historian feed"),
-        "WEATHER_DRIVEN": ("levels and flows rose while it was raining on the "
-                           "same catchment"),
-        "PROCESS_EVENT": ("a level shift the neighbours corroborate — "
-                          "operational, worth watching, not a fault"),
+        "OUT_OF_SCOPE": ("the water moved and the instruments reported it "
+                         "correctly — rain, a pump, a valve or an area event, "
+                         "which is operations' business and not this system's"),
         "DRIFT_MAINTENANCE": ("a slow drift with no abrupt failure, which is a "
                               "calibration job rather than a callout"),
         "INSTRUMENT_CONFLICT": ("readings that cannot all be true at once — "

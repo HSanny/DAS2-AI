@@ -161,8 +161,8 @@ rules:
       - "\\brpm\\b"
 
   # --- weather -------------------------------------------------------------
-  # Rain gauges are what make WEATHER_DRIVEN triage possible with no external
-  # API: flow spiked and it was raining nearby means do not dispatch.
+  # Rain gauges are what let triage excuse the weather with no external API:
+  # flow spiked and it was raining nearby means nobody is paged.
   - equipment: Rainfall
     patterns:
       - "rainfall"

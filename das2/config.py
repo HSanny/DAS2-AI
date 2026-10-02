@@ -267,8 +267,13 @@ class IncidentConfig:
     escalate_severity_delta: float = 20.0
     escalate_on_new_members: bool = True
 
-    #: REGIONAL_EVENT requires corroboration from several sites and several
-    #: equipment types; one panel misbehaving is fan-out, not a regional event.
+    #: An area event requires corroboration from several sites and several
+    #: equipment types; one panel misbehaving is fan-out, not an area event.
+    #:
+    #: Recognising one no longer pages anybody -- an area event is the water
+    #: moving, which the client ruled out of scope -- but these thresholds
+    #: still decide which sensors are excused as part of it and which are left
+    #: to answer for themselves as instrument faults.
     regional_min_sensors: int = 3
     regional_min_equipment_types: int = 2
 

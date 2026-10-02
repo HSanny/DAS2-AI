@@ -344,9 +344,12 @@ def _split_by_time(members: list[SensorAnomaly],
     quantisation collapse whose window legitimately spans 19.7 hours overlapped
     a stale sensor, a pump contradiction, a reverse-flow event and the real
     four-sensor level shift -- none of which overlapped each other. Chained
-    together they formed one 8-member "REGIONAL_EVENT", scored P1, and would
-    have sent a crew to investigate an area event that never happened. Five
-    independent faults, presented as the most severe thing on the map.
+    together they formed one 8-member area event, scored P1, and would have
+    sent a crew to investigate something that never happened. Five independent
+    faults, presented as the most severe thing on the map -- and under the
+    sensor-health paging line the damage runs the other way too: four of those
+    five are instrument faults, and being swept into an area event is now
+    enough to stop them reaching anyone at all.
 
     So a cluster is required to share a common instant, which is what "these
     happened together" actually claims. The greedy sweep below takes the

@@ -210,8 +210,8 @@ def build_incidents(clusters: list[Cluster], *, now: datetime,
                        # every incident in that region means a downpour at
                        # 03:00 "explains" a level shift at 20:00. Measured on
                        # the fixture: the genuine four-sensor regional event
-                       # was labelled WEATHER_DRIVEN and suppressed to P4 by
-                       # rain that fell at a different time of day.
+                       # was excused as weather and dropped off the paging
+                       # line by rain that fell at a different time of day.
                        rainfall_mm=rainfall.get(_cluster_key(c)))
         for c in clusters
     ]

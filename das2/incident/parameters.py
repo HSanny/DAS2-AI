@@ -8,8 +8,8 @@ The gap this closes
 -------------------
 An incident used to read::
 
-    P1  REGIONAL_EVENT  East  12 sensor(s)  Bedok Diversion, Bedok PS, ...
-        -> Multiple sites affected together - investigate the area.
+    P1  SENSOR_FAULT  East  12 sensor(s)  Bedok Diversion, Bedok PS, ...
+        -> Instrument fault - dispatch a technician.
 
 That says WHERE and HOW CONFIDENT, and never WHAT. It does not say whether
 those twelve sensors are canal levels, flows, pressures or pump motors, so it

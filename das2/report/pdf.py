@@ -300,11 +300,15 @@ def _cover(pdf: PdfPages, result, stamp: str) -> None:
     *so what*.
     """
     incidents = list(result.incidents)
-    by_priority: dict[str, int] = {}
-    for incident in incidents:
-        p = incident.priority.value
-        by_priority[p] = by_priority.get(p, 0) + 1
-    urgent = by_priority.get("P1", 0) + by_priority.get("P2", 0)
+    # Counted over what REACHED the paging line, not over every priority.
+    #
+    # Priority says how bad a finding is; the paging line says whether it is
+    # this system's to raise. A failed pump sits at P2 by its class floor and an
+    # area event can carry fifty sensors, and neither is something this document
+    # is asking anybody to decide -- so counting them here would open the report
+    # with a number that nothing inside it acts on.
+    urgent = sum(1 for i in incidents
+                 if i.should_alert and i.priority.value in ("P1", "P2"))
 
     window = ""
     if result.window_start and result.window_end:
@@ -367,18 +371,19 @@ def _cover(pdf: PdfPages, result, stamp: str) -> None:
 def _act_first(pdf: PdfPages, result) -> None:
     """The P1 and P2 list, on its own page, first after the explanation."""
     urgent = sorted([i for i in result.incidents
-                     if i.priority.value in ("P1", "P2")],
+                     if i.should_alert and i.priority.value in ("P1", "P2")],
                     key=lambda i: -i.severity)
     fig, y = _page(
         pdf, "Act first",
-        f"{len(urgent)} incident(s) at P1 or P2, most severe first"
+        f"{len(urgent)} sensor-health incident(s) at P1 or P2, most severe first"
         if urgent else
-        "Nothing at P1 or P2 this run.")
+        "No sensor-health incident reached P1 or P2 this run.")
     if not urgent:
         fig.text(L, y - 0.06,
-                 "The network is quiet at the priorities that mean dispatch. "
-                 "The pages that follow record what was seen and what was "
-                 "deliberately not sent.",
+                 "No instrument is in a state that means dispatch. The pages "
+                 "that follow record what was seen, including what the water, "
+                 "the weather and the plant did -- none of which is this "
+                 "page's business.",
                  fontsize=theme.SIZE_BODY, color=theme.INK_SECONDARY,
                  va="center")
         _close(pdf, fig)
@@ -434,7 +439,8 @@ def _anatomy_pages(pdf: PdfPages, result, *, limit: int = 6) -> None:
     and a page of eight would be a spreadsheet.
     """
     incidents = sorted(
-        [i for i in result.incidents if i.priority.value in ("P1", "P2")],
+        [i for i in result.incidents
+         if i.should_alert and i.priority.value in ("P1", "P2")],
         key=lambda i: -i.severity)[:limit]
     if not incidents:
         return

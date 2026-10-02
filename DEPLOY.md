@@ -411,8 +411,8 @@ docker compose run --rm das2-migrate      # idempotent; safe every time
 Every message leads with the decision:
 
 ```
-🔴 P2 · REGIONAL_EVENT
-Multiple sites affected together - investigate the area, not one sensor.
+🔴 P2 · SENSOR_FAULT
+Instrument fault with no corroboration from neighbours - dispatch a technician.
 
 Where: East — BedokPS, BedokPond4, TampinesPS
 Scale: 7 sensor(s) at 3 site(s), spread 2.5 km
@@ -420,29 +420,48 @@ When:  21 Sep 05:49 → 21 Sep 06:28 (39 min)
 Rain nearby: 0.0 mm
 
 Why:
-• 7 sensors across 3 sites (BedokPS, BedokPond4, TampinesPS)
-• 2 equipment types affected (Flowrate, Pressure) -- unlikely to be one
-  instrument failing
+• FLATLINE, QUANTISATION_COLLAPSE: the instrument itself has failed
+• not a judgement about the water, so neighbour behaviour does not change it
 • spread 2.5 km around East
 
 [✅ Acknowledge] [🚚 Dispatched] [🔕 False alarm]
 ```
 
-The seven incident classes and what each means:
+#### Only four classes ever reach your phone
+
+The paging line is **sensor health**, and nothing else — set that way on your
+instruction:
+
+> *"we want to anticipate the potential unnormal, or abnormal behavior of the
+> sensor based on the stats, but not the operational event, or weather
+> condition, or close/on valve things like that"*
 
 | Class | What the evidence says | What to do |
 |---|---|---|
-| `REGIONAL_EVENT` | Several sites, several equipment types, same time | **Investigate the area** |
 | `SENSOR_FAULT` | One instrument misbehaving, neighbours calm | **Dispatch a technician** |
-| `WEATHER_DRIVEN` | Rain at nearby gauges explains it | Monitor — **do not dispatch** |
-| `PROCESS_EVENT` | Neighbours moved together; the water moved | Operational, monitor |
 | `DRIFT_MAINTENANCE` | Slow drift, no abrupt failure | Schedule recalibration |
-| `TELEMETRY_FANOUT` | One RTU/panel, many sensors | Suppressed — never alerts |
-| `WATCH` | Weak or conflicting evidence | Suppressed — re-evaluated next run |
+| `INSTRUMENT_CONFLICT` | Two readings that cannot both be true | Check them all; one is wrong |
+| `TELEMETRY_OUTAGE` | A block of sensors across sites went quiet together | Check the comms link or the feed |
 
-The last two are **deliberately silent**. The dashboard shows them; nobody is
-paged. The run summary always says how many were suppressed, so silence is
-visibly a decision rather than a crash.
+Everything else is detected, scored, and shown on the interactive report —
+and paged to nobody:
+
+| Class | What the evidence says | Why it is silent |
+|---|---|---|
+| `OUT_OF_SCOPE` | Rain, an area event, a pump or a valve — the water moved and the instruments reported it correctly | Operations' business, not this system's |
+| `ASSET_FAILURE` | A machine's own channels contradict each other while every instrument on it reads normally | Plant, not instrument — on the report |
+| `TELEMETRY_FANOUT` | One RTU/panel, many sensors | One cause, not many faults |
+| `WATCH` | Weak or conflicting evidence | Re-evaluated next run |
+
+`OUT_OF_SCOPE` is worth understanding, because it is doing real work. The rain
+totals, the area test and the neighbour correlation are all still computed —
+they are what **keeps a storm off your phone**. Without them a downpour arrives
+as a dozen broken level sensors, which is the opposite of what you asked for.
+Reaching `OUT_OF_SCOPE` is how a cluster gets excused, and the evidence behind
+each one is recorded so you can disagree with it in the report.
+
+The run summary always says how many were suppressed, so silence is visibly a
+decision rather than a crash.
 
 ### Press the buttons
 

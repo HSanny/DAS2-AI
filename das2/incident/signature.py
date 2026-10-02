@@ -10,7 +10,7 @@ water engineer would call that, and what would change their mind.
 
 It describes, it does not decide
 --------------------------------
-The incident CLASS -- REGIONAL_EVENT, SENSOR_FAULT, TELEMETRY_FANOUT -- drives
+The incident CLASS -- SENSOR_FAULT, TELEMETRY_OUTAGE, OUT_OF_SCOPE -- drives
 priority and dispatch, and is computed from evidence the system can measure:
 how many sites, how many parameters, whether the neighbours moved, what the
 rain did. A signature sits beside that verdict and explains it. It never

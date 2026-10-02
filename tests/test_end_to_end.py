@@ -42,7 +42,7 @@ sys.path.insert(0, str(REPO))
 from das2 import pipeline  # noqa: E402
 from das2.config import Config  # noqa: E402
 from das2.incident.build import reconcile  # noqa: E402
-from das2.models import IncidentClass  # noqa: E402
+from das2.models import PAGEABLE_CLASSES, IncidentClass  # noqa: E402
 from das2.report import dashboard  # noqa: E402
 
 
@@ -90,12 +90,21 @@ def main():
         check("the window is the full 72 hours",
               (result.window_end - result.window_start).total_seconds() > 70 * 3600)
 
-        # --- the client's headline requirement ----------------------------- #
-        print("\nthe regional event: several sites abnormal together")
+        # --- the area event, recognised and deliberately not paged --------- #
+        #
+        # This was the client's headline requirement for most of the project,
+        # and it is still the hardest thing in the fixture to get right: four
+        # sensors at four different sites, sharing no name prefix, moving
+        # together. What changed is the verdict. The client ruled operational
+        # events off the paging line, so finding this now means recognising it
+        # and NOT sending it -- which is the only thing that keeps a storm from
+        # arriving as a dozen broken level sensors.
+        print("\nthe area event: several sites abnormal together")
         regional = [i for i in result.incidents
-                    if i.incident_class is IncidentClass.REGIONAL_EVENT]
-        check("exactly one regional event is reported", len(regional) == 1,
-              f"({len(regional)})")
+                    if i.incident_class is IncidentClass.OUT_OF_SCOPE
+                    and len(i.cluster.sites) >= 3]
+        check("exactly one multi-site area event is recognised",
+              len(regional) == 1, f"({len(regional)})")
         event = regional[0]
         check("it spans several sites", len(event.cluster.sites) >= 3,
               f"({sorted(event.cluster.sites)})")
@@ -104,10 +113,16 @@ def main():
               f"({sorted(event.cluster.equipment_types)})")
         check("it is placed in the East", str(event.cluster.region) == "East",
               f"({event.cluster.region})")
-        check("it is actionable, not suppressed", event.should_alert,
+        check("it is NOT paged", not event.should_alert,
               f"(severity {event.severity}, {event.priority.value})")
-        check("it is among the incidents actually sent",
-              any(i.incident_id == event.incident_id for i in result.alertable))
+        check("and is not among the incidents sent",
+              not any(i.incident_id == event.incident_id
+                      for i in result.alertable),
+              "(the water moving is operations' business, not this system's)")
+        check("but it is still in the run, with its evidence, for the report",
+              event in result.incidents
+              and len(event.detail.get("evidence", [])) >= 2,
+              "(set aside is not the same as discarded)")
         # Deliberately NOT asserting that it outranks everything. Once the
         # fixture carried a pump insisting it was running against a meter
         # reading zero, that scored higher -- and correctly so: a contradiction
@@ -119,8 +134,9 @@ def main():
               all(a.severity >= b.severity
                   for a, b in zip(result.incidents, result.incidents[1:])),
               f"({[round(i.severity, 1) for i in result.incidents]})")
-        check("it tells the operator to investigate the area",
-              "area" in event.recommendation.lower())
+        check("it says plainly that nobody is paged",
+              "nobody is paged" in event.recommendation.lower(),
+              f"({event.recommendation})")
         check("it carries the evidence that justified that",
               len(event.detail.get("evidence", [])) >= 2,
               f"({event.detail.get('evidence')})")
@@ -139,18 +155,24 @@ def main():
         for incident in result.incidents:
             if incident.incident_class is IncidentClass.TELEMETRY_FANOUT:
                 check("fan-out never alerts", not incident.should_alert)
-            if incident.incident_class is IncidentClass.WEATHER_DRIVEN:
-                check("weather-driven says do not dispatch",
-                      "not dispatch" in incident.recommendation.lower())
+            if incident.incident_class is IncidentClass.OUT_OF_SCOPE:
+                check("an out-of-scope verdict never pages",
+                      not incident.should_alert)
+
+        print("\n  every paged incident is about an instrument")
+        for incident in result.alertable:
+            check(f"{incident.incident_class.value} is a sensor-health class",
+                  incident.incident_class in PAGEABLE_CLASSES,
+                  f"({incident.incident_id})")
 
         print("\n  and rain is judged over the INCIDENT's window, not the run's")
-        weather = [i for i in result.incidents
-                   if i.incident_class is IncidentClass.WEATHER_DRIVEN]
-        check("the regional event is not excused by rain at another hour",
-              event.incident_class is IncidentClass.REGIONAL_EVENT
-              and event not in weather,
+        rain_excused = [i for i in result.incidents
+                        if any("rain at nearby gauges" in w
+                               for w in i.detail.get("evidence", []))]
+        check("the area event is not excused by rain at another hour",
+              event not in rain_excused,
               "(a whole-run rainfall total attached to every incident in the "
-              "region suppressed this genuine event to P4)")
+              "region excused this genuine event on rain that fell at 03:00)")
 
         print("\nsensor faults are found and are dispatchable")
         faults = [i for i in result.incidents
