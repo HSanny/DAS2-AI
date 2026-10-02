@@ -40,8 +40,40 @@ from typing import Any
 # Env helpers
 # --------------------------------------------------------------------------- #
 def _env(name: str) -> str | None:
+    """
+    One environment variable, trimmed, or None when unset or blank.
+
+    The trim is the fix for a real failure. A `.env` written as
+
+        DAS2_ALERT_TELEGRAM_CHAT_ID= -10012345678
+
+    -- with a space after the `=`, which is how people write assignments -- gave
+    the chat id as `' -10012345678'`. The value passed every "is it configured?"
+    test in this system, because it is not blank, and then Telegram rejected it
+    with `chat not found`, which reads as a wrong chat rather than a stray
+    character the terminal cannot show you.
+
+    The same applies to a token pasted with a trailing newline, which is what
+    copying out of a chat window produces.
+
+    Leading and trailing only, never the inside: a password may legitimately
+    contain a space. One that legitimately BEGINS or ends with a space cannot
+    survive an unquoted `.env` line anyway, so there is nothing to lose there.
+    """
     raw = os.getenv(name)
-    return raw if raw is not None and raw.strip() != "" else None
+    if raw is None:
+        return None
+    trimmed = raw.strip()
+    if trimmed == "":
+        return None
+    if trimmed != raw:
+        # Visible, because a silently-corrected mistake is a mistake that gets
+        # made again -- and because the next reader of this `.env` cannot see
+        # the whitespace either.
+        import logging
+        logging.getLogger("das2.config").info(
+            "%s had surrounding whitespace, which was trimmed", name)
+    return trimmed
 
 
 def _coerce(value: str, target_type: type) -> Any:
@@ -357,6 +389,64 @@ class AlertConfig:
     telegram_token: str = field(default="", repr=False)
     telegram_chat_id: str = ""
 
+    def telegram_problems(self) -> list[str]:
+        """
+        What is wrong with the Telegram credentials, in plain terms.
+
+        Shape-checked rather than merely present-checked, because every way these
+        go wrong fails LATE and opaquely. A token with a stray character gets
+        `401 Unauthorized`, which reads as "the bot was deleted". A chat id with
+        one gets `400 chat not found`, which reads as "wrong chat" or "the bot
+        was never added to the group". Both are really "look at your .env", and
+        neither says so.
+
+        A bot token is `<digits>:<35-ish url-safe characters>` and a chat id is
+        an integer, negative for a group or supergroup. That is enough structure
+        to catch a stray space, a truncated paste, the two values swapped, and
+        the `@channelname` form, which this bot cannot use because it only ever
+        replies into a numeric chat.
+        """
+        import re
+
+        problems: list[str] = []
+        token, chat = self.telegram_token, self.telegram_chat_id
+
+        if not token:
+            problems.append("DAS2_ALERT_TELEGRAM_TOKEN is not set")
+        elif not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{30,}", token):
+            if ":" not in token:
+                problems.append(
+                    "the token has no ':' in it — a bot token looks like "
+                    "12345678:AAGvGJ... and the part before the ':' is the "
+                    "bot's numeric id")
+            elif any(c.isspace() for c in token):
+                problems.append(
+                    "the token contains a space or newline — it was probably "
+                    "pasted with a line break, or quoted in .env")
+            else:
+                problems.append(
+                    f"the token is not shaped like a bot token "
+                    f"(got {len(token)} characters; expected digits, then ':', "
+                    f"then about 35 letters, digits, '_' or '-')")
+
+        if not chat:
+            problems.append("DAS2_ALERT_TELEGRAM_CHAT_ID is not set")
+        elif chat.startswith("@"):
+            problems.append(
+                "the chat id is an @name — use the NUMERIC id instead. For a "
+                "group it is negative, like -10012345678")
+        elif not re.fullmatch(r"-?\d+", chat):
+            if any(c.isspace() for c in chat):
+                problems.append(
+                    f"the chat id contains a space ({chat!r}) — a `.env` line "
+                    f"written as `KEY= value` keeps the space. Values are now "
+                    f"trimmed, so this means the space is inside the value")
+            else:
+                problems.append(
+                    f"the chat id is not a number ({chat!r}) — it should be an "
+                    f"integer, negative for a group, like -10012345678")
+        return problems
+
 
 @dataclass
 class ReportConfig:
@@ -476,9 +566,23 @@ class DatabaseConfig:
         if self.url:
             return _complete_pyodbc_url(_escape_userinfo(self.url),
                                         self.driver, self.encrypt)
-        from urllib.parse import quote_plus
+        from urllib.parse import quote, quote_plus
+
+        # `quote`, NOT `quote_plus`, for the username and password.
+        #
+        # They differ on one character and it matters: `quote_plus` encodes a
+        # space as `+`, which is correct in a QUERY STRING and wrong in userinfo,
+        # where `+` is a literal plus. SQLAlchemy decodes userinfo with `unquote`,
+        # so a password of `pa ss` went to the server as `pa+ss` -- a login
+        # failure reported as a bad password, on a password that is correct, in
+        # the one configuration style this file recommends for awkward passwords.
+        #
+        # `quote_plus` stays below, where the `+` convention is the right one:
+        # the driver name genuinely contains spaces, and
+        # `driver=ODBC+Driver+18+for+SQL+Server` is how a query string says so.
         return (
-            f"mssql+pyodbc://{quote_plus(self.username)}:{quote_plus(self.password)}"
+            f"mssql+pyodbc://{quote(self.username, safe='')}"
+            f":{quote(self.password, safe='')}"
             f"@{self.host}:{self.port}/{self.database}"
             f"?driver={quote_plus(self.driver)}&TrustServerCertificate=yes"
             f"&Encrypt={quote_plus(self.encrypt)}"

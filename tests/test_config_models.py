@@ -202,6 +202,109 @@ def main():
           "if the share mounts, the machine is up and it is SQL Server")
 
     # ------------------------------------------------------------------ #
+    print("\nthe split database fields survive any password, unescaped")
+    # The route .env.example recommends for an awkward password, so it has to
+    # hold for every character rather than most of them.
+    from sqlalchemy.engine.url import make_url
+    awkward = ["P@ssword1234", "pa/ss", "pa#ss", "pa?ss", "pa%ss", "pa+ss",
+               "pa ss", "Pass word 1234", "p@ss:w/d#1?2", "a:b@c/d?e#f g+h"]
+    broken = []
+    for pw in awkward:
+        parsed = make_url(DatabaseConfig(
+            host="10.0.0.5", port=1433, database="anomaly_db",
+            username="flotech", password=pw).sqlalchemy_url())
+        if (parsed.password != pw or parsed.host != "10.0.0.5"
+                or parsed.database != "anomaly_db"):
+            broken.append((pw, parsed.password, parsed.host))
+    check(f"all {len(awkward)} awkward passwords round-trip intact",
+          not broken, f"broken: {broken}")
+
+    # The one that was actually wrong, and the reason this block exists.
+    # `quote_plus` encodes a space as `+`, which is right in a query string and
+    # wrong in userinfo, where `+` is a literal plus -- and SQLAlchemy decodes
+    # userinfo with `unquote`. So `pa ss` reached the server as `pa+ss`: a login
+    # failure, reported as a bad password, on a password that was correct.
+    spaced = make_url(DatabaseConfig(
+        host="h", port=1433, database="d", username="u",
+        password="pa ss").sqlalchemy_url())
+    check("a space in the password is not turned into a '+'",
+          spaced.password == "pa ss", repr(spaced.password))
+    check("and a literal '+' in the password is not turned into a space",
+          make_url(DatabaseConfig(
+              host="h", port=1433, database="d", username="u",
+              password="pa+ss").sqlalchemy_url()).password == "pa+ss")
+    check("while the driver name still uses the query-string convention",
+          "driver=ODBC+Driver+18+for+SQL+Server" in DatabaseConfig(
+              host="h", database="d", username="u",
+              password="p").sqlalchemy_url(),
+          "`+` for a space IS correct there, which is why both encoders are used")
+    check("a backslash in a domain login survives",
+          make_url(DatabaseConfig(
+              host="h", port=1433, database="d", username="PUB\\flotech",
+              password="p").sqlalchemy_url()).username == "PUB\\flotech")
+
+    print("\na space after the `=` in .env does not become part of the value")
+    # The client's own `.env`, written the way people write assignments:
+    #
+    #     DAS2_ALERT_TELEGRAM_CHAT_ID= -10012345678
+    #
+    # gave the chat id as ' -10012345678'. That passes every "is it configured?"
+    # test in this system, because it is not blank, and then Telegram answers
+    # `400 chat not found` -- which reads as the wrong chat, or the bot not being
+    # in the group, rather than one invisible character.
+    from das2.config import AlertConfig
+
+    saved_env = {k: os.environ.pop(k) for k in list(os.environ)
+                 if k.startswith(("DAS2_", "DAS_"))}
+    try:
+        os.environ["DAS2_ALERT_TELEGRAM_CHAT_ID"] = " -10012345678"
+        os.environ["DAS2_ALERT_TELEGRAM_TOKEN"] = \
+            "12345678:AAGvGJzhpDVYXnhSkd0JjdxnrzaimkHFLlU\n"
+        os.environ["DAS2_DATABASE_HOST"] = "  192.168.25.16  "
+        trimmed = Config.load()
+    finally:
+        for k in list(os.environ):
+            if k.startswith(("DAS2_", "DAS_")):
+                del os.environ[k]
+        os.environ.update(saved_env)
+
+    check("a leading space on the chat id is trimmed",
+          trimmed.alert.telegram_chat_id == "-10012345678",
+          repr(trimmed.alert.telegram_chat_id))
+    check("a trailing newline on the token is trimmed too",
+          trimmed.alert.telegram_token.endswith("HFLlU"),
+          "which is what pasting out of a chat window produces")
+    check("and the same applies to every other setting",
+          trimmed.database.host == "192.168.25.16",
+          repr(trimmed.database.host))
+    check("so the client's own .env now validates clean",
+          trimmed.alert.telegram_problems() == [],
+          "DAS2_ALERT_TELEGRAM_CHAT_ID= -10012345678 was the real line")
+
+    print("\n  and a malformed credential is named before the network is touched")
+    good_token = "12345678:AAGvGJzhpDVYXnhSkd0JjdxnrzaimkHFLlU"
+    cases = [
+        ("an @name instead of a number", "@mychannel", good_token, "NUMERIC"),
+        ("a space inside the chat id", "-100 123", good_token, "space"),
+        ("a chat id that is not a number", "abc", good_token, "not a number"),
+        ("a token with no colon", "-100123", "12345678", "no ':'"),
+        ("a token pasted with a line break", "-100123",
+         "12345678:AAG with space xxxxxxxxxxxxxxxxxxxxxxx", "space or newline"),
+        ("a truncated token", "-100123", "12345678:AAGvGJ", "not shaped like"),
+    ]
+    for label, chat, token, expect in cases:
+        problems = AlertConfig(telegram_token=token,
+                               telegram_chat_id=chat).telegram_problems()
+        check(label, bool(problems) and expect in problems[0],
+              problems[0][:70] if problems else "no problem reported")
+
+    ok_pair = AlertConfig(telegram_token=good_token,
+                          telegram_chat_id="-10012345678")
+    check("a correct pair is left alone", ok_pair.telegram_problems() == [],
+          "the shape check must not become one more thing to fight")
+    check("and an unset pair says which variables to set",
+          len(AlertConfig().telegram_problems()) == 2)
+
     print("\nno configuration at all is reported as that, not as a network fault")
     # The real failure on the client's box, and the reason this section exists.
     # With no environment, DAS2_DATABASE_HOST is "" and sqlalchemy_url() builds

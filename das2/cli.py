@@ -327,9 +327,19 @@ def cmd_check(config: Config, args) -> int:
                       "run instead of in four weeks.")
 
     print("\nTelegram")
-    if not config.alert.telegram_token or not config.alert.telegram_chat_id:
-        report("credentials configured", False,
-               "set DAS2_ALERT_TELEGRAM_TOKEN and DAS2_ALERT_TELEGRAM_CHAT_ID")
+    # Shape-checked before the network is touched, because every way these go
+    # wrong fails late and misleadingly: a stray character in the token gets
+    # `401 Unauthorized` ("the bot was deleted") and one in the chat id gets
+    # `400 chat not found` ("wrong chat"). Both really mean "look at your .env".
+    problems = config.alert.telegram_problems()
+    if problems:
+        report("credentials look right", False, problems[0])
+        for extra in problems[1:]:
+            print(f"         also: {extra}")
+        print("         Expected form, with NO space after the '=':")
+        print("           DAS2_ALERT_TELEGRAM_TOKEN=12345678:AAGvGJzhpDVYXn"
+              "hSkd0JjdxnrzaimkHFLlU")
+        print("           DAS2_ALERT_TELEGRAM_CHAT_ID=-10012345678")
     else:
         from das2.alerting.telegram import TelegramClient, TelegramConfig
         client = TelegramClient(TelegramConfig(
@@ -567,6 +577,15 @@ def cmd_run(config: Config, args) -> int:
         return 0
 
     from das2.alerting.telegram import TelegramConfig, send_report, send_run
+
+    # Said once, here, before the attempt. A malformed token or chat id fails
+    # inside the Telegram call with `401 Unauthorized` or `chat not found`, which
+    # name the wrong cause -- and a run whose analysis was fine but whose alert
+    # went nowhere is the worst outcome this system has, because nothing about it
+    # looks like a failure.
+    for problem in config.alert.telegram_problems():
+        log.error("Telegram credentials: %s", problem)
+
     telegram = TelegramConfig(token=config.alert.telegram_token,
                               chat_id=config.alert.telegram_chat_id,
                               enabled=config.alert.enabled)
