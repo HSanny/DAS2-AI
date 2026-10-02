@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import String, Text, bindparam, create_engine, text
 from sqlalchemy.engine import Engine
 
 from das2.models import (
@@ -442,10 +442,87 @@ def _py_dt(value):
     return to_pydatetime() if callable(to_pydatetime) else value
 
 
+#: Rows per round trip. Matches `save_readings`, for the same reason: pyodbc
+#: packs an executemany into parameter arrays, and the array has to fit in
+#: memory on both ends.
+WRITE_CHUNK = 1000
+
+#: Columns wide enough that the driver must be told their type.
+#:
+#: With `fast_executemany` on, pyodbc sizes a string parameter from what it
+#: infers for the batch rather than from the column, and a batch whose first row
+#: carries a 200-character narrative followed by a row carrying 4,000 characters
+#: is the documented way to get "String data, right truncation" -- or, worse, a
+#: silently shortened value. Declaring the type makes SQLAlchemy emit
+#: `setinputsizes`, so the driver sizes the parameter from the schema instead of
+#: from the first row it happens to see.
+#:
+#: Only the wide ones are listed. Keys, timestamps and floats are fixed-width
+#: and infer correctly.
+_WIDE_TEXT = {
+    "signals_json": Text(),
+    "detail": Text(),
+    "narrative": Text(),
+    "notes": Text(),
+    "recommendation": String(500),
+    "equipment_types": String(400),
+}
+
+
+def _typed(sql: str):
+    """A statement with its wide text parameters typed. See `_WIDE_TEXT`."""
+    stmt = text(sql)
+    present = {name: type_ for name, type_ in _WIDE_TEXT.items()
+               if f":{name}" in sql}
+    if present:
+        stmt = stmt.bindparams(*(bindparam(name, type_=type_)
+                                 for name, type_ in present.items()))
+    return stmt
+
+
+def _write_many(conn, sql: str, rows: list[dict], *,
+                chunk: int = WRITE_CHUNK) -> None:
+    """
+    Execute one statement over many rows, in as few round trips as possible.
+
+    This is the whole fix for the persistence speed. `save_run` used to call
+    `conn.execute` once per anomaly, once per incident member and once per
+    incident event, which on the client's run was about 3,500 statements and
+    3,500 network round trips to SQL Server: 12 minutes 45 seconds, roughly
+    4.6 rows a second. The readings path in the same run wrote 659,006 rows in
+    2 minutes 1 second -- 5,450 a second, to the same database over the same
+    link -- because it hands the driver a list and lets it batch.
+
+    The per-row fallback is not decoration. `fast_executemany` has real driver
+    quirks around parameter typing, and the typed binds above address the one
+    that bites hardest, but a run that fails to record what it found is worse
+    than a run that records it slowly. A batch that raises is retried row by
+    row, and the loss is speed with a line in the log, not the run.
+    """
+    if not rows:
+        return
+    for start in range(0, len(rows), chunk):
+        batch = rows[start:start + chunk]
+        stmt = _typed(sql)
+        try:
+            conn.execute(stmt, batch)
+        except Exception as exc:                              # noqa: BLE001
+            log.warning("batched write of %d row(s) failed (%s); "
+                        "falling back to row-by-row",
+                        len(batch), str(exc)[:160])
+            for row in batch:
+                conn.execute(stmt, row)
+
+
 def save_run(engine: Engine, result, *, detector_version: str = "das2") -> None:
-    """Persist one run: the run row, its anomalies, its incidents and members."""
+    """
+    Persist one run: the run row, its anomalies, its incidents and members.
+
+    Every statement below is executed over a LIST of rows rather than once per
+    row -- see `_write_many` for the measurement that motivated it.
+    """
     with engine.begin() as conn:
-        conn.execute(text("""
+        conn.execute(_typed("""
             INSERT INTO das2_detection_run
               (run_id, started_at, finished_at, window_start, window_end,
                sensors_analysed, anomalies_found, incidents_open,
@@ -473,19 +550,11 @@ def save_run(engine: Engine, result, *, detector_version: str = "das2") -> None:
         })
 
         anomaly_ids: dict[str, str] = {}
+        anomaly_rows: list[dict] = []
         for anomaly in result.anomalies:
             aid = _uid()
             anomaly_ids[f"{anomaly.sensor.sensor_key}|{anomaly.start.isoformat()}"] = aid
-            conn.execute(text("""
-                INSERT INTO das2_sensor_anomaly
-                  (anomaly_id, run_id, sensor_key, start_ts, end_ts, dominant_type,
-                   deviation, deviation_unit, span_fraction, duration_s,
-                   window_fraction, severity_score, signals_json)
-                VALUES
-                  (:anomaly_id, :run_id, :sensor_key, :start_ts, :end_ts, :dominant_type,
-                   :deviation, :deviation_unit, :span_fraction, :duration_s,
-                   :window_fraction, :severity_score, :signals_json)
-            """), {
+            anomaly_rows.append({
                 "anomaly_id": aid,
                 "run_id": result.run_id,
                 "sensor_key": anomaly.sensor.sensor_key,
@@ -505,24 +574,29 @@ def save_run(engine: Engine, result, *, detector_version: str = "das2") -> None:
                       "n_points": s.n_points, "detail": s.detail}
                      for s in anomaly.signals], default=str),
             })
+        _write_many(conn, """
+            INSERT INTO das2_sensor_anomaly
+              (anomaly_id, run_id, sensor_key, start_ts, end_ts, dominant_type,
+               deviation, deviation_unit, span_fraction, duration_s,
+               window_fraction, severity_score, signals_json)
+            VALUES
+              (:anomaly_id, :run_id, :sensor_key, :start_ts, :end_ts, :dominant_type,
+               :deviation, :deviation_unit, :span_fraction, :duration_s,
+               :window_fraction, :severity_score, :signals_json)
+        """, anomaly_rows)
 
+        _upsert_incidents(conn, result.incidents)
+
+        member_keys: list[dict] = []
+        member_rows: list[dict] = []
+        event_rows: list[dict] = []
+        now = datetime.now()
         for incident in result.incidents:
-            _upsert_incident(conn, incident)
             for member in incident.cluster.members:
                 key = f"{member.sensor.sensor_key}|{member.start.isoformat()}"
-                conn.execute(text("""
-                    DELETE FROM das2_incident_member
-                     WHERE incident_id = :incident_id AND sensor_key = :sensor_key
-                """), {"incident_id": incident.incident_id,
-                       "sensor_key": member.sensor.sensor_key})
-                conn.execute(text("""
-                    INSERT INTO das2_incident_member
-                      (incident_id, sensor_key, anomaly_id, first_seen_at,
-                       last_seen_at, contribution)
-                    VALUES
-                      (:incident_id, :sensor_key, :anomaly_id, :first_seen_at,
-                       :last_seen_at, :contribution)
-                """), {
+                member_keys.append({"incident_id": incident.incident_id,
+                                    "sensor_key": member.sensor.sensor_key})
+                member_rows.append({
                     "incident_id": incident.incident_id,
                     "sensor_key": member.sensor.sensor_key,
                     "anomaly_id": anomaly_ids.get(key),
@@ -530,37 +604,47 @@ def save_run(engine: Engine, result, *, detector_version: str = "das2") -> None:
                     "last_seen_at": _py_dt(member.end),
                     "contribution": member.score,
                 })
-
-            conn.execute(text("""
-                INSERT INTO das2_incident_event
-                  (event_id, incident_id, ts, event_type, detail)
-                VALUES (:event_id, :incident_id, :ts, :event_type, :detail)
-            """), {
+            event_rows.append({
                 "event_id": _uid(),
                 "incident_id": incident.incident_id,
-                "ts": datetime.now(),
+                "ts": now,
                 "event_type": incident.status.value.lower(),
                 "detail": fit_json(incident.detail, DETAIL_LIMIT,
                                    keep=("evidence", "signature",
                                          "rain_evidence")),
             })
 
-    log.info("run %s persisted: %d anomalies, %d incidents",
-             result.run_id, len(result.anomalies), len(result.incidents))
+        # Delete every membership first, then insert every membership. Phased
+        # rather than interleaved per member, which is what lets each phase be
+        # one batch -- and it is safe because the two sets are identical: a row
+        # deleted here is a row re-inserted below.
+        _write_many(conn, """
+            DELETE FROM das2_incident_member
+             WHERE incident_id = :incident_id AND sensor_key = :sensor_key
+        """, member_keys)
+        _write_many(conn, """
+            INSERT INTO das2_incident_member
+              (incident_id, sensor_key, anomaly_id, first_seen_at,
+               last_seen_at, contribution)
+            VALUES
+              (:incident_id, :sensor_key, :anomaly_id, :first_seen_at,
+               :last_seen_at, :contribution)
+        """, member_rows)
+        _write_many(conn, """
+            INSERT INTO das2_incident_event
+              (event_id, incident_id, ts, event_type, detail)
+            VALUES (:event_id, :incident_id, :ts, :event_type, :detail)
+        """, event_rows)
+
+    log.info("run %s persisted: %d anomalies, %d incidents, "
+             "%d member row(s)",
+             result.run_id, len(result.anomalies), len(result.incidents),
+             len(member_rows))
 
 
-def _upsert_incident(conn, incident: Incident) -> None:
-    """
-    Insert or update one incident, preserving its acknowledgement.
-
-    Written as delete-then-insert of the mutable columns rather than a MERGE,
-    because MERGE syntax differs between SQL Server and SQLite and this code
-    has to run identically on both. The ack columns are deliberately NOT
-    overwritten on update: an operator who acknowledged an incident an hour ago
-    must not be re-paged because the severity moved by a point.
-    """
+def _incident_params(incident: Incident) -> dict:
     c = incident.cluster
-    params = {
+    return {
         "incident_id": incident.incident_id,
         "incident_class": incident.incident_class.value,
         "status": incident.status.value,
@@ -581,12 +665,48 @@ def _upsert_incident(conn, incident: Incident) -> None:
         "last_seen_at": _py_dt(incident.last_seen_at),
         "resolved_at": _py_dt(incident.resolved_at),
     }
-    existing = conn.execute(
-        text("SELECT incident_id FROM das2_incident WHERE incident_id = :incident_id"),
-        {"incident_id": incident.incident_id}).fetchone()
 
-    if existing:
-        conn.execute(text("""
+
+def _upsert_incidents(conn, incidents) -> None:
+    """
+    Insert or update a run's incidents, preserving their acknowledgements.
+
+    Update-or-insert rather than a MERGE, because MERGE syntax differs between
+    SQL Server and SQLite and this code has to run identically on both. The ack
+    columns are deliberately NOT overwritten on update: an operator who
+    acknowledged an incident an hour ago must not be re-paged because the
+    severity moved by a point.
+
+    Which incidents already exist is answered in ONE query over the whole run
+    rather than one per incident. That matters more than it looks: the SELECT
+    was the only statement here that had to come back before the next could be
+    sent, so on the client's run it was 97 serial round trips before a single
+    row was written.
+    """
+    incidents = list(incidents)
+    if not incidents:
+        return
+
+    ids = [i.incident_id for i in incidents]
+    existing: set[str] = set()
+    # Chunked because an IN list is parameterised, and SQL Server rejects a
+    # statement with more than 2,100 parameters -- a limit a busy run reaches.
+    for start in range(0, len(ids), 500):
+        batch = ids[start:start + 500]
+        names = [f"id{n}" for n in range(len(batch))]
+        rows = conn.execute(
+            text("SELECT incident_id FROM das2_incident WHERE incident_id IN ("
+                 + ", ".join(f":{n}" for n in names) + ")"),
+            dict(zip(names, batch))).fetchall()
+        existing.update(str(r[0]) for r in rows)
+
+    updates = [_incident_params(i) for i in incidents
+               if i.incident_id in existing]
+    inserts = [_incident_params(i) for i in incidents
+               if i.incident_id not in existing]
+
+    if updates:
+        _write_many(conn, """
             UPDATE das2_incident SET
               incident_class = :incident_class, status = :status,
               severity = :severity, priority = :priority, region = :region,
@@ -598,9 +718,10 @@ def _upsert_incident(conn, incident: Incident) -> None:
               recommendation = :recommendation, last_seen_at = :last_seen_at,
               resolved_at = :resolved_at
             WHERE incident_id = :incident_id
-        """), params)
-    else:
-        conn.execute(text("""
+        """, updates)
+
+    if inserts:
+        _write_many(conn, """
             INSERT INTO das2_incident
               (incident_id, incident_class, status, severity, priority, region,
                centroid_lat, centroid_lon, radius_m, sensor_count, site_count,
@@ -611,7 +732,7 @@ def _upsert_incident(conn, incident: Incident) -> None:
                :centroid_lat, :centroid_lon, :radius_m, :sensor_count, :site_count,
                :equipment_types, :neighbour_correlation, :rainfall_mm, :narrative,
                :recommendation, :opened_at, :last_seen_at, :resolved_at, 'NONE')
-        """), params)
+        """, inserts)
 
 
 # --------------------------------------------------------------------------- #
@@ -788,50 +909,71 @@ def already_delivered(engine: Engine, incident_id: str, payload: str,
 
 
 def upsert_sensors(engine: Engine, sensors) -> int:
-    """Refresh the sensor inventory. Cheap, and keeps the DB self-describing."""
-    written = 0
+    """
+    Refresh the sensor inventory. Keeps the DB self-describing.
+
+    Batched, like `save_run` and `save_baselines`, and this one runs on EVERY
+    run rather than once a day: a row-per-statement version is three statements
+    per sensor -- a SELECT that has to come back before either write can be
+    sent, then an UPDATE or an INSERT -- which on the 2,672 analysed sensors is
+    about 8,000 serial round trips to do a job whose answer barely changes
+    between runs.
+    """
+    rows: list[dict] = []
+    for _, row in sensors.iterrows():
+        rows.append({
+            "sensor_key": str(row["sensor_key"]),
+            "description": str(row.get("description") or "")[:400],
+            "equipment": str(row.get("equipment") or "")[:64],
+            "signal_type": str(row.get("signal_type") or "")[:16],
+            "kind": str(row.get("kind") or "")[:16],
+            "unit": str(row.get("unit") or "")[:32],
+            "rtu_number": _str_or_none(row.get("rtu_number")),
+            "site": _str_or_none(row.get("site")),
+            "latitude": _float_or_none(row.get("latitude")),
+            "longitude": _float_or_none(row.get("longitude")),
+            "region": _str_or_none(row.get("region")),
+            "planning_area": _str_or_none(row.get("planning_area")),
+            "alertable": 1 if row.get("alertable", True) else 0,
+        })
+
+    if not rows:
+        return 0
+
     with engine.begin() as conn:
-        for _, row in sensors.iterrows():
-            params = {
-                "sensor_key": str(row["sensor_key"]),
-                "description": str(row.get("description") or "")[:400],
-                "equipment": str(row.get("equipment") or "")[:64],
-                "signal_type": str(row.get("signal_type") or "")[:16],
-                "kind": str(row.get("kind") or "")[:16],
-                "unit": str(row.get("unit") or "")[:32],
-                "rtu_number": _str_or_none(row.get("rtu_number")),
-                "site": _str_or_none(row.get("site")),
-                "latitude": _float_or_none(row.get("latitude")),
-                "longitude": _float_or_none(row.get("longitude")),
-                "region": _str_or_none(row.get("region")),
-                "planning_area": _str_or_none(row.get("planning_area")),
-                "alertable": 1 if row.get("alertable", True) else 0,
-            }
-            exists = conn.execute(
-                text("SELECT 1 FROM das2_sensor WHERE sensor_key = :sensor_key"),
-                {"sensor_key": params["sensor_key"]}).fetchone()
-            if exists:
-                conn.execute(text("""
-                    UPDATE das2_sensor SET description=:description,
-                      equipment=:equipment, signal_type=:signal_type, kind=:kind,
-                      unit=:unit, rtu_number=:rtu_number, site=:site,
-                      latitude=:latitude, longitude=:longitude, region=:region,
-                      planning_area=:planning_area, alertable=:alertable
-                     WHERE sensor_key=:sensor_key
-                """), params)
-            else:
-                conn.execute(text("""
-                    INSERT INTO das2_sensor
-                      (sensor_key, description, equipment, signal_type, kind, unit,
-                       rtu_number, site, latitude, longitude, region,
-                       planning_area, alertable)
-                    VALUES
-                      (:sensor_key, :description, :equipment, :signal_type, :kind,
-                       :unit, :rtu_number, :site, :latitude, :longitude, :region,
-                       :planning_area, :alertable)
-                """), params)
-            written += 1
-    return written
+        # Which keys are already there, in one query per 500 rather than one per
+        # sensor. Chunked because an IN list is parameterised and SQL Server
+        # caps a statement at 2,100 parameters.
+        existing: set[str] = set()
+        keys = [r["sensor_key"] for r in rows]
+        for start in range(0, len(keys), 500):
+            batch = keys[start:start + 500]
+            names = [f"k{n}" for n in range(len(batch))]
+            found = conn.execute(
+                text("SELECT sensor_key FROM das2_sensor WHERE sensor_key IN ("
+                     + ", ".join(f":{n}" for n in names) + ")"),
+                dict(zip(names, batch))).fetchall()
+            existing.update(str(r[0]) for r in found)
+
+        _write_many(conn, """
+            UPDATE das2_sensor SET description=:description,
+              equipment=:equipment, signal_type=:signal_type, kind=:kind,
+              unit=:unit, rtu_number=:rtu_number, site=:site,
+              latitude=:latitude, longitude=:longitude, region=:region,
+              planning_area=:planning_area, alertable=:alertable
+             WHERE sensor_key=:sensor_key
+        """, [r for r in rows if r["sensor_key"] in existing])
+        _write_many(conn, """
+            INSERT INTO das2_sensor
+              (sensor_key, description, equipment, signal_type, kind, unit,
+               rtu_number, site, latitude, longitude, region,
+               planning_area, alertable)
+            VALUES
+              (:sensor_key, :description, :equipment, :signal_type, :kind,
+               :unit, :rtu_number, :site, :latitude, :longitude, :region,
+               :planning_area, :alertable)
+        """, [r for r in rows if r["sensor_key"] not in existing])
+    return len(rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -1026,31 +1168,45 @@ def save_baselines(engine: Engine, baselines) -> int:
     Replace rather than merge: the daily job recomputes each sensor's whole
     table from the full history window, so a merge would leave buckets behind
     from a period that is no longer in scope and quietly age the baseline.
+
+    Batched, and this is the largest instance of the per-row write that cost
+    `save_run` thirteen minutes. A sensor's profile is up to 96 buckets x
+    weekday/weekend = 192 rows, so the full fleet is 2,672 x 192 = **513,024
+    rows**. One statement each, at the 4.6 rows/sec this database was measured
+    at over this link, is **31 hours** -- a daily job that cannot finish in a
+    day, and which would have been found only by someone watching it not
+    finish.
     """
-    written = 0
+    deletes = []
+    rows: list[dict] = []
+    now = datetime.now()
+    for baseline in baselines.values():
+        batch = baseline.as_rows()
+        if not batch:
+            continue
+        deletes.append({"sensor_key": baseline.sensor_key})
+        for row in batch:
+            row["updated_at"] = now
+            row["days_observed"] = baseline.days_observed
+            rows.append(row)
+
+    if not rows:
+        return 0
+
     with engine.begin() as conn:
-        for baseline in baselines.values():
-            rows = baseline.as_rows()
-            if not rows:
-                continue
-            conn.execute(text("DELETE FROM das2_sensor_profile "
-                              "WHERE sensor_key = :sensor_key"),
-                         {"sensor_key": baseline.sensor_key})
-            for row in rows:
-                row["updated_at"] = datetime.now()
-                row["days_observed"] = baseline.days_observed
-                conn.execute(text("""
-                    INSERT INTO das2_sensor_profile
-                      (sensor_key, bucket_of_day, is_weekend, median_value,
-                       mad_value, n_samples, updated_at, days_observed)
-                    VALUES
-                      (:sensor_key, :bucket_of_day, :is_weekend, :median_value,
-                       :mad_value, :n_samples, :updated_at, :days_observed)
-                """), row)
-                written += 1
+        _write_many(conn, "DELETE FROM das2_sensor_profile "
+                          "WHERE sensor_key = :sensor_key", deletes)
+        _write_many(conn, """
+            INSERT INTO das2_sensor_profile
+              (sensor_key, bucket_of_day, is_weekend, median_value,
+               mad_value, n_samples, updated_at, days_observed)
+            VALUES
+              (:sensor_key, :bucket_of_day, :is_weekend, :median_value,
+               :mad_value, :n_samples, :updated_at, :days_observed)
+        """, rows)
     log.info("stored %d baseline bucket(s) for %d sensor(s)",
-             written, len(baselines))
-    return written
+             len(rows), len(baselines))
+    return len(rows)
 
 
 def load_baselines(engine: Engine) -> dict:
@@ -1146,101 +1302,154 @@ def load_history(engine: Engine, days: int = 28, *,
     return pd.DataFrame(columns=["sensor_key", "ts", "value"])
 
 
-def prune_readings(engine: Engine, retention_days: int) -> int:
-    """
-    Drop readings older than the retention window.
+#: Sensors per history batch for the daily job.
+#:
+#: 250 x 28 days x 120 s is about 5 million rows in flight, a few hundred MB in
+#: pandas. The fleet is 2,672 sensors, so this is roughly eleven batches.
+HISTORY_SENSOR_BATCH = 250
 
-    Without this the table grows without bound: months x 2,672 sensors x 120 s
-    is on the order of 10^8 rows, and an operations database quietly filling up
-    is the sort of failure that takes the monitoring down along with it.
 
-    The retention window has to stay comfortably above what the profile job
-    wants -- it reads 28 days -- so pruning below that would silently disable
-    DRIFT and the baselines. Returns the number of rows removed.
-    """
-    if retention_days <= 0:
-        return 0
-    cutoff = datetime.now() - timedelta(days=retention_days)
+def history_span_days(engine: Engine, table: str, days: int) -> float:
+    """How many days of history `table` holds inside the window. 0.0 if none."""
+    cutoff = datetime.now() - timedelta(days=days)
     try:
-        with engine.begin() as conn:
-            result = conn.execute(
-                text("DELETE FROM das2_reading WHERE ts < :cutoff"),
-                {"cutoff": cutoff})
-            removed = int(result.rowcount or 0)
-    except Exception as exc:                              # noqa: BLE001
-        log.warning("could not prune das2_reading: %s", str(exc)[:160])
-        return 0
-    if removed:
-        log.info("pruned %d reading(s) older than %d days", removed, retention_days)
-    return removed
+        with engine.connect() as conn:
+            lo, hi = conn.execute(
+                text(f"SELECT MIN(ts), MAX(ts) FROM {table} "
+                     f"WHERE ts >= :cutoff"),
+                {"cutoff": cutoff}).fetchone()
+    except Exception as exc:                                  # noqa: BLE001
+        log.info("history not available from %s (%s)", table, str(exc)[:100])
+        return 0.0
+    lo, hi = _as_datetime(lo), _as_datetime(hi)
+    if lo is None or hi is None:
+        return 0.0
+    return max(0.0, (hi - lo).total_seconds() / 86400.0)
 
 
-def save_baselines(engine: Engine, baselines) -> int:
+def history_sensors(engine: Engine, days: int = 28, *,
+                    fallback_table: str = "") -> tuple[list[str], str]:
     """
-    Replace the stored time-of-day profiles.
+    Which sensors have history in the window, and which table it came from.
 
-    Replace rather than merge: the daily job recomputes each sensor's whole
-    table from the full history window, so a merge would leave buckets behind
-    from a period that is no longer in scope and quietly age the baseline.
+    Answered with a `SELECT DISTINCT` so the row count never reaches this
+    process. Returns `([], "")` when there is no history at all.
+
+    When a fallback table is configured, the table with the LONGER history wins
+    rather than `das2_reading` simply winning whenever it is non-empty. That
+    ordering mattered: `das2_reading` holds whatever the runs so far have
+    written, so one run is enough to make it non-empty -- and then an older
+    readings table holding months of history was never consulted again. The
+    effect was that DRIFT, which needs 14 days, waited a fortnight on a
+    database that already had the data, with nothing to say why.
+
+    A fallback is only ever consulted because the operator pointed
+    DAS2_DATABASE_HISTORY_FALLBACK_TABLE at it, so preferring it when it knows
+    more is doing what they asked rather than reaching somewhere unexpected.
     """
-    written = 0
-    with engine.begin() as conn:
-        for baseline in baselines.values():
-            rows = baseline.as_rows()
-            if not rows:
-                continue
-            conn.execute(text("DELETE FROM das2_sensor_profile "
-                              "WHERE sensor_key = :sensor_key"),
-                         {"sensor_key": baseline.sensor_key})
-            for row in rows:
-                row["updated_at"] = datetime.now()
-                row["days_observed"] = baseline.days_observed
-                conn.execute(text("""
-                    INSERT INTO das2_sensor_profile
-                      (sensor_key, bucket_of_day, is_weekend, median_value,
-                       mad_value, n_samples, updated_at, days_observed)
-                    VALUES
-                      (:sensor_key, :bucket_of_day, :is_weekend, :median_value,
-                       :mad_value, :n_samples, :updated_at, :days_observed)
-                """), row)
-                written += 1
-    log.info("stored %d baseline bucket(s) for %d sensor(s)",
-             written, len(baselines))
-    return written
+    candidates = ["das2_reading"] + ([fallback_table] if fallback_table else [])
+    if len(candidates) > 1:
+        spans = {t: history_span_days(engine, t, days) for t in candidates}
+        candidates.sort(key=lambda t: -spans[t])
+        if spans[candidates[0]] > 0:
+            log.info("history sources: %s — reading from %s",
+                     ", ".join(f"{t} {spans[t]:.0f}d" for t in spans),
+                     candidates[0])
 
-
-def load_baselines(engine: Engine) -> dict:
-    """
-    Stored time-of-day baselines, for the hourly run's L2 layer.
-
-    Returns an empty dict when the daily job has not run. The L2 detector
-    abstains on that rather than inventing a baseline from the current window,
-    which is the behaviour that made the incumbent's rolling median unable to
-    see any excursion longer than its own window.
-    """
-    from das2.profile.build import TimeOfDayBaseline
-
-    out: dict[str, TimeOfDayBaseline] = {}
-    with engine.connect() as conn:
+    for table in candidates:
         try:
-            rows = conn.execute(text("""
-                SELECT sensor_key, bucket_of_day, is_weekend, median_value,
-                       mad_value, n_samples, days_observed
-                  FROM das2_sensor_profile
-            """)).mappings().all()
-        except Exception as exc:                          # noqa: BLE001
-            log.warning("could not read stored baselines: %s", exc)
-            return {}
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text(f"SELECT DISTINCT sensor_key FROM {table} "
+                         f"WHERE ts >= :cutoff"),
+                    {"cutoff": datetime.now() - timedelta(days=days)}).fetchall()
+            keys = sorted({str(r[0]) for r in rows if r[0] is not None})
+            if keys:
+                return keys, table
+        except Exception as exc:                              # noqa: BLE001
+            log.info("history not available from %s (%s)", table, str(exc)[:100])
+    return [], ""
 
-    for row in rows:
-        key = str(row["sensor_key"])
-        baseline = out.setdefault(key, TimeOfDayBaseline(sensor_key=key))
-        baseline.days_observed = max(baseline.days_observed,
-                                     int(row["days_observed"] or 0))
-        baseline.buckets[(int(row["bucket_of_day"]), int(row["is_weekend"]))] = (
-            float(row["median_value"] or 0.0),
-            float(row["mad_value"] or 0.0),
-            int(row["n_samples"] or 0),
-        )
-    log.info("loaded time-of-day baselines for %d sensor(s)", len(out))
-    return out
+
+def iter_history(engine: Engine, days: int = 28, *,
+                 fallback_table: str = "",
+                 batch_sensors: int = HISTORY_SENSOR_BATCH):
+    """
+    The same history as `load_history`, a batch of sensors at a time.
+
+    This is what makes the daily job survivable at fleet scale, and the module
+    it feeds says so in its own docstring: *"Months x 2,672 sensors x 120 s is
+    on the order of 10^8 rows... the functions here take a per-sensor frame so
+    they can be driven straight from a server-side GROUP BY rather than pulling
+    the fleet into pandas."* `load_history` did exactly what that warns
+    against -- one `SELECT` of the whole window into one frame -- which is fine
+    on the fixture and is tens of gigabytes on the real estate.
+
+    Batching by SENSOR rather than by time, because every statistic the job
+    computes is per-sensor and needs that sensor's whole history at once: a
+    28-day Theil-Sen slope cannot be assembled from one day at a time, and a
+    time-of-day bucket needs every day's visit to it. Splitting by sensor is
+    the only axis along which the arithmetic is unchanged.
+
+    Yields `(frame, batch_number, total_batches)`. Yields nothing at all when
+    there is no history, which the caller must treat as the fresh-install state
+    rather than as a failure.
+    """
+    import pandas as pd
+
+    keys, table = history_sensors(engine, days, fallback_table=fallback_table)
+    if not keys:
+        return
+
+    cutoff = datetime.now() - timedelta(days=days)
+    total = (len(keys) + batch_sensors - 1) // batch_sensors
+    for n, start in enumerate(range(0, len(keys), batch_sensors), start=1):
+        batch = keys[start:start + batch_sensors]
+        # Named parameters rather than an expanding IN clause: SQL Server caps a
+        # statement at 2,100 parameters, and the batch size has to stay clear of
+        # it. At 250 sensors plus the cutoff there is room to spare.
+        names = [f"k{i}" for i in range(len(batch))]
+        sql = (f"SELECT sensor_key, ts, value FROM {table} "
+               f"WHERE ts >= :cutoff AND sensor_key IN ("
+               + ", ".join(f":{name}" for name in names) + ")")
+        params = {"cutoff": cutoff}
+        params.update(zip(names, batch))
+        with engine.connect() as conn:
+            frame = pd.read_sql(text(sql), conn, params=params)
+        if frame.empty:
+            continue
+        # format="mixed" is required, not merely tidy -- see `load_history`.
+        frame["ts"] = pd.to_datetime(frame["ts"], format="mixed",
+                                     errors="coerce")
+        frame = frame.dropna(subset=["ts"])
+        frame["sensor_key"] = frame["sensor_key"].astype(str)
+        if frame.empty:
+            continue
+        log.info("history batch %d/%d: %d row(s), %d sensor(s) from %s",
+                 n, total, len(frame), frame["sensor_key"].nunique(), table)
+        yield frame, n, total
+
+
+def baseline_age_hours(engine: Engine) -> float | None:
+    """
+    How long since the daily profile job last wrote anything, in hours.
+
+    `None` means it has never run. This exists so the hourly run can notice
+    that for itself: on the client's deployment the profile job was documented,
+    containerised and never scheduled, so `baselines: {'sensors': 0}` appeared
+    in every run log and DRIFT, NOISE_BURST and RESIDUAL_OUTLIER -- the whole
+    "anticipate the sensor going bad" family -- silently produced nothing for
+    weeks. A dependency that fails by being quiet needs to be checked by the
+    thing that depends on it, not by a line in a compose file.
+    """
+    try:
+        with engine.connect() as conn:
+            newest = conn.execute(
+                text("SELECT MAX(updated_at) FROM das2_sensor_profile")).scalar()
+    except Exception as exc:                                  # noqa: BLE001
+        log.debug("could not read the baseline age (%s)", str(exc)[:120])
+        return None
+    newest = _as_datetime(newest)
+    if newest is None:
+        return None
+    return max(0.0, (datetime.now() - newest).total_seconds() / 3600.0)

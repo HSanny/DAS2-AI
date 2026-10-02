@@ -262,11 +262,14 @@ Or paste `tools/reset_das2.sql` into SSMS and then re-run `das2-migrate`.
 `dateDim`, `alarmevent`, `abnormal_sensor_history`), and there is one concrete
 reason to keep `dbo.data` in particular:
 
-> The daily profile job reads `das2_reading` first and **falls back to
-> `dbo.data`**. `das2_reading` starts empty, so on a fresh install that
-> fallback is the only thing that gives you 28 days of history on day one.
-> Drop it and `DRIFT`, `NOISE_BURST` and the time-of-day baselines produce
-> nothing for four weeks while `das2_reading` fills up.
+> The daily profile job reads `das2_reading` first, and can **fall back to
+> `dbo.data`** if you point `DAS2_DATABASE_HISTORY_FALLBACK_TABLE` at it.
+> `das2_reading` starts empty, so on a fresh install that fallback is the only
+> thing that gives you 28 days of history on day one. Without it, `DRIFT`,
+> `NOISE_BURST` and the time-of-day baselines produce nothing for four weeks
+> while `das2_reading` fills up — and those three are exactly the
+> *"anticipate the sensor going bad"* family. `das2-check` now says which
+> state you are in.
 
 Keeping them also lets both systems run side by side, which is what any
 comparison between old and new needs. Nothing in `das2` writes to them.
@@ -617,31 +620,36 @@ Also working: full-coverage classification · per-sensor profiles · typed fusio
 triage and recommendations · per-region alert budgets · rain context from your
 own gauges · dashboard · charts · Telegram with acknowledgement · persistence.
 
-### The daily job — set this up, it is not optional
+### The daily job — now runs itself
 
-Two detectors and the whole L2 baseline layer depend on it:
+Two detectors and the whole L2 baseline layer depend on it: `DRIFT`,
+`NOISE_BURST` and `RESIDUAL_OUTLIER`. **You no longer have to schedule it.**
+
+The run checks how old the stored baselines are and rebuilds them when they are
+over 30 hours old, so the work happens about once a day inside whichever run
+first notices. That costs that one run a few extra minutes and nothing else; the
+window is 72 hours, so nothing is missed.
+
+This changed because the old arrangement failed quietly on your deployment. The
+job was written, containerised and documented — and scheduling it was a sentence
+in a compose-file comment, so it never ran. Every run logged
+`baselines: {'sensors': 0, 'usable': 0}` and all three detectors produced
+nothing, for weeks, with no error anywhere.
+
+You can still run it by hand, and should if you want it now rather than within
+the next thirty hours:
 
 ```bash
-# Once a day. Add to cron, or Task Scheduler on Windows.
-docker compose run --rm das2 python -m das2.cli profile
+docker compose run --rm das2-profile
 ```
 
-It reads up to 28 days of history, builds each sensor's time-of-day baseline,
-and computes `DRIFT` and `NOISE_BURST`. Until it has run:
+If you prefer to drive it from your own cron or Task Scheduler, set
+`DAS2_BASELINE_AUTO_REFRESH=false` so the work is not done twice.
 
-* `RESIDUAL_OUTLIER` produces nothing — the hourly run says so in its
-  `baselines:` line rather than failing silently;
-* `DRIFT` and `NOISE_BURST` produce nothing.
-
-**It needs history to read, and it starts empty.** The hourly run writes every
-reading into `das2_reading` (`DAS2_DATABASE_STORE_READINGS=true`, on by
-default), so the store fills as the system runs. On a fresh install the first
-`das2 profile` will report *"No history yet"* — that is the expected state, not
-a failure, and it says so.
-
-Until enough days have accumulated, `DRIFT`, `NOISE_BURST` and the L2 baseline
-layer produce nothing, and the hourly run reports that in its `baselines:`
-line rather than falling silent.
+**It needs history to read, and `das2_reading` starts empty.** The hourly run
+writes every reading into it (`DAS2_DATABASE_STORE_READINGS=true`, on by
+default), so the store fills as the system runs. Until there are enough days,
+all three detectors produce nothing and `das2-check` says so in as many words.
 
 If you would rather learn from an existing readings table, point
 `DAS2_DATABASE_HISTORY_FALLBACK_TABLE` at it — it must expose `sensor_key`,

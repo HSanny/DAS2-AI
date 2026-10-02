@@ -163,6 +163,52 @@ def cmd_check(config: Config, args) -> int:
             except Exception:                              # noqa: BLE001
                 report("das2 tables present", False,
                        "run `python -m das2.cli migrate` first")
+
+        # The long-horizon detectors, and whether they can say anything yet.
+        #
+        # DRIFT, NOISE_BURST and RESIDUAL_OUTLIER are the "anticipate the sensor
+        # going bad" family, which is what this system is now scoped to find --
+        # and all three are silent until the profile job has history to learn
+        # from. On the client's deployment that was true for weeks and the only
+        # sign of it was one line of `baselines: {'sensors': 0}` in a run log.
+        # A pre-flight that does not mention it is a pre-flight that passes
+        # while three of the detectors cannot fire.
+        from das2.io.store import baseline_age_hours, history_sensors
+        from das2.profile.build import MIN_DAYS_DRIFT
+
+        age = baseline_age_hours(engine)
+        if age is None:
+            report("time-of-day baselines", False,
+                   "never built — DRIFT, NOISE_BURST and RESIDUAL_OUTLIER "
+                   "cannot fire. The hourly run now builds them itself once "
+                   "there is history; see below.")
+        else:
+            fresh = age < config.baseline.max_age_hours
+            report("time-of-day baselines", fresh,
+                   f"last built {age:.0f}h ago"
+                   + ("" if fresh else
+                      f" — over the {config.baseline.max_age_hours}h refresh "
+                      f"age; the next run will rebuild them"))
+
+        keys, table = history_sensors(engine,
+                                      days=config.baseline.profile_days,
+                                      fallback_table=config.database
+                                      .history_fallback_table)
+        if keys:
+            report("reading history to learn from", True,
+                   f"{len(keys)} sensor(s) in {table}")
+        else:
+            report("reading history to learn from", False,
+                   f"das2_reading is empty, so there is nothing to build a "
+                   f"baseline from yet. Each run adds to it; DRIFT needs "
+                   f"{MIN_DAYS_DRIFT} days.")
+            if not config.database.history_fallback_table:
+                print("         If an older readings table already holds "
+                      "months of history, point")
+                print("         DAS2_DATABASE_HISTORY_FALLBACK_TABLE at it "
+                      "(needs sensor_key, ts, value)")
+                print("         and the baselines are available on the next "
+                      "run instead of in four weeks.")
     except Exception as exc:                               # noqa: BLE001
         report("connection", False, str(exc)[:160])
 
@@ -197,6 +243,87 @@ def cmd_check(config: Config, args) -> int:
 
     print(f"\n{'All checks passed.' if ok else 'Some checks FAILED — see above.'}\n")
     return 0 if ok else 1
+
+
+def build_profiles(config: Config, engine, *, days: int | None = None,
+                   batch_sensors: int | None = None, report=None):
+    """
+    The daily job, driven a batch of sensors at a time.
+
+    Shared by `das2 profile` and by the staleness check in `das2 run`, so the
+    two cannot drift apart in what they compute or in what they store.
+
+    Batched because the whole-fleet read does not fit. 28 days x 2,672 sensors
+    x 120 s is on the order of 50 million rows; `load_history` pulled all of it
+    into one DataFrame, which is fine on the fixture and tens of gigabytes on
+    the real estate. `iter_history` hands over a few hundred sensors at a time
+    and the results are folded together -- see its docstring for why the split
+    is by sensor rather than by time.
+
+    Baselines are saved per batch rather than at the end. A job that dies two
+    thirds of the way through then leaves two thirds of the fleet with a fresh
+    baseline instead of none, and the next run picks up where it stopped.
+
+    Returns `(result, batches)`; `batches == 0` means there is no history yet,
+    which on a fresh install is the expected state and not a failure.
+    """
+    from das2.io.store import HISTORY_SENSOR_BATCH, iter_history, save_baselines
+    from das2.profile.build import PREFERRED_DAYS, ProfileJobResult, run_profile_job
+
+    days = days or config.baseline.profile_days or PREFERRED_DAYS
+    batch_sensors = batch_sensors or HISTORY_SENSOR_BATCH
+    units = {}
+    total = ProfileJobResult()
+    batches = 0
+
+    for frame, n, of in iter_history(
+            engine, days=days, batch_sensors=batch_sensors,
+            fallback_table=config.database.history_fallback_table):
+        batches += 1
+        batch_result = run_profile_job(frame, units=units)
+        save_baselines(engine, batch_result.baselines)
+        total.absorb(batch_result)
+        if report:
+            report(n, of, frame, batch_result)
+
+    return total, batches
+
+
+def _refresh_baselines_if_stale(config: Config, engine) -> None:
+    """
+    Run the daily job from inside the hourly run when it is overdue.
+
+    Guarded three ways, because a job that costs minutes must not be allowed to
+    run every hour: it is skipped when the baselines were written recently,
+    skipped when `baseline.auto_refresh` is off for an installation that drives
+    the job from its own scheduler, and never fatal -- a failure here costs the
+    L2 layer one more run, not the alert.
+    """
+    if not config.baseline.auto_refresh:
+        return
+    try:
+        from das2.io.store import baseline_age_hours
+
+        age = baseline_age_hours(engine)
+        if age is not None and age < config.baseline.max_age_hours:
+            log.info("time-of-day baselines are %.1fh old, under the %dh "
+                     "refresh age — not rebuilding", age,
+                     config.baseline.max_age_hours)
+            return
+
+        log.info("time-of-day baselines are %s — building them now",
+                 "missing" if age is None else f"{age:.0f}h old")
+        result, batches = build_profiles(config, engine)
+        if not batches:
+            log.info("no stored history yet, so there is nothing to build "
+                     "from. DRIFT, NOISE_BURST and RESIDUAL_OUTLIER will "
+                     "produce nothing until das2_reading has a few weeks in "
+                     "it; this run's `baselines:` line will say so.")
+            return
+        log.info("baselines rebuilt: %s", result.summary())
+    except Exception as exc:                                  # noqa: BLE001
+        log.warning("could not refresh the time-of-day baselines (%s) — "
+                    "carrying on with whatever is stored", str(exc)[:200])
 
 
 def cmd_run(config: Config, args) -> int:
@@ -243,6 +370,17 @@ def cmd_run(config: Config, args) -> int:
         except Exception as exc:                           # noqa: BLE001
             log.warning("could not load open incidents (%s) — "
                         "every incident will be treated as new", exc)
+        # Keep the baselines fresh without anybody remembering to.
+        #
+        # The daily profile job was written, containerised and documented, and
+        # then never scheduled -- so every run on the client's deployment logged
+        # `baselines: {'sensors': 0, 'usable': 0}` and DRIFT, NOISE_BURST and
+        # RESIDUAL_OUTLIER produced nothing for weeks. Those three are precisely
+        # the "anticipate the sensor going bad" family the system is now scoped
+        # to, so a silent dependency on an unscheduled cron is not acceptable:
+        # the run that needs the baselines checks them itself.
+        _refresh_baselines_if_stale(config, engine)
+
         try:
             from das2.io.store import load_baselines
             baselines = load_baselines(engine)
@@ -490,17 +628,29 @@ def cmd_profile(config: Config, args) -> int:
     a 1%/day drift is 3% across it while the daily demand cycle is 10-30%.
     Run it once a day; the hourly run scores against what it stores.
     """
-    from das2.io.store import load_history, make_engine, save_baselines
-    from das2.profile.build import MIN_DAYS_DRIFT, PREFERRED_DAYS, run_profile_job
+    from das2.io.store import make_engine
+    from das2.profile.build import MIN_DAYS_DRIFT, PREFERRED_DAYS
 
     engine = make_engine(config.database.sqlalchemy_url())
     days = args.days or PREFERRED_DAYS
-    print(f"Reading up to {days} days of history ...")
-    history = load_history(
-        engine, days=days,
-        fallback_table=config.database.history_fallback_table)
+    print(f"Reading up to {days} days of history, "
+          f"a few hundred sensors at a time ...")
 
-    if history.empty:
+    seen_days: list[int] = []
+
+    def progress(n, of, frame, batch):
+        sensors = frame["sensor_key"].nunique()
+        seen_days.extend(
+            frame.groupby("sensor_key")["ts"]
+                 .apply(lambda s: s.dt.normalize().nunique()).tolist())
+        print(f"  batch {n}/{of}: {len(frame):>9,} readings, "
+              f"{sensors:>4} sensors, "
+              f"{sum(1 for b in batch.baselines.values() if b.usable):>4} "
+              f"usable baseline(s)")
+
+    result, batches = build_profiles(config, engine, days=days, report=progress)
+
+    if not batches:
         print("\nNo history yet — das2_reading is empty.")
         print("This is the expected state on a fresh install, not a failure. "
               "The hourly run fills das2_reading as it goes; come back once it "
@@ -518,21 +668,21 @@ def cmd_profile(config: Config, args) -> int:
                   "it; it must expose sensor_key, ts and value.")
         return 2
 
-    observed = history.groupby("sensor_key")["ts"].apply(
-        lambda s: s.dt.normalize().nunique())
-    print(f"{len(history):,} readings, {history['sensor_key'].nunique()} sensors, "
-          f"median {observed.median():.0f} days each")
-
-    result = run_profile_job(history)
+    median_days = (sorted(seen_days)[len(seen_days) // 2] if seen_days else 0)
+    print(f"\n{len(seen_days)} sensor(s) over {batches} batch(es), "
+          f"median {median_days} day(s) of history each")
     print(f"\n{result.summary()}")
 
-    if observed.median() < MIN_DAYS_DRIFT:
+    if median_days < MIN_DAYS_DRIFT:
         print(f"\nNOTE: median history is under {MIN_DAYS_DRIFT} days, so DRIFT "
               f"is not being computed. It is not a failure -- the slope simply "
               f"cannot be separated from the daily cycle over a shorter span.")
 
-    save_baselines(engine, result.baselines)
-    print("Baselines stored. The hourly run will score against them from now on.")
+    # Already stored, per batch, as each one finished: a job interrupted two
+    # thirds of the way through leaves two thirds of the fleet with a fresh
+    # baseline rather than none.
+    print("\nBaselines stored. The hourly run will score against them from "
+          "now on.")
     return 0
 
 

@@ -178,6 +178,29 @@ class BaselineConfig:
     bucket_minutes: int = 15
     split_weekend: bool = True
 
+    #: Let the hourly run rebuild the baselines itself when they are stale.
+    #:
+    #: ON by default, and that default is the fix for a real failure rather
+    #: than a convenience. The daily job was written, containerised and
+    #: documented -- and never scheduled, because scheduling it was a line in a
+    #: compose file comment that nobody had reason to read. Every run on the
+    #: client's deployment logged `baselines: {'sensors': 0, 'usable': 0}`, and
+    #: DRIFT, NOISE_BURST and RESIDUAL_OUTLIER produced nothing at all for
+    #: weeks. Those three are exactly the "anticipate the sensor going bad"
+    #: family the system is now scoped to.
+    #:
+    #: Turn it OFF on an installation that drives `das2 profile` from its own
+    #: cron or Task Scheduler, so the work is not done twice.
+    auto_refresh: bool = True
+
+    #: Rebuild once the stored baselines are older than this.
+    #:
+    #: 30 rather than 24, so an hourly run does not rebuild a profile that
+    #: yesterday's run built an hour "late" -- a 24-hour threshold against an
+    #: hourly schedule rebuilds every single day at whichever hour first
+    #: crosses it, and then drifts an hour later each day until it wraps.
+    max_age_hours: int = 30
+
     #: Absorbs duty-cycle timing jitter. A pump starting 20 minutes late is
     #: normal operation but produces a large residual against an exact
     #: time-of-day expectation, so the residual is scored against the best

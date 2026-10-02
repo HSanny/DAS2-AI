@@ -411,7 +411,23 @@ Get-ChildItem .\output\dashboard_*.html |
 `Invoke-Item` opens it in your browser. Drop that last line to just print the
 path.
 
-### 11. Schedule the daily job
+### 11. The daily job — optional now
+
+**You can skip this step.** The hourly run checks how old the stored baselines
+are and rebuilds them itself once they pass 30 hours, so `DRIFT`, `NOISE_BURST`
+and `RESIDUAL_OUTLIER` come up on their own without a scheduled task.
+
+That changed because the previous arrangement failed silently here: this step
+existed, it was never done, and all three detectors produced nothing for weeks
+while every run logged `baselines: {'sensors': 0}` and no error.
+
+Run `docker compose run --rm das2-check` to see the state — it now reports
+whether the baselines exist, how old they are, and whether there is any history
+to build them from.
+
+Set up the scheduled task below only if you would rather own the timing
+yourself; if you do, also set `DAS2_BASELINE_AUTO_REFRESH=false` in `.env` so
+the work is not done twice.
 
 Task Scheduler rather than cron. From an **elevated** PowerShell, once:
 

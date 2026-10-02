@@ -113,14 +113,27 @@ services:
     profiles: ["tools"]
 
   # --- daily: baselines, DRIFT and NOISE_BURST -----------------------------
-  # Schedule this ONCE A DAY from cron or Task Scheduler:
   #     docker compose run --rm das2-profile
   #
-  # Not optional. DRIFT, NOISE_BURST and the whole L2 baseline layer depend on
-  # it, and until it has run they produce nothing at all. It is separate from
-  # the hourly loop because these answers change slowly, cost far more to
-  # compute, and genuinely cannot be derived from a 72-hour window -- a 1%/day
-  # drift is 3% across it while the daily demand cycle is 10-30%.
+  # NO LONGER NEEDS SCHEDULING. The hourly run checks how old the stored
+  # baselines are and rebuilds them itself once they pass
+  # DAS2_BASELINE_MAX_AGE_HOURS (30), so the work happens about once a day
+  # inside whichever run first notices.
+  #
+  # That changed because this service's old instruction -- "schedule this once a
+  # day from cron" -- was a comment in a compose file, and nobody had reason to
+  # read it. It never ran. DRIFT, NOISE_BURST and the whole L2 baseline layer
+  # depend on it, so all three produced nothing for weeks while every run logged
+  # `baselines: {'sensors': 0}` and no error. A dependency that fails by being
+  # quiet belongs to the code that depends on it, not to a deployment note.
+  #
+  # Run it here when you want the baselines NOW rather than within the next
+  # thirty hours, or set DAS2_BASELINE_AUTO_REFRESH=false and drive it from your
+  # own scheduler so the work is not done twice.
+  #
+  # It stays a separate command because these answers change slowly, cost far
+  # more to compute, and genuinely cannot be derived from a 72-hour window -- a
+  # 1%/day drift is 3% across it while the daily demand cycle is 10-30%.
   das2-profile:
     <<: *common
     container_name: das2-profile

@@ -86,6 +86,23 @@ DRIFT_MIN_FRACTION_PER_DAY = 0.02
 
 #: ...and the trend must be consistent, not a random walk. Kendall's tau over
 #: the daily medians; 0.5 means the ordering is clearly monotone.
+#:
+#: Measured, and left alone deliberately. Against a stationary sensor -- level
+#: fixed, diurnal cycle, white noise -- tau >= 0.5 fired on **0 of 200** clean
+#: series, which is the null this gate exists for.
+#:
+#: It was nearly raised on the strength of a second experiment that looked much
+#: worse: against sensors whose LEVEL follows a random walk, tau >= 0.5 fired on
+#: 39%, and no threshold up to 0.9 brought that under 0.7% without losing the
+#: drifts worth catching. That reading was wrong. Checking what those series had
+#: actually done: the ones tau flagged had moved a median of 10x their own noise
+#: over three weeks, consistently in one direction, while the ones it rejected
+#: had moved a third as far. A sensor whose level has walked 10x its noise away
+#: from where it started IS drifting -- that is the finding, not a false alarm.
+#: The experiment's "null" was a population of drifting sensors.
+#:
+#: Worth remembering before anyone tunes this: the null model has to be a
+#: HEALTHY sensor, and a random walk is not one.
 DRIFT_MIN_TAU = 0.5
 
 #: A noise burst is a day whose within-day spread exceeds the median of the
@@ -135,6 +152,23 @@ class TimeOfDayBaseline:
         ]
 
 
+def _as_ts(ts):
+    """
+    A datetime Series, converting only when it is not one already.
+
+    `pd.to_datetime` on an already-datetime column is not free: it decides
+    whether to use its parse cache by ITERATING the values, which profiled at
+    32% of the whole daily job -- 50,520 element-wise iterations for twenty
+    sensors. Every function here takes a caller-supplied frame and so has to be
+    defensive about the column's type; this makes being defensive cost nothing
+    in the normal case, where it arrives from the reading store already typed.
+    """
+    series = ts if isinstance(ts, pd.Series) else pd.Series(ts)
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+    return pd.to_datetime(series, errors="coerce")
+
+
 def build_baseline(sensor_key: str, frame: pd.DataFrame, *,
                    ts_col: str = "ts", value_col: str = "value"
                    ) -> TimeOfDayBaseline:
@@ -149,7 +183,7 @@ def build_baseline(sensor_key: str, frame: pd.DataFrame, *,
     if df.empty:
         return baseline
 
-    ts = pd.to_datetime(df[ts_col])
+    ts = _as_ts(df[ts_col])
     values = df[value_col].to_numpy(dtype=float)
     bucket = ((ts.dt.hour * 60 + ts.dt.minute) // BUCKET_MINUTES).to_numpy()
     weekend = (ts.dt.weekday >= 5).astype(int).to_numpy()
@@ -167,21 +201,92 @@ def build_baseline(sensor_key: str, frame: pd.DataFrame, *,
     return baseline
 
 
+#: A calendar day must COVER this share of a typical day's span to be compared
+#: with other days. See `_whole_days`.
+WHOLE_DAY_FRACTION = 0.9
+
+
+def _whole_days(ts: pd.Series, values: np.ndarray):
+    """
+    Group by calendar day, dropping the partial days at the window's edges.
+
+    This is not tidiness. A 28-day window almost never starts at midnight -- the
+    hourly run reads the last 28 days from whenever it happens to run -- so the
+    first and last calendar days cover a FRACTION of a day, and that fraction is
+    one arbitrary phase of the daily cycle rather than all of it. Their daily
+    median is therefore not an estimate of the same quantity as every other
+    day's.
+
+    Measured, on a 21-day window offset by twelve hours, sampled at 120 s, with
+    a 1.6-wide diurnal cycle and 0.02 of noise:
+
+        whole days      4.011, 3.994, 4.003, 4.000, 3.989 ...  (spread 0.025)
+        first day       3.432
+        last day        4.560
+
+    An edge offset of 0.565 against a real day-to-day spread of 0.025 -- 22x --
+    placed at the two ends of the series, which is exactly where Theil-Sen and
+    Kendall's tau are most sensitive. It produced DRIFT on clean sensors, and it
+    split a genuine noise burst across two half-days and diluted it below the
+    detection multiple so the burst was MISSED. Both failure directions at once,
+    from the same cause.
+
+    Judged on TIME COVERED, not on sample count, and the difference is the whole
+    correctness of this function. Those are two unrelated properties:
+
+      * a PARTIAL day is short in coverage -- it starts or ends mid-cycle, so
+        its median is biased by which hours it happens to contain;
+      * a THIN day is sparse in samples but spans the full 24 hours, so its
+        median is unbiased. This feed reports at anything from 16 s to 300 s,
+        and 57% of its sensors are report-by-exception, so thin days are normal
+        and healthy.
+
+    A count-based rule confuses the two in both directions. Tried first at 0.6 of
+    the median day's COUNT, it kept a 07:13-to-midnight first day -- 504 samples
+    against a typical 720, which passes a count test at 70% while covering only
+    16.8 of 24 hours -- and the daily medians still spanned 0.39 instead of 0.025.
+
+    Comparison is against the TYPICAL day's span rather than against 24 hours, so
+    a sensor that reports once a day (every span zero, every day alike) keeps all
+    of its days instead of losing all of them.
+    """
+    frame = pd.DataFrame({"ts": _as_ts(ts), "value": values}).dropna()
+    if frame.empty:
+        return None
+    day = frame["ts"].dt.normalize()
+    # `agg(["min", "max"])` rather than a lambda over each group: the lambda
+    # form is a Python call per calendar day per sensor, and this function runs
+    # twice for every sensor in the fleet.
+    bounds = frame.groupby(day)["ts"].agg(["min", "max"])
+    spans = bounds["max"] - bounds["min"]
+    if spans.empty:
+        return None
+    typical = spans.median()
+    keep = spans[spans >= WHOLE_DAY_FRACTION * typical].index
+    if len(keep) == 0:
+        return None
+    return frame[day.isin(keep)].groupby(day)
+
+
 def _daily_medians(ts: pd.Series, values: np.ndarray
                    ) -> tuple[np.ndarray, np.ndarray]:
     """
-    One median per calendar day.
+    One median per whole calendar day.
 
     Collapsing to daily medians is what makes drift measurable: it removes the
     daily cycle completely rather than trying to model it, which is the whole
-    reason a 72-hour slope is meaningless and a 28-day one is not.
+    reason a 72-hour slope is meaningless and a 28-day one is not. Partial days
+    are excluded -- see `_whole_days`, where leaving them in produced DRIFT on
+    sensors that were not drifting.
     """
-    frame = pd.DataFrame({"ts": pd.to_datetime(ts), "value": values}).dropna()
-    if frame.empty:
+    grouped = _whole_days(ts, values)
+    if grouped is None:
         return np.array([]), np.array([])
-    grouped = frame.groupby(frame["ts"].dt.normalize())["value"].median()
-    days = (grouped.index - grouped.index[0]).days.to_numpy(dtype=float)
-    return days, grouped.to_numpy(dtype=float)
+    medians = grouped["value"].median().dropna()
+    if medians.empty:
+        return np.array([]), np.array([])
+    days = (medians.index - medians.index[0]).days.to_numpy(dtype=float)
+    return days, medians.to_numpy(dtype=float)
 
 
 def _theil_sen(x: np.ndarray, y: np.ndarray) -> float:
@@ -261,7 +366,7 @@ def detect_drift(sensor_key: str, frame: pd.DataFrame, *,
     total_change = slope * span_days
     percent_per_day = (100.0 * slope / abs(level)) if level else None
 
-    ts = pd.to_datetime(df[ts_col])
+    ts = _as_ts(df[ts_col])
     return [Signal(
         type=AnomalyType.DRIFT,
         start=ts.min().to_pydatetime(),
@@ -298,16 +403,36 @@ def detect_noise_burst(sensor_key: str, frame: pd.DataFrame, *,
     self-contamination trap that has now bitten four detectors in this project;
     for this one it would be fatal rather than merely weakening, because the
     burst is the noise being measured.
+
+    Known limit: the unit is a CALENDAR day, so a burst that lasts about one day
+    and straddles midnight is split between two days, each half-diluted with
+    quiet readings, and can fall under the multiple. Measured on a fixture where
+    a 30x burst straddles midnight exactly: missed. Accepted rather than fixed
+    with a sliding window, because the realistic fault -- a failing transducer or
+    a loose earth -- does not become noisy for exactly 24 hours and then stop; it
+    stays noisy, and is caught on its first whole day. A sliding window would
+    cost four times the work on a once-a-day job to cover a case that needs the
+    fault to end on schedule.
     """
     df = frame[[ts_col, value_col]].dropna()
     if df.empty:
         return []
-    ts = pd.to_datetime(df[ts_col])
+    ts = _as_ts(df[ts_col])
     values = df[value_col].to_numpy(dtype=float)
 
-    day = ts.dt.normalize()
+    # Whole days only, for the same reason DRIFT needs them -- and here the
+    # consequence runs the other way. A 21-day window offset by twelve hours
+    # splits the burst day across two calendar dates, so each half carries half
+    # the burst's samples diluted with half a day of quiet readings, and a real
+    # 30x noise burst came in under the 4x multiple and was MISSED. The
+    # `sample.size < 10` floor below cannot catch that: a half day on this feed
+    # is about 360 samples.
+    grouped = _whole_days(ts, values)
+    if grouped is None:
+        return []
+
     spreads: list[tuple[pd.Timestamp, float, int]] = []
-    for date, index in df.groupby(day).groups.items():
+    for date, index in grouped.groups.items():
         sample = values[df.index.get_indexer(index)]
         sample = sample[np.isfinite(sample)]
         if sample.size < 10:
@@ -364,6 +489,20 @@ class ProfileJobResult:
     signals: dict[str, list[Signal]] = field(default_factory=dict)
     skipped_short_history: int = 0
 
+    def absorb(self, other: "ProfileJobResult") -> "ProfileJobResult":
+        """
+        Fold another batch's result into this one.
+
+        The daily job reads history a few hundred sensors at a time -- see
+        `store.iter_history` for why -- so the whole-fleet answer is assembled
+        from batches. Sensor keys never repeat across batches, so this is a
+        plain union rather than a merge with precedence rules.
+        """
+        self.baselines.update(other.baselines)
+        self.signals.update(other.signals)
+        self.skipped_short_history += other.skipped_short_history
+        return self
+
     def summary(self) -> dict[str, object]:
         by_type: dict[str, int] = {}
         for signals in self.signals.values():
@@ -398,7 +537,7 @@ def run_profile_job(readings: pd.DataFrame, *, key_col: str = "sensor_key",
         result.baselines[key] = build_baseline(key, group, ts_col=ts_col,
                                                value_col=value_col)
 
-        days = pd.to_datetime(group[ts_col]).dt.normalize().nunique()
+        days = _as_ts(group[ts_col]).dt.normalize().nunique()
         if days < MIN_DAYS_NOISE:
             result.skipped_short_history += 1
             continue
