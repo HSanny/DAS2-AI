@@ -147,6 +147,58 @@ def main():
           "sa:***@10.0.0.5:1433/anomaly_db" in leaky.safe_url)
     escaped = DatabaseConfig(url="mssql+pyodbc://sa:p%40ss%3Aword@h/db")
     check("a percent-escaped password is masked", "p%40ss" not in escaped.safe_url)
+
+    # ------------------------------------------------------------------ #
+    print("\nan unreachable database explains itself instead of a traceback")
+    # `migrate` is the first command in the runbook that touches the database,
+    # so it is the first one anybody hits -- and it had no guard at all, so a
+    # database that could not be reached produced sixty lines of SQLAlchemy pool
+    # internals ending in `HYT00 Login timeout expired`. That message is also
+    # ambiguous: on this very deployment it was once caused by a password
+    # containing `@` mangling the HOST, not by the network.
+    import io
+    from contextlib import redirect_stdout
+
+    import das2.cli as cli
+    import das2.io.store as store
+
+    real_make = store.make_engine
+
+    def refuse(*a, **k):
+        raise RuntimeError(
+            "('HYT00', '[HYT00] [Microsoft][ODBC Driver 18 for SQL Server]"
+            "Login timeout expired (0) (SQLDriverConnect)')")
+
+    store.make_engine = refuse
+    unreachable = Config()
+    unreachable.database.url = \
+        "mssql+pyodbc://flotech:P@ssword1234@192.168.25.16:1433/anomaly_db"
+    out = io.StringIO()
+    with redirect_stdout(out):
+        engine = cli.connect_or_explain(unreachable)
+    text_out = out.getvalue()
+    store.make_engine = real_make
+
+    check("it returns None rather than raising", engine is None,
+          "every caller turns that into exit 3")
+    check("it names the host actually handed to the driver",
+          "192.168.25.16:1433" in text_out,
+          next((ln for ln in text_out.splitlines() if "Tried:" in ln), ""))
+    check("without the password", "ssword1234" not in text_out
+          and "P@ss" not in text_out)
+    check("it says a timeout is not a rejected password",
+          "not a" in text_out and "rejected password" in text_out,
+          "the two are opposite problems and the driver reports them alike")
+    check("it names BOTH causes, since they look identical",
+          "The host above is WRONG" in text_out
+          and "unreachable from the container" in text_out)
+    check("including the escaping trap that caused it here before",
+          "fragment of your password" in text_out,
+          "P@ssword1234 made the host ssword1234@192.168.25.16 and every run "
+          "waited 60s on an address that does not exist")
+    check("and it points at the share as a way to tell them apart",
+          "HISTORY share" in text_out,
+          "if the share mounts, the machine is up and it is SQL Server")
     cfg.database.url = "sqlite:///x.db"
     check("explicit url wins", cfg.database.sqlalchemy_url() == "sqlite:///x.db")
 

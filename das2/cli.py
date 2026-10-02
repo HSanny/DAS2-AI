@@ -45,8 +45,67 @@ log = logging.getLogger("das2.cli")
 
 
 # --------------------------------------------------------------------------- #
+def connect_or_explain(config: Config):
+    """
+    Build an engine and prove it works, or say what was tried and return None.
+
+    Every command that needs the database goes through here, so that a database
+    that cannot be reached produces one readable paragraph rather than sixty
+    lines of SQLAlchemy pool internals. `migrate` is the first command in the
+    runbook that touches the database, so it is the first one anybody hits, and
+    it was the one with no guard at all.
+
+    The paragraph names the HOST, and that is the point rather than politeness.
+    `HYT00 Login timeout expired` is what an unreachable server looks like, and
+    on this very deployment it was once produced by a password containing `@`:
+    SQLAlchemy's URL parser stopped at the first `@`, so `P@ssword1234` made the
+    host `ssword1234@192.168.25.16` and every run spent sixty seconds waiting on
+    an address that does not exist. The diagnosis went to the network, then to
+    TLS, then to the timeout. None of those were it. `safe_url` is parsed by the
+    same parser the driver is handed, so printing it is what tells the two
+    causes apart at a glance.
+    """
+    from sqlalchemy import text
+
+    from das2.io.store import make_engine
+
+    try:
+        engine = make_engine(config.database.sqlalchemy_url())
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return engine
+    except Exception as exc:                                  # noqa: BLE001
+        detail = str(exc)
+        log.error("cannot reach the database: %s", detail[:300])
+        print(f"\nTried: {config.database.safe_url}")
+        print("\nThat is the host and port the ODBC driver was actually given, "
+              "parsed the\nsame way the driver parses it.")
+        if "HYT00" in detail or "Login timeout" in detail:
+            print("\n`Login timeout expired` means no answer at all for "
+                  f"{store_login_timeout()}s — not a\nrejected password. Two "
+                  "very different causes look identical:")
+            print("\n  1. The host above is WRONG. Check it against your real "
+                  "server. If it has a\n     fragment of your password in it, "
+                  "an unescaped special character in\n     DAS2_DATABASE_URL "
+                  "split the URL in the wrong place — set DAS2_DATABASE_HOST,"
+                  "\n     _PORT, _DATABASE, _USERNAME and _PASSWORD as separate "
+                  "values instead,\n     which needs no escaping.")
+            print("\n  2. The host is right and unreachable from the "
+                  "container. Check the SQL\n     Server service is running, "
+                  "that TCP/IP is enabled in SQL Server\n     Configuration "
+                  "Manager, and that port 1433 is open to the Docker network."
+                  "\n     If the HISTORY share still mounts, the machine is up "
+                  "and it is SQL\n     Server or its port specifically.")
+        return None
+
+
+def store_login_timeout() -> int:
+    from das2.io.store import DEFAULT_LOGIN_TIMEOUT_S
+    return DEFAULT_LOGIN_TIMEOUT_S
+
+
 def cmd_migrate(config: Config, args) -> int:
-    from das2.io.store import apply_migrations, make_engine, render_migrations
+    from das2.io.store import apply_migrations, render_migrations
 
     # --print-sql emits exactly what would be executed and connects to nothing,
     # so a DBA can review it, or run it in SSMS themselves, without this system
@@ -58,7 +117,9 @@ def cmd_migrate(config: Config, args) -> int:
             print(statement.rstrip().rstrip(";") + ";\n")
         return 0
 
-    engine = make_engine(config.database.sqlalchemy_url())
+    engine = connect_or_explain(config)
+    if engine is None:
+        return 3
     executed = apply_migrations(engine)
     print(f"Applied {len(executed)} statement(s) against {config.database.safe_url}")
     for statement in executed:
@@ -336,7 +397,7 @@ def cmd_run(config: Config, args) -> int:
     if not args.dry_run:
         from sqlalchemy import text
 
-        from das2.io.store import load_open_incidents, make_engine
+        from das2.io.store import load_open_incidents
 
         # Build the engine and probe it before anything else, and STOP if
         # either fails. Construction is inside the guard because it is not
@@ -353,16 +414,10 @@ def cmd_run(config: Config, args) -> int:
         # forever. Suppressing exactly that repetition is what the incident
         # layer is for, so a database outage must not be allowed to turn it off
         # quietly. Better to run nothing than to flood the operators' chat.
-        try:
-            engine = make_engine(config.database.sqlalchemy_url())
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-        except Exception as exc:                           # noqa: BLE001
-            log.error("cannot reach the database at %s: %s",
-                      config.database.safe_url, exc)
-            log.error("run `docker compose run --rm das2-check` for the full "
-                      "pre-flight, or `--dry-run` to analyse without a "
-                      "database.")
+        engine = connect_or_explain(config)
+        if engine is None:
+            print("\nRun `docker compose run --rm das2-check` for the full "
+                  "pre-flight, or\n`--dry-run` to analyse without a database.")
             return 3
 
         try:
@@ -628,10 +683,11 @@ def cmd_profile(config: Config, args) -> int:
     a 1%/day drift is 3% across it while the daily demand cycle is 10-30%.
     Run it once a day; the hourly run scores against what it stores.
     """
-    from das2.io.store import make_engine
     from das2.profile.build import MIN_DAYS_DRIFT, PREFERRED_DAYS
 
-    engine = make_engine(config.database.sqlalchemy_url())
+    engine = connect_or_explain(config)
+    if engine is None:
+        return 3
     days = args.days or PREFERRED_DAYS
     print(f"Reading up to {days} days of history, "
           f"a few hundred sensors at a time ...")
@@ -688,9 +744,11 @@ def cmd_profile(config: Config, args) -> int:
 
 def cmd_ack_worker(config: Config, args) -> int:
     from das2.alerting.telegram import TelegramConfig, run_ack_worker
-    from das2.io.store import make_engine, record_ack
+    from das2.io.store import record_ack
 
-    engine = make_engine(config.database.sqlalchemy_url())
+    engine = connect_or_explain(config)
+    if engine is None:
+        return 3
 
     def on_ack(ref, state, user):
         record_ack(engine, ref, state, user)
