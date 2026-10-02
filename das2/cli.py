@@ -157,6 +157,55 @@ def cmd_check(config: Config, args) -> int:
         print(f"  [{'PASS' if passed else 'FAIL'}] {label}"
               f"{('  — ' + detail) if detail else ''}")
 
+    # --- Did the configuration arrive at all? ------------------------------- #
+    # First, because it is upstream of every other check and because its absence
+    # does not look like its cause. With no environment, `DAS2_DATABASE_HOST` is
+    # "" and sqlalchemy_url() builds `Server=,1433`, which the ODBC driver
+    # reports as `HYT00 Login timeout expired` -- indistinguishable from a
+    # firewall or a stopped service, so the whole diagnosis goes to the network.
+    # Meanwhile the Telegram token is "" and reports as "not configured".
+    #
+    # Two unrelated settings failing together is the signal: they come from one
+    # `.env`, so the cause is the file not reaching the container, not two
+    # coincidences. This section says that outright rather than leaving it to be
+    # inferred from two sections that do not mention each other.
+    print("\nConfiguration")
+    expected = {
+        "database": ("DAS2_DATABASE_URL", "DAS2_DATABASE_HOST"),
+        "Telegram": ("DAS2_ALERT_TELEGRAM_TOKEN", "DAS2_ALERT_TELEGRAM_CHAT_ID"),
+    }
+    present = {name: bool(os.environ.get(name, "").strip())
+               for names in expected.values() for name in names}
+    seen = sum(1 for v in present.values() if v)
+    das2_vars = [k for k in os.environ if k.startswith(("DAS2_", "DAS_"))]
+
+    if seen == 0:
+        report("the container received its .env", False,
+               f"NO DAS2_* variables are set inside the container "
+               f"({len(das2_vars)} found)")
+        print("         Everything below that needs credentials will fail, and "
+              "will NOT look like")
+        print("         this is why. Check, in this order:")
+        print("           1. the file is named exactly `.env` — Notepad saves "
+              "`.env.txt` silently;")
+        print("              `Get-ChildItem -Force` in the project folder shows "
+              "the real name")
+        print("           2. it sits beside docker-compose.yml, in the folder "
+              "you run compose from")
+        print("           3. `docker compose config` prints the values it "
+              "resolved — if they are")
+        print("              empty there, compose cannot see the file either")
+        print("           4. `docker compose run --rm das2-check env | "
+              "Select-String DAS2_` shows")
+        print("              what actually reaches the container")
+        ok = False
+    else:
+        for label, names in expected.items():
+            got = [n for n in names if present[n]]
+            report(f"{label} settings present", bool(got),
+                   ", ".join(got) if got else
+                   f"none of {', '.join(names)} is set in the container")
+
     print("\nInput data")
     history = Path(config.ingest.history_dir)
     report("history directory exists", history.is_dir(), str(history))
@@ -210,13 +259,19 @@ def cmd_check(config: Config, args) -> int:
            else "not configured — no map, no geo-clustering, no by-region view")
 
     print("\nDatabase")
-    try:
-        from sqlalchemy import text
-        from das2.io.store import make_engine
-        engine = make_engine(config.database.sqlalchemy_url())
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+    # Through the same helper every other command uses, so the one command whose
+    # entire job is diagnosis cannot be the one that reports least. Its own
+    # inline probe printed the driver error and not the HOST -- and the host was
+    # the answer: `mssql+pyodbc://:***@:1433/` says "no configuration" at a
+    # glance, while `HYT00 Login timeout expired` says "blame the network".
+    from sqlalchemy import text
+
+    engine = connect_or_explain(config)
+    if engine is None:
+        report("connection", False, config.database.safe_url)
+    else:
         report("connection", True, config.database.safe_url)
+    if engine is not None:
         with engine.connect() as conn:
             try:
                 n = conn.execute(text("SELECT COUNT(*) FROM das2_incident")).scalar()
@@ -270,8 +325,6 @@ def cmd_check(config: Config, args) -> int:
                       "(needs sensor_key, ts, value)")
                 print("         and the baselines are available on the next "
                       "run instead of in four weeks.")
-    except Exception as exc:                               # noqa: BLE001
-        report("connection", False, str(exc)[:160])
 
     print("\nTelegram")
     if not config.alert.telegram_token or not config.alert.telegram_chat_id:

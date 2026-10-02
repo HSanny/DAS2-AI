@@ -13,6 +13,7 @@ Run:  python3 tests/test_config_models.py
 """
 
 import json
+import argparse
 import os
 import sys
 import tempfile
@@ -199,6 +200,46 @@ def main():
     check("and it points at the share as a way to tell them apart",
           "HISTORY share" in text_out,
           "if the share mounts, the machine is up and it is SQL Server")
+
+    # ------------------------------------------------------------------ #
+    print("\nno configuration at all is reported as that, not as a network fault")
+    # The real failure on the client's box, and the reason this section exists.
+    # With no environment, DAS2_DATABASE_HOST is "" and sqlalchemy_url() builds
+    # `Server=,1433`, which the ODBC driver reports as `HYT00 Login timeout
+    # expired` -- identical to a firewall or a stopped service. The whole
+    # diagnosis went to the network. Meanwhile the Telegram token was also ""
+    # and reported as "not configured", from the SAME unread .env.
+    empty = DatabaseConfig()
+    check("an unset host builds a URL with no server in it",
+          "@:1433/" in empty.safe_url, empty.safe_url)
+    check("which is what the driver turns into a login timeout", True,
+          "Server=,1433 — indistinguishable from an unreachable host, so the "
+          "check has to name the configuration itself")
+
+    saved = {k: os.environ.pop(k) for k in list(os.environ)
+             if k.startswith(("DAS2_", "DAS_"))}
+    try:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli.cmd_check(Config.load(), argparse.Namespace())
+        report_text = out.getvalue()
+    finally:
+        os.environ.update(saved)
+
+    check("the pre-flight leads with the missing configuration",
+          report_text.index("Configuration") < report_text.index("Database"),
+          "it is upstream of every other check, so it is reported first")
+    check("and says outright that nothing reached the container",
+          "NO DAS2_* variables are set" in report_text)
+    check("it names the Notepad trap, which is the usual cause on Windows",
+          ".env.txt" in report_text,
+          "Notepad appends .txt silently and the folder view hides it")
+    check("and gives a command that shows what the container really got",
+          "env | Select-String DAS2_" in report_text)
+    check("the database line now shows the empty host, not just the driver error",
+          "@:1433/" in report_text,
+          "`HYT00 Login timeout expired` sends you to the network; "
+          "`Server=,1433` sends you to the .env")
     cfg.database.url = "sqlite:///x.db"
     check("explicit url wins", cfg.database.sqlalchemy_url() == "sqlite:///x.db")
 
