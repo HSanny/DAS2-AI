@@ -504,18 +504,36 @@ def merge_episodes(clusters: list[Cluster], *,
     if len(clusters) < 2:
         return list(clusters)
 
-    remaining = list(clusters)
+    # Biggest first, so the group is seeded by the most substantial cluster
+    # rather than by whichever happened to be built first. Greedy agglomeration
+    # is order-dependent either way; this at least makes the order meaningful.
+    remaining = sorted(clusters, key=lambda c: (-len(c.sites), -len(c.members)))
     merged: list[Cluster] = []
     while remaining:
         head = remaining.pop(0)
         group = [head]
         changed = True
-        # Repeated passes: A may not reach C directly, but if it reaches B and
-        # B reaches C then all three are the same event.
         while changed:
             changed = False
             for other in list(remaining):
-                if any(str(other.region) == str(c.region)
+                # EVERY member, not any one of them. Complete linkage, and the
+                # distinction is the whole correctness of this function.
+                #
+                # The first version asked for `any`, which is single linkage,
+                # whose failure mode is chaining: A overlaps B, B overlaps C,
+                # C overlaps D, and the group swallows all four although A and
+                # D share nothing whatever. Four three-site clusters sliding by
+                # one site each -- which is exactly the shape a 72-hour window
+                # produces as an event moves -- merged into one six-site
+                # incident whose ends had no site in common.
+                #
+                # On the client's second production run that turned 227
+                # clusters into 37, put 144 sensors across 9 sites into a
+                # single P1, and left the run with no P2 at all, because a
+                # merged giant saturates every size term in `severity` and goes
+                # straight to the top. "Investigate the area" is not an
+                # instruction when the area is most of the East.
+                if all(str(other.region) == str(c.region)
                        and _site_jaccard(other, c) >= site_overlap
                        and _hours_apart(other, c) <= gap_hours
                        for c in group):

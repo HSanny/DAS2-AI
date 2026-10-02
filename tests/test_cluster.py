@@ -370,6 +370,32 @@ def main():
     check("the window spans all of them",
           (merged[0].end - merged[0].start) >= timedelta(hours=4))
 
+    # Chaining: the failure mode of single linkage, and the one this merge
+    # shipped with. Four clusters sliding by one site each -- the shape a
+    # 72-hour window produces as an event moves -- where the FIRST and LAST
+    # share no site whatever. Asking whether a candidate overlaps ANY member
+    # of the group walks the whole chain and swallows all four. On the second
+    # production run that collapsed 227 clusters into 37, put 144 sensors
+    # across 9 sites into one P1, and left the run with no P2 at all.
+    def slide(sites, hours_in):
+        members = [anomaly(f"{s}-{hours_in}", s, "Level",
+                           start_min=hours_in * 60, dur_min=120)
+                   for s in sites]
+        return Cluster(members=members, region="East", centroid_lat=1.34,
+                       centroid_lon=103.93, radius_m=2000.0)
+
+    A, B, C = "BedokPS", "BedokPond4", "TampinesPS"
+    D, E = "Kranji1PS", "PandanTG"          # only their site names are used
+    chained = merge_episodes([slide([A, B, C], 0), slide([B, C, D], 1),
+                              slide([C, D, E], 2)])
+    spans = [c.sites for c in chained]
+    check("a chain does not collapse into one incident", len(chained) > 1,
+          f"{len(chained)} incident(s) from 3 sliding clusters")
+    check("THE ENDS OF A CHAIN NEVER SHARE AN INCIDENT",
+          not any({A, E} <= s for s in spans),
+          "A overlaps B and B overlaps C, but A and C share nothing; single "
+          "linkage merges all three anyway and the alert becomes a postcode")
+
     apart = merge_episodes([episode(wide, 0), episode(wide, 72)])
     check("bursts days apart stay separate", len(apart) == 2,
           "one trip on Monday and one on Thursday is two trips")
